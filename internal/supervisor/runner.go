@@ -97,28 +97,49 @@ func NewRunner(cfg config.Service, baseEnv []string, spawn Spawner, clock Clock,
 	}
 }
 
-// Run drives the state machine until ctx is canceled. Returns when the
-// runner has exited cleanly (ctx canceled, or terminal Stopped/Fatal —
-// though terminal states still keep Run alive in case Start is invoked
-// again; only ctx exits Run).
-func (r *Runner) Run(ctx context.Context) {
-	var backoffTimer Timer
-	stopBackoff := func() {
-		if backoffTimer != nil {
-			backoffTimer.Stop()
-			backoffTimer = nil
-		}
+// runnerTimers holds the two timer slots Run multiplexes on: backoff
+// (between exit and next spawn) and stopKill (between stop_signal and
+// SIGKILL escalation). At most one of each is set at any moment.
+type runnerTimers struct {
+	backoff  Timer
+	stopKill Timer
+}
+
+func (t *runnerTimers) cancelBackoff() {
+	if t.backoff != nil {
+		t.backoff.Stop()
+		t.backoff = nil
 	}
-	defer stopBackoff()
+}
+
+func (t *runnerTimers) cancelStopKill() {
+	if t.stopKill != nil {
+		t.stopKill.Stop()
+		t.stopKill = nil
+	}
+}
+
+// Run drives the state machine until ctx is canceled. Returns when ctx
+// is done — terminal Stopped/Fatal states still keep Run alive so a
+// future Start (e.g. via zpctl) can revive the service.
+func (r *Runner) Run(ctx context.Context) {
+	timers := &runnerTimers{}
+	defer func() {
+		timers.cancelBackoff()
+		timers.cancelStopKill()
+	}()
 
 	for {
 		var exitCh <-chan reaper.ExitInfo
 		if p := r.currentProcess(); p != nil {
 			exitCh = p.Exit()
 		}
-		var timerCh <-chan time.Time
-		if backoffTimer != nil {
-			timerCh = backoffTimer.Chan()
+		var backoffCh, stopKillCh <-chan time.Time
+		if timers.backoff != nil {
+			backoffCh = timers.backoff.Chan()
+		}
+		if timers.stopKill != nil {
+			stopKillCh = timers.stopKill.Chan()
 		}
 
 		select {
@@ -128,20 +149,27 @@ func (r *Runner) Run(ctx context.Context) {
 		case cmd := <-r.cmds:
 			switch cmd.kind {
 			case cmdStart:
-				r.handleStart(&backoffTimer)
+				r.handleStart(timers)
 			case cmdStop:
-				r.handleStop(&backoffTimer)
+				r.handleStop(timers)
 			}
 			if cmd.done != nil {
 				close(cmd.done)
 			}
 
 		case info := <-exitCh:
-			r.handleExit(info, &backoffTimer)
+			// The process is gone; the kill timer has done its job
+			// (or never fired) and is no longer needed.
+			timers.cancelStopKill()
+			r.handleExit(info, timers)
 
-		case <-timerCh:
-			backoffTimer = nil
-			r.handleBackoffExpired(&backoffTimer)
+		case <-backoffCh:
+			timers.backoff = nil
+			r.handleBackoffExpired(timers)
+
+		case <-stopKillCh:
+			timers.stopKill = nil
+			r.handleStopKillTimeout()
 		}
 	}
 }
@@ -311,33 +339,31 @@ func (r *Runner) setProcess(p Process) {
 	r.mu.Unlock()
 }
 
-func (r *Runner) handleStart(timer *Timer) {
+func (r *Runner) handleStart(timers *runnerTimers) {
 	switch r.State() {
 	case StatePending, StateStopped, StateFatal:
 		r.crashes = 0
 		r.nextDelay = r.cfg.BackoffInitial.Std()
-		r.spawnNext(timer)
+		r.spawnNext(timers)
 	case StateBackoff:
 		// Caller wants the service NOW; cancel the pending backoff.
-		if *timer != nil {
-			(*timer).Stop()
-			*timer = nil
-		}
-		r.spawnNext(timer)
+		timers.cancelBackoff()
+		r.spawnNext(timers)
 	default:
 		// Already starting/running/stopping — Start is a no-op.
 	}
 }
 
 // spawnNext spawns the configured command and transitions Starting->Running
-// (no readiness probe in Phase 4; Phase 5 inserts the probe between).
+// (the readiness probe lives in the orchestrator, not here, since it's
+// cross-service ordering rather than per-service state).
 // On spawn failure, increments crashes and schedules backoff (or fatal).
-func (r *Runner) spawnNext(timer *Timer) {
+func (r *Runner) spawnNext(timers *runnerTimers) {
 	r.setState(StateStarting)
 	proc, err := r.spawn(r.cfg, r.baseEnv)
 	if err != nil {
 		r.log.Error("spawn failed", "service", r.cfg.Name, "err", err)
-		r.recordFailure(timer)
+		r.recordFailure(timers)
 		return
 	}
 	r.setProcess(proc)
@@ -347,7 +373,7 @@ func (r *Runner) spawnNext(timer *Timer) {
 	r.setState(StateRunning)
 }
 
-func (r *Runner) handleExit(info reaper.ExitInfo, timer *Timer) {
+func (r *Runner) handleExit(info reaper.ExitInfo, timers *runnerTimers) {
 	r.mu.Lock()
 	r.lastExit = info
 	r.mu.Unlock()
@@ -390,13 +416,13 @@ func (r *Runner) handleExit(info reaper.ExitInfo, timer *Timer) {
 		r.nextDelay = r.cfg.BackoffInitial.Std()
 	}
 
-	r.recordFailure(timer)
+	r.recordFailure(timers)
 }
 
 // recordFailure increments the crash counter and either schedules
 // backoff or transitions to fatal once the retry budget is exhausted.
 // Shared between spawn-failed and process-exit-needs-restart paths.
-func (r *Runner) recordFailure(timer *Timer) {
+func (r *Runner) recordFailure(timers *runnerTimers) {
 	r.crashes++
 	if r.crashes >= MaxConsecutiveCrashes {
 		r.log.Warn("retry budget exceeded; fatal", "service", r.cfg.Name, "crashes", r.crashes)
@@ -405,7 +431,7 @@ func (r *Runner) recordFailure(timer *Timer) {
 	}
 	delay := r.backoffStep()
 	r.log.Info("backoff", "service", r.cfg.Name, "delay", delay, "crashes", r.crashes)
-	*timer = r.clock.NewTimer(delay)
+	timers.backoff = r.clock.NewTimer(delay)
 	r.setState(StateBackoff)
 }
 
@@ -425,14 +451,14 @@ func (r *Runner) backoffStep() time.Duration {
 	return delay
 }
 
-func (r *Runner) handleBackoffExpired(timer *Timer) {
+func (r *Runner) handleBackoffExpired(timers *runnerTimers) {
 	if r.State() != StateBackoff {
 		return
 	}
-	r.spawnNext(timer)
+	r.spawnNext(timers)
 }
 
-func (r *Runner) handleStop(timer *Timer) {
+func (r *Runner) handleStop(timers *runnerTimers) {
 	switch r.State() {
 	case StateStarting, StateRunning:
 		sig, ok := config.ParseSignal(r.cfg.StopSignal)
@@ -445,19 +471,40 @@ func (r *Runner) handleStop(timer *Timer) {
 			}
 		}
 		r.setState(StateStopping)
-		// Phase 6 will add the SIGKILL-after-timeout escalation.
+		// Schedule SIGKILL escalation if the process doesn't exit by
+		// stop_timeout. handleExit cancels the timer if the process
+		// dies on its own first.
+		timers.stopKill = r.clock.NewTimer(r.cfg.StopTimeout.Std())
 
 	case StateBackoff:
-		if *timer != nil {
-			(*timer).Stop()
-			*timer = nil
-		}
+		timers.cancelBackoff()
 		r.setState(StateStopped)
 
 	case StatePending:
 		r.setState(StateStopped)
 
 	default:
-		// stopping/stopped/fatal — no-op
+		// stopping/stopped/fatal — no-op (SIGKILL timer, if any, keeps running)
+	}
+}
+
+// handleStopKillTimeout fires when stop_timeout has elapsed since Stop
+// and the process is still alive. We escalate to SIGKILL on the process
+// group; the kernel will reap and the resulting Exit will transition us
+// to Stopped. Stays in Stopping until that happens — SIGKILL is
+// uncatchable, so for any process not stuck in uninterruptible kernel
+// sleep this is a matter of milliseconds.
+func (r *Runner) handleStopKillTimeout() {
+	if r.State() != StateStopping {
+		return
+	}
+	p := r.currentProcess()
+	if p == nil {
+		return
+	}
+	r.log.Warn("stop_timeout exceeded; escalating to SIGKILL",
+		"service", r.cfg.Name, "pid", p.PID(), "stop_timeout", r.cfg.StopTimeout.Std())
+	if err := p.SignalGroup(syscall.SIGKILL); err != nil {
+		r.log.Error("SIGKILL failed", "service", r.cfg.Name, "err", err)
 	}
 }

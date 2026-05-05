@@ -339,6 +339,43 @@ stop_timeout = "3s"
 	}
 }
 
+// #6 (smoke version): a service that traps SIGTERM and runs sleep 30
+// must still shut down promptly because the runner escalates to SIGKILL
+// after stop_timeout. The whole shutdown should land within
+// stop_timeout + a small grace, not the full 30s sleep.
+func TestSuperviseStopEscalatesToKill(t *testing.T) {
+	cfg := t.TempDir()
+	writeFile(t, filepath.Join(cfg, "services", "10_stubborn.toml"), `
+command = ["/bin/sh", "-c", "trap '' TERM; sleep 30"]
+restart = "always"
+stop_timeout = "1s"
+`)
+
+	envFile := filepath.Join(t.TempDir(), "env")
+	cmd := exec.Command(zpinitBin, "--config", cfg)
+	cmd.Env = append(os.Environ(), "ZPINIT_ENV_FILE="+envFile)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// Let it boot.
+	time.Sleep(300 * time.Millisecond)
+
+	start := time.Now()
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("zpinit exit error: %v\nstderr:\n%s", err, stderr.String())
+	}
+	elapsed := time.Since(start)
+	if elapsed > 4*time.Second {
+		t.Errorf("shutdown took %v; SIGKILL escalation should have killed the trap-TERM service", elapsed)
+	}
+	if !strings.Contains(stderr.String(), "SIGKILL") {
+		t.Errorf("expected stderr to mention SIGKILL escalation; got:\n%s", stderr.String())
+	}
+}
+
 // #22: CMD wins over services. Services TOML present + CMD provided →
 // CMD execs, services never spawned.
 func TestCmdWinsOverServices(t *testing.T) {

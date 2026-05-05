@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/0ploy/zpinit/internal/config"
 	"github.com/0ploy/zpinit/internal/reaper"
@@ -164,11 +165,14 @@ func (o *Orchestrator) startExitCodeWatcher(ctx context.Context) <-chan struct{}
 	return done
 }
 
-// stopAll signals each running service in reverse start order, waiting
-// up to the per-service stop_timeout. Phase 6 adds SIGKILL escalation
-// once the timeout elapses; until then a service that ignores its
-// stop_signal will leak past zpinit's exit.
+// stopAll signals each running service in reverse start order. The
+// per-runner SIGKILL escalation (handleStopKillTimeout) handles
+// processes that ignore their stop_signal, so this loop just waits
+// for each runner to reach Stopped/Fatal. The wait budget is
+// stop_timeout plus a few seconds of slack for SIGKILL → kernel
+// kill → SIGCHLD → reaper dispatch.
 func (o *Orchestrator) stopAll() {
+	const reapGrace = 5 * time.Second
 	for i := len(o.runners) - 1; i >= 0; i-- {
 		r := o.runners[i]
 		switch r.State() {
@@ -179,9 +183,12 @@ func (o *Orchestrator) stopAll() {
 		o.log.Info("stop: signaling", "service", cfg.Name)
 		r.Stop()
 
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.StopTimeout.Std())
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.StopTimeout.Std()+reapGrace)
 		if _, err := r.WaitTerminal(ctx); err != nil {
-			o.log.Warn("service did not stop within stop_timeout (Phase 6 will SIGKILL escalate)",
+			// Even SIGKILL didn't bring it down within the grace —
+			// process is likely stuck in uninterruptible kernel
+			// sleep. Nothing more we can do here.
+			o.log.Error("service did not terminate even after SIGKILL escalation",
 				"service", cfg.Name, "state", r.State(), "err", err)
 		}
 		cancel()

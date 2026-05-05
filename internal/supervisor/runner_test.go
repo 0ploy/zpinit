@@ -335,6 +335,85 @@ func TestRunner_StopDuringRunning(t *testing.T) {
 	f.waitState(StateStopped, time.Second)
 }
 
+// Phase 6: when stop_timeout elapses without the process exiting,
+// the runner sends SIGKILL to the process group.
+func TestRunner_StopEscalatesToKillAfterStopTimeout(t *testing.T) {
+	f := newFixture(t, config.Service{
+		Command:     []string{"x"},
+		Restart:     config.RestartAlways,
+		StopSignal:  "TERM",
+		StopTimeout: config.Duration(10 * time.Second),
+	})
+	f.runner.Start()
+	p := f.nextProcess(time.Second)
+	f.waitState(StateRunning, time.Second)
+
+	go f.runner.Stop()
+	f.waitState(StateStopping, time.Second)
+
+	// First signal is the configured stop_signal.
+	sigs := p.signalsReceived()
+	if len(sigs) != 1 || sigs[0] != syscall.SIGTERM {
+		t.Fatalf("after Stop: signals = %v, want [SIGTERM]", sigs)
+	}
+
+	// Process refuses to exit. Cross the stop_timeout — SIGKILL fires.
+	f.clock.Advance(10 * time.Second)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(p.signalsReceived()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	sigs = p.signalsReceived()
+	if len(sigs) != 2 || sigs[1] != syscall.SIGKILL {
+		t.Errorf("after stop_timeout: signals = %v, want [SIGTERM, SIGKILL]", sigs)
+	}
+
+	// Kernel reaps the SIGKILL'd process; runner transitions to Stopped.
+	p.pushExit(reaper.ExitInfo{Signaled: true, Signal: syscall.SIGKILL})
+	f.waitState(StateStopped, time.Second)
+}
+
+// If the process does exit before stop_timeout, the kill timer must
+// be canceled so it doesn't fire on a later Spawn (the next service
+// instance would otherwise get an immediate phantom SIGKILL).
+func TestRunner_StopKillTimerCanceledOnEarlyExit(t *testing.T) {
+	f := newFixture(t, config.Service{
+		Command:     []string{"x"},
+		Restart:     config.RestartAlways,
+		StopSignal:  "TERM",
+		StopTimeout: config.Duration(10 * time.Second),
+	})
+	f.runner.Start()
+	p := f.nextProcess(time.Second)
+	f.waitState(StateRunning, time.Second)
+
+	go f.runner.Stop()
+	f.waitState(StateStopping, time.Second)
+
+	// Process exits cleanly in response to SIGTERM.
+	p.pushExit(reaper.ExitInfo{Signaled: true, Signal: syscall.SIGTERM})
+	f.waitState(StateStopped, time.Second)
+
+	// Now Start again; the previous kill timer firing would send
+	// SIGKILL to the new process. Verify the new process only ever
+	// sees the signals we explicitly send it.
+	f.runner.Start()
+	p2 := f.nextProcess(time.Second)
+	f.waitState(StateRunning, time.Second)
+
+	// Cross the would-be-original-kill-timer deadline.
+	f.clock.Advance(15 * time.Second)
+	time.Sleep(50 * time.Millisecond)
+
+	if got := p2.signalsReceived(); len(got) != 0 {
+		t.Errorf("new process received signals from a leaked kill timer: %v", got)
+	}
+}
+
 func TestRunner_StopDuringBackoff(t *testing.T) {
 	f := newFixture(t, config.Service{
 		Command: []string{"x"},

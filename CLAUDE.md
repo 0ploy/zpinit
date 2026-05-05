@@ -70,9 +70,11 @@ implementing.
   fds for the child, so the parent's copies leak file handles.
 - `ZPINIT_ENV_FILE` is an internal/test override for the env-file path. Production
   always reads `/run/zpinit/env`. Don't expose it in `--help` or document it publicly.
-- Stop sends one signal and parks in Stopping until the process exits. SIGKILL
-  escalation arrives in Phase 6 — until then, a process that ignores `stop_signal`
-  blocks the runner up to its `stop_timeout` and then leaks past zpinit's exit.
+- Stop sends `stop_signal` to the process group, then escalates to SIGKILL after
+  `stop_timeout` via `handleStopKillTimeout`. The kill timer slot in `runnerTimers`
+  must be canceled in `handleExit` — otherwise an early clean exit followed by a
+  later Start would leak SIGKILL onto the next instance. Test
+  `TestRunner_StopKillTimerCanceledOnEarlyExit` guards this.
 
 - supervise mode splits signals onto two channels: SIGCHLD goes to a dedicated
   reaper goroutine that runs throughout shutdown, user signals (TERM/INT/HUP) go

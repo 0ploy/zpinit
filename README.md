@@ -4,11 +4,11 @@ A single static Go binary that runs as PID 1 in Docker containers, folding toget
 typically takes three tools (tini + a hand-rolled `docker-entrypoint.sh` + supervisord)
 into one consistent mental model.
 
-**Status: in development.** Phase 5 of 8 complete. Wrap mode and supervise mode both
+**Status: in development.** Phase 6 of 8 complete. Wrap mode and supervise mode both
 work end-to-end: ordered boot with optional readiness probes, per-service backoff and
-retry budget, exit-code propagation from a designated foreground worker. Phase 6
-(graceful shutdown with SIGKILL escalation), Phase 7 (SIGHUP reload), and Phase 8
-(`zpctl` control socket) are still ahead.
+retry budget, graceful shutdown that escalates to SIGKILL on each service's
+`stop_timeout`, exit-code propagation from a designated foreground worker. Phase 7
+(SIGHUP reload) and Phase 8 (`zpctl` control socket) are still ahead.
 
 ## How it works
 
