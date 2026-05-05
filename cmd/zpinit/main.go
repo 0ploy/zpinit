@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/0ploy/zpinit/internal/config"
 	"github.com/0ploy/zpinit/internal/reaper"
 )
 
@@ -28,8 +29,7 @@ func main() {
 	}
 
 	if checkConfig != "" {
-		fmt.Fprintln(os.Stderr, "zpinit: --check-config is not yet implemented (Phase 2)")
-		os.Exit(2)
+		os.Exit(runCheckConfig(checkConfig))
 	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -39,6 +39,19 @@ func main() {
 	}
 
 	os.Exit(run(log))
+}
+
+func runCheckConfig(dir string) int {
+	cfg, err := config.Load(dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	for _, w := range cfg.Warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+	fmt.Printf("config OK: %d service(s) in %s/services\n", len(cfg.Services), dir)
+	return 0
 }
 
 func run(log *slog.Logger) int {
