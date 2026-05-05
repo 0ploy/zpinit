@@ -4,11 +4,12 @@ A single static Go binary that runs as PID 1 in Docker containers, folding toget
 typically takes three tools (tini + a hand-rolled `docker-entrypoint.sh` + supervisord)
 into one consistent mental model.
 
-**Status: in development.** Phase 6 of 8 complete. Wrap mode and supervise mode both
+**Status: in development.** Phase 7 of 8 complete. Wrap mode and supervise mode both
 work end-to-end: ordered boot with optional readiness probes, per-service backoff and
 retry budget, graceful shutdown that escalates to SIGKILL on each service's
-`stop_timeout`, exit-code propagation from a designated foreground worker. Phase 7
-(SIGHUP reload) and Phase 8 (`zpctl` control socket) are still ahead.
+`stop_timeout`, exit-code propagation from a designated foreground worker, and
+SIGHUP-driven reload that adds, removes, or restarts services from a re-read of
+the config directory. Phase 8 (`zpctl` control socket) is still ahead.
 
 ## How it works
 
@@ -71,6 +72,14 @@ zpinit --check-config /etc/zpinit/
 ```
 
 Exit 0 with a one-line OK summary, or exit 1 with every problem found in one pass.
+
+## Reload
+
+Send `SIGHUP` to the running zpinit process to apply config changes without a
+container restart. zpinit re-reads `/etc/zpinit/`, diffs the result against the
+running set by **filename**, and applies the difference: new files start as new
+services, removed files trigger graceful stop, content changes restart the
+service (unless `reloadable = false`). A file rename is a remove + add.
 
 ## Foreground worker pattern
 

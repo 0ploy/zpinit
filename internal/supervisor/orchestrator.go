@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -31,6 +33,14 @@ type Orchestrator struct {
 	clock   Clock
 
 	runners []*Runner
+
+	// runnerCtx and wg are populated by Run and used by Reload to spawn
+	// goroutines for newly-added services on the same lifecycle as the
+	// initial set. Reload is called from the main goroutine while
+	// orch.Run is parked in its steady-state select, so they don't race
+	// over runners/cfg in practice — see the Reload comment for details.
+	runnerCtx context.Context
+	wg        *sync.WaitGroup
 }
 
 // NewOrchestrator builds an Orchestrator wired to the production
@@ -78,12 +88,10 @@ func (o *Orchestrator) Run(ctx context.Context) int {
 	defer wg.Wait()
 	runnerCtx, cancelRunners := context.WithCancel(context.Background())
 	defer cancelRunners()
+	o.runnerCtx = runnerCtx
+	o.wg = &wg
 	for _, r := range o.runners {
-		wg.Add(1)
-		go func(r *Runner) {
-			defer wg.Done()
-			r.Run(runnerCtx)
-		}(r)
+		o.spawnRunnerGoroutine(r)
 	}
 
 	bootCtx, bootCancel := context.WithTimeout(ctx, o.cfg.Globals.BootTimeout.Std())
@@ -192,6 +200,169 @@ func (o *Orchestrator) stopAll() {
 				"service", cfg.Name, "state", r.State(), "err", err)
 		}
 		cancel()
+	}
+}
+
+func (o *Orchestrator) spawnRunnerGoroutine(r *Runner) {
+	o.wg.Add(1)
+	go func() {
+		defer o.wg.Done()
+		r.Run(o.runnerCtx)
+	}()
+}
+
+// Reload diffs the current service set against newCfg and applies
+// add/remove/restart actions. Identity is by filename per the spec
+// ("file rename = remove + add"); service-name reuse across renames
+// is not preserved.
+//
+// Restart is implemented as remove + add. A `reloadable = false`
+// service whose config changed is left untouched and logged.
+//
+// Safe to call concurrently with orch.Run because orch.Run only reads
+// o.runners during initial boot or stopAll; both happen outside the
+// steady-state window when SIGHUP is processed. exit_code_from
+// pointing at a reload-removed service will fire shutdown via the
+// existing watcher — that's a known interaction worth flagging in
+// release notes if it bites someone.
+func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) error {
+	diff := o.computeDiff(newCfg.Services)
+	o.log.Info("reload", "add", len(diff.add), "remove", len(diff.remove), "restart", len(diff.restart))
+
+	for _, r := range diff.remove {
+		o.removeService(ctx, r)
+	}
+	for _, p := range diff.restart {
+		o.removeService(ctx, p.old)
+		o.addService(ctx, p.new, newCfg.Globals)
+	}
+	for _, s := range diff.add {
+		o.addService(ctx, s, newCfg.Globals)
+	}
+
+	// Keep runners filename-sorted so stopAll's reverse iteration matches
+	// the original boot order even after adds.
+	sort.Slice(o.runners, func(i, j int) bool {
+		return o.runners[i].Cfg().Filename < o.runners[j].Cfg().Filename
+	})
+
+	o.cfg = newCfg
+	return nil
+}
+
+type reloadRestartPair struct {
+	old *Runner
+	new config.Service
+}
+
+type reloadDiff struct {
+	add     []config.Service
+	remove  []*Runner
+	restart []reloadRestartPair
+}
+
+// computeDiff produces a stable, filename-sorted action list. Pure
+// function (no I/O, no goroutines), kept private but exposed via tests
+// in the same package.
+func (o *Orchestrator) computeDiff(newSvcs []config.Service) reloadDiff {
+	existing := map[string]*Runner{}
+	for _, r := range o.runners {
+		existing[r.Cfg().Filename] = r
+	}
+	newSet := map[string]config.Service{}
+	for _, s := range newSvcs {
+		newSet[s.Filename] = s
+	}
+
+	allFiles := map[string]struct{}{}
+	for fn := range existing {
+		allFiles[fn] = struct{}{}
+	}
+	for fn := range newSet {
+		allFiles[fn] = struct{}{}
+	}
+	ordered := make([]string, 0, len(allFiles))
+	for fn := range allFiles {
+		ordered = append(ordered, fn)
+	}
+	sort.Strings(ordered)
+
+	var diff reloadDiff
+	for _, fn := range ordered {
+		old, hasOld := existing[fn]
+		s, hasNew := newSet[fn]
+		switch {
+		case hasOld && !hasNew:
+			diff.remove = append(diff.remove, old)
+		case !hasOld && hasNew:
+			diff.add = append(diff.add, s)
+		case hasOld && hasNew:
+			if !servicesEqual(old.Cfg(), s) {
+				if old.Cfg().IsReloadable() {
+					diff.restart = append(diff.restart, reloadRestartPair{old: old, new: s})
+				} else {
+					o.log.Info("reload: config changed but reloadable=false; ignoring",
+						"service", old.Cfg().Name, "file", fn)
+				}
+			}
+		}
+	}
+	return diff
+}
+
+// servicesEqual compares two service configs ignoring Filename, which
+// is the diff key rather than a content field.
+func servicesEqual(a, b config.Service) bool {
+	a.Filename = ""
+	b.Filename = ""
+	return reflect.DeepEqual(a, b)
+}
+
+func (o *Orchestrator) removeService(ctx context.Context, r *Runner) {
+	cfg := r.Cfg()
+	o.log.Info("reload: removing", "service", cfg.Name)
+	r.Stop()
+	wctx, cancel := context.WithTimeout(ctx, cfg.StopTimeout.Std()+5*time.Second)
+	if _, err := r.WaitTerminal(wctx); err != nil {
+		o.log.Warn("reload: removed service did not terminate cleanly",
+			"service", cfg.Name, "err", err)
+	}
+	cancel()
+	for i, x := range o.runners {
+		if x == r {
+			o.runners = append(o.runners[:i], o.runners[i+1:]...)
+			break
+		}
+	}
+	// Note: the runner's Run goroutine stays parked on runnerCtx until
+	// orchestrator shutdown. Acceptable for typical reload patterns.
+}
+
+func (o *Orchestrator) addService(ctx context.Context, cfg config.Service, globals config.Globals) {
+	o.log.Info("reload: adding", "service", cfg.Name)
+	r := NewRunner(cfg, o.baseEnv, o.spawner, o.clock, o.log)
+	o.runners = append(o.runners, r)
+	o.spawnRunnerGoroutine(r)
+
+	bctx, bcancel := context.WithTimeout(ctx, globals.BootTimeout.Std())
+	defer bcancel()
+
+	r.Start()
+	if err := r.WaitBootResult(bctx); err != nil {
+		o.log.Error("reload: added service failed to boot", "service", cfg.Name, "err", err)
+		return
+	}
+	if cfg.Ready != nil {
+		env := service.MergeEnv(o.baseEnv, cfg.Env)
+		if err := waitReady(bctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
+			if cfg.Ready.OnTimeout == config.ReadyContinue {
+				o.log.Warn("reload: readiness failed; continuing per on_timeout",
+					"service", cfg.Name, "err", err)
+			} else {
+				o.log.Error("reload: added service readiness failed",
+					"service", cfg.Name, "err", err)
+			}
+		}
 	}
 }
 

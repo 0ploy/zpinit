@@ -339,6 +339,74 @@ stop_timeout = "3s"
 	}
 }
 
+// #7 (host approximation): SIGHUP causes zpinit to re-read the config
+// directory and start newly-added services without a restart.
+func TestSuperviseSighupAddsService(t *testing.T) {
+	cfg := t.TempDir()
+	tmp := t.TempDir()
+	a := filepath.Join(tmp, "a")
+	b := filepath.Join(tmp, "b")
+
+	writeFile(t, filepath.Join(cfg, "services", "10_a.toml"), fmt.Sprintf(`
+command = ["/bin/sh", "-c", "touch %s; sleep 30"]
+restart = "always"
+stop_timeout = "1s"
+`, a))
+
+	envFile := filepath.Join(t.TempDir(), "env")
+	cmd := exec.Command(zpinitBin, "--config", cfg)
+	cmd.Env = append(os.Environ(), "ZPINIT_ENV_FILE="+envFile)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(syscall.SIGKILL)
+		_ = cmd.Wait()
+	})
+
+	// Wait for a's marker to confirm it's running.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(a); err == nil {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if _, err := os.Stat(a); err != nil {
+		t.Fatalf("a never started; stderr:\n%s", stderr.String())
+	}
+
+	// Drop a new service file and SIGHUP.
+	writeFile(t, filepath.Join(cfg, "services", "20_b.toml"), fmt.Sprintf(`
+command = ["/bin/sh", "-c", "touch %s; sleep 30"]
+restart = "always"
+stop_timeout = "1s"
+`, b))
+	if err := cmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+
+	// b should appear shortly after the reload.
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(b); err == nil {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if _, err := os.Stat(b); err != nil {
+		t.Fatalf("b never started after SIGHUP; stderr:\n%s", stderr.String())
+	}
+
+	// Clean shutdown.
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("zpinit exit error: %v\nstderr:\n%s", err, stderr.String())
+	}
+}
+
 // #6 (smoke version): a service that traps SIGTERM and runs sleep 30
 // must still shut down promptly because the runner escalates to SIGKILL
 // after stop_timeout. The whole shutdown should land within

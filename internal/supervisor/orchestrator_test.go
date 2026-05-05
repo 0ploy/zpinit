@@ -351,6 +351,209 @@ func TestOrchestrator_ReadinessTimeoutContinueProceeds(t *testing.T) {
 	f.awaitExit(3 * time.Second)
 }
 
+// computeDiff is a pure function — easiest to test directly without
+// running orch.Run. Build orchestrator with hand-rolled runners.
+func diffFixture(t *testing.T, services []config.Service) *Orchestrator {
+	t.Helper()
+	o := &Orchestrator{
+		cfg: &config.Config{Services: services},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	for _, s := range services {
+		r := NewRunner(s, nil, nil, nil, o.log)
+		o.runners = append(o.runners, r)
+	}
+	return o
+}
+
+func mustService(name, file string, body func(*config.Service)) config.Service {
+	s := config.Service{
+		Name:              name,
+		Filename:          file,
+		Command:           []string{"x", name},
+		Restart:           config.RestartAlways,
+		BackoffInitial:    config.Duration(time.Second),
+		BackoffMax:        config.Duration(30 * time.Second),
+		BackoffResetAfter: config.Duration(60 * time.Second),
+		StopSignal:        "TERM",
+		StopTimeout:       config.Duration(time.Second),
+		Log:               config.Logging{Stdout: "inherit", Stderr: "inherit"},
+	}
+	if body != nil {
+		body(&s)
+	}
+	return s
+}
+
+func TestDiff_Empty(t *testing.T) {
+	svcs := []config.Service{
+		mustService("a", "10_a.toml", nil),
+		mustService("b", "20_b.toml", nil),
+	}
+	o := diffFixture(t, svcs)
+	d := o.computeDiff(svcs)
+	if len(d.add)+len(d.remove)+len(d.restart) != 0 {
+		t.Errorf("expected empty diff; got %+v", d)
+	}
+}
+
+func TestDiff_Add(t *testing.T) {
+	old := []config.Service{mustService("a", "10_a.toml", nil)}
+	new_ := []config.Service{
+		mustService("a", "10_a.toml", nil),
+		mustService("b", "20_b.toml", nil),
+	}
+	o := diffFixture(t, old)
+	d := o.computeDiff(new_)
+	if len(d.add) != 1 || d.add[0].Filename != "20_b.toml" {
+		t.Errorf("add = %+v", d.add)
+	}
+	if len(d.remove) != 0 || len(d.restart) != 0 {
+		t.Errorf("unexpected diff: %+v", d)
+	}
+}
+
+func TestDiff_Remove(t *testing.T) {
+	old := []config.Service{
+		mustService("a", "10_a.toml", nil),
+		mustService("b", "20_b.toml", nil),
+	}
+	new_ := []config.Service{mustService("a", "10_a.toml", nil)}
+	o := diffFixture(t, old)
+	d := o.computeDiff(new_)
+	if len(d.remove) != 1 || d.remove[0].Cfg().Filename != "20_b.toml" {
+		t.Errorf("remove = %+v", d.remove)
+	}
+}
+
+func TestDiff_Restart(t *testing.T) {
+	old := []config.Service{mustService("a", "10_a.toml", nil)}
+	new_ := []config.Service{mustService("a", "10_a.toml", func(s *config.Service) {
+		s.Command = []string{"x", "a", "--new-flag"}
+	})}
+	o := diffFixture(t, old)
+	d := o.computeDiff(new_)
+	if len(d.restart) != 1 {
+		t.Fatalf("restart count = %d, want 1", len(d.restart))
+	}
+	if d.restart[0].new.Command[2] != "--new-flag" {
+		t.Errorf("restart payload missing new flag: %v", d.restart[0].new.Command)
+	}
+}
+
+func TestDiff_NotReloadableSkipsRestart(t *testing.T) {
+	notReload := false
+	old := []config.Service{mustService("a", "10_a.toml", func(s *config.Service) {
+		s.Reloadable = &notReload
+	})}
+	new_ := []config.Service{mustService("a", "10_a.toml", func(s *config.Service) {
+		s.Reloadable = &notReload
+		s.Command = []string{"x", "a", "--changed"}
+	})}
+	o := diffFixture(t, old)
+	d := o.computeDiff(new_)
+	if len(d.restart) != 0 {
+		t.Errorf("non-reloadable service should not be restarted: %+v", d.restart)
+	}
+}
+
+func TestDiff_RenameIsRemoveAdd(t *testing.T) {
+	old := []config.Service{mustService("redis", "10_redis.toml", nil)}
+	new_ := []config.Service{mustService("redis", "20_redis.toml", nil)}
+	o := diffFixture(t, old)
+	d := o.computeDiff(new_)
+	if len(d.remove) != 1 || d.remove[0].Cfg().Filename != "10_redis.toml" {
+		t.Errorf("expected to remove 10_redis.toml; got %+v", d.remove)
+	}
+	if len(d.add) != 1 || d.add[0].Filename != "20_redis.toml" {
+		t.Errorf("expected to add 20_redis.toml; got %+v", d.add)
+	}
+}
+
+func TestReload_AddsService(t *testing.T) {
+	initial := []config.Service{mustService("a", "10_a.toml", nil)}
+	f, captured := newCapturingFixture(t, initial, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+
+	// Wait for initial.
+	waitForSpawnCount(t, captured, 1, 2*time.Second)
+
+	// Reload with one extra service.
+	newCfg := &config.Config{
+		Services: []config.Service{
+			mustService("a", "10_a.toml", nil),
+			mustService("b", "20_b.toml", nil),
+		},
+		Globals: f.cfg.Globals,
+	}
+	if err := f.orch.Reload(ctx, newCfg); err != nil {
+		t.Fatal(err)
+	}
+	waitForSpawnCount(t, captured, 2, 2*time.Second)
+
+	cancel()
+	for _, p := range captured.snapshot() {
+		go p.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}
+	f.awaitExit(3 * time.Second)
+}
+
+func TestReload_RemovesService(t *testing.T) {
+	initial := []config.Service{
+		mustService("a", "10_a.toml", nil),
+		mustService("b", "20_b.toml", nil),
+	}
+	f, captured := newCapturingFixture(t, initial, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+	waitForSpawnCount(t, captured, 2, 2*time.Second)
+
+	// Reload removes b.
+	newCfg := &config.Config{
+		Services: []config.Service{mustService("a", "10_a.toml", nil)},
+		Globals:  f.cfg.Globals,
+	}
+
+	// b's process must receive a stop signal during Reload — push its
+	// exit so the WaitTerminal in removeService unblocks promptly.
+	bProc := captured.snapshot()[1]
+	go func() {
+		// SIGTERM arrives via Stop; deliver synthetic exit shortly after.
+		time.Sleep(80 * time.Millisecond)
+		bProc.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}()
+
+	if err := f.orch.Reload(ctx, newCfg); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := len(f.orch.runners); got != 1 {
+		t.Errorf("runners after reload = %d, want 1", got)
+	}
+
+	cancel()
+	// a's process still alive — deliver its synthetic exit.
+	go captured.snapshot()[0].pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	f.awaitExit(3 * time.Second)
+}
+
+func waitForSpawnCount(t *testing.T, c *capturedProcs, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(c.snapshot()) >= want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("got %d spawns, want %d", len(c.snapshot()), want)
+}
+
 func TestOrchestrator_ExitCodeFromWorker(t *testing.T) {
 	worker := dummyService("worker", false)
 	worker.Restart = config.RestartNever

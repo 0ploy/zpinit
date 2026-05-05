@@ -76,6 +76,21 @@ implementing.
   later Start would leak SIGKILL onto the next instance. Test
   `TestRunner_StopKillTimerCanceledOnEarlyExit` guards this.
 
+- Reload identity is by **filename**, not service name. A rename
+  (`10_redis.toml` → `20_redis.toml`) is a remove + add, even if the resolved
+  service name is unchanged — per the spec. Config-content equality ignores
+  the Filename field, so a content-only edit (in place) becomes a restart
+  rather than an unrelated remove + add.
+
+- Removed Runners' goroutines stay parked on the shared `runnerCtx` until
+  orchestrator shutdown. Acceptable for typical reload cadence; if reload-heavy
+  workloads ever surface, give each Runner its own ctx with `runnerEntry`.
+
+- If `exit_code_from` points at a service and that service is removed via
+  reload, its WaitTerminal-watcher fires and shuts the supervisor down. Avoid
+  reload-removing the watched service — Phase 8's zpctl will surface this in
+  release notes.
+
 - supervise mode splits signals onto two channels: SIGCHLD goes to a dedicated
   reaper goroutine that runs throughout shutdown, user signals (TERM/INT/HUP) go
   to the main loop. Don't collapse them — sharing one channel means the SIGTERM

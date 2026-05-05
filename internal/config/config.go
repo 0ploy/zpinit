@@ -73,8 +73,10 @@ type Service struct {
 	Ready      *Ready            `toml:"ready"`
 }
 
-// IsReloadable returns true unless the service explicitly set reloadable=false.
-func (s *Service) IsReloadable() bool {
+// IsReloadable returns true unless the service explicitly set
+// reloadable=false. Value receiver so callers holding a Service
+// (rather than *Service) can call it directly.
+func (s Service) IsReloadable() bool {
 	return s.Reloadable == nil || *s.Reloadable
 }
 

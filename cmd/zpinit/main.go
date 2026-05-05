@@ -94,7 +94,7 @@ func run(log *slog.Logger, configDir string, cmdline []string) int {
 	case modeWrap:
 		return execCmd(log, cmdline, finalEnv)
 	case modeSupervise:
-		return runSupervise(log, cfg, finalEnv, r)
+		return runSupervise(log, configDir, cfg, finalEnv, r)
 	case modeError:
 		fmt.Fprintf(os.Stderr,
 			"zpinit: nothing to do — provide a CMD or populate %s\n",
@@ -189,8 +189,9 @@ func indexEq(s string) int {
 // block reading SIGCHLDs, the reaper would stop, and child Exit
 // channels would never fire (Phase 5 had this bug for one commit).
 //
-// Phase 7 will route SIGHUP to the orchestrator's reload path.
-func runSupervise(log *slog.Logger, cfg *config.Config, env map[string]string, r *reaper.Reaper) int {
+// SIGHUP triggers a reload via orchestrator.Reload (Phase 7): re-load
+// config from disk, diff against the running set, apply add/remove/restart.
+func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env map[string]string, r *reaper.Reaper) int {
 	chldCh := make(chan os.Signal, 16)
 	signal.Notify(chldCh, syscall.SIGCHLD)
 	userCh := make(chan os.Signal, 8)
@@ -245,7 +246,15 @@ func runSupervise(log *slog.Logger, cfg *config.Config, env map[string]string, r
 					return 1
 				}
 			case syscall.SIGHUP:
-				log.Info("SIGHUP received; reload not yet implemented (Phase 7)")
+				log.Info("SIGHUP: reloading config", "dir", configDir)
+				newCfg, err := config.Load(configDir)
+				if err != nil {
+					log.Error("reload: config load failed; keeping running set", "err", err)
+					continue
+				}
+				if err := orch.Reload(ctx, newCfg); err != nil {
+					log.Error("reload: failed", "err", err)
+				}
 			}
 		case code := <-exitCh:
 			cleanup()
