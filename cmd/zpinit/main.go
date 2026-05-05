@@ -10,10 +10,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/0ploy/zpinit/internal/config"
 	"github.com/0ploy/zpinit/internal/entrypoint"
 	"github.com/0ploy/zpinit/internal/reaper"
+	"github.com/0ploy/zpinit/internal/supervisor"
 )
 
 var version = "dev"
@@ -92,8 +94,7 @@ func run(log *slog.Logger, configDir string, cmdline []string) int {
 	case modeWrap:
 		return execCmd(log, cmdline, finalEnv)
 	case modeSupervise:
-		log.Info("supervise mode (services start in Phase 3+); idling on signal loop", "service_count", len(cfg.Services))
-		return supervisorPlaceholder(log, r)
+		return runSupervise(log, cfg, finalEnv, r)
 	case modeError:
 		fmt.Fprintf(os.Stderr,
 			"zpinit: nothing to do — provide a CMD or populate %s\n",
@@ -180,28 +181,75 @@ func indexEq(s string) int {
 	return -1
 }
 
-// supervisorPlaceholder keeps zpinit alive in supervise mode until a real
-// supervisor lands in Phase 3+. It runs the same signal loop as Phase 1
-// so SIGCHLD reaps and SIGTERM exits cleanly — this is what integration
-// test #20 ("supervise mode keeps PID 1 alive") exercises.
-func supervisorPlaceholder(log *slog.Logger, r *reaper.Reaper) int {
-	sigCh := make(chan os.Signal, 16)
-	signal.Notify(sigCh, syscall.SIGCHLD, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	defer signal.Stop(sigCh)
+// runSupervise is the supervise-mode entry point. It splits signals
+// onto two channels: SIGCHLD goes to a dedicated reaper goroutine that
+// runs throughout shutdown, and SIGTERM/INT/HUP go to the user-signal
+// loop here. The split is load-bearing — if reaping shared a channel
+// with shutdown, the SIGTERM handler's wait for orchestrator exit would
+// block reading SIGCHLDs, the reaper would stop, and child Exit
+// channels would never fire (Phase 5 had this bug for one commit).
+//
+// Phase 7 will route SIGHUP to the orchestrator's reload path.
+func runSupervise(log *slog.Logger, cfg *config.Config, env map[string]string, r *reaper.Reaper) int {
+	chldCh := make(chan os.Signal, 16)
+	signal.Notify(chldCh, syscall.SIGCHLD)
+	userCh := make(chan os.Signal, 8)
+	signal.Notify(userCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 
-	log.Info("zpinit started", "version", version, "pid", os.Getpid())
+	reaperStop := make(chan struct{})
+	reaperDone := make(chan struct{})
+	go func() {
+		defer close(reaperDone)
+		for {
+			select {
+			case <-chldCh:
+				r.Reap()
+			case <-reaperStop:
+				r.Reap() // final drain
+				return
+			}
+		}
+	}()
+	cleanup := func() {
+		close(reaperStop)
+		<-reaperDone
+		signal.Stop(userCh)
+		signal.Stop(chldCh)
+	}
+
+	envSlice := entrypoint.SliceFromEnviron(env)
+	orch := supervisor.NewOrchestrator(cfg, envSlice, r, log)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	exitCh := make(chan int, 1)
+	go func() { exitCh <- orch.Run(ctx) }()
+
+	log.Info("zpinit started", "version", version, "pid", os.Getpid(), "services", len(cfg.Services))
 
 	for {
-		sig := <-sigCh
-		switch sig {
-		case syscall.SIGCHLD:
-			r.Reap()
-		case syscall.SIGTERM, syscall.SIGINT:
-			log.Info("shutdown signal received", "signal", sig.String())
-			r.Reap()
-			return 0
-		case syscall.SIGHUP:
-			log.Info("SIGHUP received; reload not yet implemented (Phase 7)")
+		select {
+		case sig := <-userCh:
+			switch sig {
+			case syscall.SIGTERM, syscall.SIGINT:
+				log.Info("shutdown signal", "signal", sig.String())
+				cancel()
+				select {
+				case code := <-exitCh:
+					cleanup()
+					return code
+				case <-time.After(120 * time.Second):
+					log.Error("orchestrator did not return within 120s of cancel; exiting anyway")
+					cleanup()
+					return 1
+				}
+			case syscall.SIGHUP:
+				log.Info("SIGHUP received; reload not yet implemented (Phase 7)")
+			}
+		case code := <-exitCh:
+			cleanup()
+			return code
 		}
 	}
 }

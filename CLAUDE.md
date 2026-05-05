@@ -70,9 +70,21 @@ implementing.
   fds for the child, so the parent's copies leak file handles.
 - `ZPINIT_ENV_FILE` is an internal/test override for the env-file path. Production
   always reads `/run/zpinit/env`. Don't expose it in `--help` or document it publicly.
-- Phase 4's Stop sends one signal and parks in Stopping until the process exits.
-  SIGKILL escalation arrives in Phase 6 — until then, a process that ignores
-  `stop_signal` hangs the runner indefinitely.
+- Stop sends one signal and parks in Stopping until the process exits. SIGKILL
+  escalation arrives in Phase 6 — until then, a process that ignores `stop_signal`
+  blocks the runner up to its `stop_timeout` and then leaks past zpinit's exit.
+
+- supervise mode splits signals onto two channels: SIGCHLD goes to a dedicated
+  reaper goroutine that runs throughout shutdown, user signals (TERM/INT/HUP) go
+  to the main loop. Don't collapse them — sharing one channel means the SIGTERM
+  handler's wait for orchestrator exit blocks reading SIGCHLDs, the reaper
+  stops, and child Exit channels never fire (Phase 5 had this bug for one
+  commit; the regression is in `cmd/zpinit/main.go`).
+
+- `Runner.WaitBootResult` and `Runner.WaitTerminal` subscribe to the observer
+  channel BEFORE checking current state. The reverse order races: a state
+  transition between the State() probe and Observe() leaves the waiter blocked
+  forever. Same applies to any new `WaitForX` helper — subscribe first.
 - `boot_timeout` clock starts after `entrypoint.d` completes, not at zpinit launch —
   per-script timeouts already cover the entrypoint phase, and a slow `composer install`
   shouldn't eat the service-boot budget.

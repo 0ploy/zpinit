@@ -188,6 +188,13 @@ func closeFile(f *os.File) {
 	}
 }
 
+// MergeEnv returns base env with [env] overrides applied. New entries
+// are appended; existing keys are replaced in place. Exported because
+// the supervisor needs the same merge for readiness probes.
+func MergeEnv(base []string, override map[string]string) []string {
+	return mergeServiceEnv(base, override)
+}
+
 // mergeServiceEnv returns base env with [env] overrides applied. New
 // entries are appended; existing keys are replaced in place.
 func mergeServiceEnv(base []string, override map[string]string) []string {

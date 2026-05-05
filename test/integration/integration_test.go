@@ -284,6 +284,61 @@ func TestModeError(t *testing.T) {
 	}
 }
 
+// #20: supervise mode actually runs services in filename order, stays
+// alive as PID 1's stand-in, and shuts them down cleanly on SIGTERM.
+func TestSuperviseMode(t *testing.T) {
+	cfg := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "log")
+	writeFile(t, filepath.Join(cfg, "services", "10_first.toml"), fmt.Sprintf(`
+command = ["/bin/sh", "-c", "echo first >> %s; sleep 30"]
+restart = "always"
+stop_timeout = "3s"
+`, marker))
+	writeFile(t, filepath.Join(cfg, "services", "20_second.toml"), fmt.Sprintf(`
+command = ["/bin/sh", "-c", "echo second >> %s; sleep 30"]
+restart = "always"
+stop_timeout = "3s"
+`, marker))
+
+	bin := zpinitBin
+	envFile := filepath.Join(t.TempDir(), "env")
+	cmd := exec.Command(bin, "--config", cfg)
+	cmd.Env = append(os.Environ(), "ZPINIT_ENV_FILE="+envFile)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// Both services should write their markers shortly after boot.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(marker); err == nil && strings.Contains(string(data), "first") && strings.Contains(string(data), "second") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	body, _ := os.ReadFile(marker)
+	if !strings.Contains(string(body), "first") || !strings.Contains(string(body), "second") {
+		_ = cmd.Process.Signal(syscall.SIGKILL)
+		_ = cmd.Wait()
+		t.Fatalf("services did not run; marker = %q\nstderr:\n%s", body, stderr.String())
+	}
+	// Filename order should put "first" before "second".
+	if i := strings.Index(string(body), "first"); i < 0 || i > strings.Index(string(body), "second") {
+		t.Errorf("services ran out of order: %q", body)
+	}
+
+	// Shutdown should be quick.
+	start := time.Now()
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("zpinit exit error: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("shutdown took %v; want < 5s", elapsed)
+	}
+}
+
 // #22: CMD wins over services. Services TOML present + CMD provided →
 // CMD execs, services never spawned.
 func TestCmdWinsOverServices(t *testing.T) {

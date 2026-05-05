@@ -7,6 +7,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"syscall"
@@ -65,6 +66,7 @@ type Runner struct {
 	state     State
 	process   Process
 	lastPID   int
+	lastExit  reaper.ExitInfo
 	crashes   int
 	upSince   time.Time
 	nextDelay time.Duration
@@ -183,15 +185,96 @@ func (r *Runner) Crashes() int {
 	return r.crashes
 }
 
-// Observe returns a channel that receives every state transition from
-// now until the runner is garbage-collected. Drops events if the buffer
-// fills; intended for tests.
-func (r *Runner) Observe() <-chan State {
+// Observe returns a channel that receives every state transition, and
+// a cleanup function the caller must invoke when done — otherwise every
+// transition broadcasts forever to a dead listener and accumulates
+// memory. Drops events if the buffer fills.
+func (r *Runner) Observe() (<-chan State, func()) {
 	ch := make(chan State, 32)
 	r.observersMu.Lock()
 	r.observers = append(r.observers, ch)
 	r.observersMu.Unlock()
-	return ch
+	cancel := func() {
+		r.observersMu.Lock()
+		for i, c := range r.observers {
+			if c == ch {
+				r.observers = append(r.observers[:i], r.observers[i+1:]...)
+				break
+			}
+		}
+		r.observersMu.Unlock()
+	}
+	return ch, cancel
+}
+
+// WaitBootResult blocks until the runner reaches Running (success) or
+// Fatal (failure), or ctx expires. Returns nil on Running, an error on
+// Fatal, ctx.Err on cancellation. Used by the orchestrator to block the
+// ordered-boot phase on each service in turn — the runner's autonomous
+// retries are honoured up to ctx's deadline (boot_timeout).
+//
+// Subscribe-before-check ordering avoids the classic race where the
+// runner transitions to the target state between a State() probe and
+// the subsequent Observe call, leaving the waiter blocked forever.
+func (r *Runner) WaitBootResult(ctx context.Context) error {
+	ch, cancel := r.Observe()
+	defer cancel()
+	switch r.State() {
+	case StateRunning:
+		return nil
+	case StateFatal:
+		return errors.New("service is fatal")
+	}
+	for {
+		select {
+		case s := <-ch:
+			switch s {
+			case StateRunning:
+				return nil
+			case StateFatal:
+				return errors.New("service is fatal")
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// WaitTerminal blocks until the runner reaches Stopped or Fatal, or
+// ctx expires. Used by the orchestrator's stopAll to bound how long it
+// waits for each service to wind down (Phase 6 will SIGKILL escalate
+// once the per-service stop_timeout elapses). Subscribe-before-check
+// for the same reason as WaitBootResult.
+func (r *Runner) WaitTerminal(ctx context.Context) (State, error) {
+	ch, cancel := r.Observe()
+	defer cancel()
+	if s := r.State(); s == StateStopped || s == StateFatal {
+		return s, nil
+	}
+	for {
+		select {
+		case s := <-ch:
+			if s == StateStopped || s == StateFatal {
+				return s, nil
+			}
+		case <-ctx.Done():
+			return r.State(), ctx.Err()
+		}
+	}
+}
+
+// LastExit returns the last reaped ExitInfo (zero value if the runner
+// has never seen an exit). Used by the orchestrator to compute the
+// supervisor exit code via exit_code_from.
+func (r *Runner) LastExit() reaper.ExitInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastExit
+}
+
+// Cfg returns the service config (read-only access for orchestration).
+func (r *Runner) Cfg() config.Service {
+	return r.cfg
 }
 
 func (r *Runner) currentProcess() Process {
@@ -265,6 +348,9 @@ func (r *Runner) spawnNext(timer *Timer) {
 }
 
 func (r *Runner) handleExit(info reaper.ExitInfo, timer *Timer) {
+	r.mu.Lock()
+	r.lastExit = info
+	r.mu.Unlock()
 	r.setProcess(nil)
 
 	if r.State() == StateStopping {

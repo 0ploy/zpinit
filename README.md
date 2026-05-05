@@ -4,9 +4,11 @@ A single static Go binary that runs as PID 1 in Docker containers, folding toget
 typically takes three tools (tini + a hand-rolled `docker-entrypoint.sh` + supervisord)
 into one consistent mental model.
 
-**Status: in development.** Phase 4 of 8 complete. Wrap mode is shippable end-to-end and
-already replaces tini for single-process images. The supervisor (multi-service mode) is
-under construction.
+**Status: in development.** Phase 5 of 8 complete. Wrap mode and supervise mode both
+work end-to-end: ordered boot with optional readiness probes, per-service backoff and
+retry budget, exit-code propagation from a designated foreground worker. Phase 6
+(graceful shutdown with SIGKILL escalation), Phase 7 (SIGHUP reload), and Phase 8
+(`zpctl` control socket) are still ahead.
 
 ## How it works
 
@@ -46,6 +48,20 @@ Filename order determines service start order. Service names default to the file
 without the numeric prefix and `.toml` extension (`10_redis.toml` → `redis`); a TOML
 `name = "..."` field overrides if you need a different identity (used by zpctl, logs,
 `exit_code_from`).
+
+Each service can declare a readiness probe — a separate command run in a loop until
+it exits 0, blocking the next service's start:
+
+```toml
+# services/10_redis.toml
+command = ["redis-server", "--daemonize", "no"]
+
+[ready]
+command   = ["redis-cli", "ping"]
+interval  = "500ms"
+timeout   = "30s"
+on_timeout = "fail"      # or "continue" to log and proceed
+```
 
 The full schema is in `internal/config/config.go`. Validate a config without spawning
 anything:

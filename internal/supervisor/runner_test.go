@@ -67,7 +67,9 @@ func newFixture(t *testing.T, cfg config.Service) *testFixture {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	f.runner = NewRunner(cfg, nil, spawn, f.clock, log)
-	f.states = f.runner.Observe()
+	ch, cancel := f.runner.Observe()
+	f.states = ch
+	t.Cleanup(cancel)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	f.cancel = cancel
