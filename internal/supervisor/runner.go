@@ -71,6 +71,11 @@ type Runner struct {
 	upSince   time.Time
 	nextDelay time.Duration
 
+	// stoppedManually distinguishes Stopped reached via Stop command
+	// (-> supervisord status STOPPED) vs reached via clean exit
+	// (-> EXITED). Set true on Stop, cleared on Start.
+	stoppedManually bool
+
 	// observers, if any, receive every state transition. Buffered; sends
 	// are non-blocking — observers that fall behind miss events.
 	observersMu sync.Mutex
@@ -300,6 +305,36 @@ func (r *Runner) LastExit() reaper.ExitInfo {
 	return r.lastExit
 }
 
+// UpSince returns when the runner last entered Running, or the zero
+// time if it isn't currently running. Drives "uptime" in zpctl status.
+func (r *Runner) UpSince() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.upSince
+}
+
+// StoppedManually reports whether the most recent terminal state was
+// reached via Stop rather than a clean exit. Used to render the
+// supervisord-compatible STOPPED-vs-EXITED distinction.
+func (r *Runner) StoppedManually() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stoppedManually
+}
+
+// SignalGroup forwards an arbitrary signal to the running process'
+// process group. Returns an error if the runner has no live process.
+// Used by the control server's `signal NAME SIG` command.
+func (r *Runner) SignalGroup(sig syscall.Signal) error {
+	r.mu.Lock()
+	p := r.process
+	r.mu.Unlock()
+	if p == nil {
+		return errors.New("not running")
+	}
+	return p.SignalGroup(sig)
+}
+
 // Cfg returns the service config (read-only access for orchestration).
 func (r *Runner) Cfg() config.Service {
 	return r.cfg
@@ -340,6 +375,9 @@ func (r *Runner) setProcess(p Process) {
 }
 
 func (r *Runner) handleStart(timers *runnerTimers) {
+	r.mu.Lock()
+	r.stoppedManually = false
+	r.mu.Unlock()
 	switch r.State() {
 	case StatePending, StateStopped, StateFatal:
 		r.crashes = 0
@@ -459,6 +497,9 @@ func (r *Runner) handleBackoffExpired(timers *runnerTimers) {
 }
 
 func (r *Runner) handleStop(timers *runnerTimers) {
+	r.mu.Lock()
+	r.stoppedManually = true
+	r.mu.Unlock()
 	switch r.State() {
 	case StateStarting, StateRunning:
 		sig, ok := config.ParseSignal(r.cfg.StopSignal)

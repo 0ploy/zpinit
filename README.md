@@ -4,12 +4,11 @@ A single static Go binary that runs as PID 1 in Docker containers, folding toget
 typically takes three tools (tini + a hand-rolled `docker-entrypoint.sh` + supervisord)
 into one consistent mental model.
 
-**Status: in development.** Phase 7 of 8 complete. Wrap mode and supervise mode both
-work end-to-end: ordered boot with optional readiness probes, per-service backoff and
-retry budget, graceful shutdown that escalates to SIGKILL on each service's
-`stop_timeout`, exit-code propagation from a designated foreground worker, and
-SIGHUP-driven reload that adds, removes, or restarts services from a re-read of
-the config directory. Phase 8 (`zpctl` control socket) is still ahead.
+**Status: feature-complete v1.** All eight planned phases have landed. zpinit
+runs as PID 1, manages either a single CMD (wrap mode) or a set of supervised
+services (supervise mode), reaps orphans tini-style, applies SIGKILL escalation
+on graceful shutdown, hot-reloads config on SIGHUP, and exposes a
+supervisorctl-compatible `zpctl` over a Unix socket.
 
 ## How it works
 
@@ -75,11 +74,36 @@ Exit 0 with a one-line OK summary, or exit 1 with every problem found in one pas
 
 ## Reload
 
-Send `SIGHUP` to the running zpinit process to apply config changes without a
-container restart. zpinit re-reads `/etc/zpinit/`, diffs the result against the
-running set by **filename**, and applies the difference: new files start as new
-services, removed files trigger graceful stop, content changes restart the
-service (unless `reloadable = false`). A file rename is a remove + add.
+Send `SIGHUP` to the running zpinit process — or run `zpctl update` — to apply
+config changes without a container restart. zpinit re-reads `/etc/zpinit/`,
+diffs the result against the running set by **filename**, and applies the
+difference: new files start as new services, removed files trigger graceful
+stop, content changes restart the service (unless `reloadable = false`). A
+file rename is a remove + add.
+
+## zpctl
+
+`zpctl` talks to the running zpinit over `/run/zpinit.sock` (mode 0600,
+root-owned). State names match supervisorctl's exactly so existing operator
+muscle memory transfers.
+
+```sh
+zpctl status                  # all services
+zpctl status redis            # one
+zpctl start redis | start all
+zpctl stop redis | stop all
+zpctl restart redis
+zpctl update                  # re-read config and apply (= SIGHUP)
+zpctl reread                  # dry-run config diff
+zpctl pid [NAME]              # zpinit's pid (no arg) or service's
+zpctl signal redis HUP        # nginx-style "reload your own config"
+zpctl tail NAME               # snapshot of file-logged stdout (8KB tail)
+zpctl shutdown                # supervisor exit
+zpctl help
+```
+
+Override the socket path with `--socket /custom/path` if `control_socket` was
+set in `zpinit.toml`.
 
 ## Foreground worker pattern
 

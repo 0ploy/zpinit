@@ -15,7 +15,10 @@ import (
 	"time"
 )
 
-var zpinitBin string
+var (
+	zpinitBin string
+	zpctlBin  string
+)
 
 func TestMain(m *testing.M) {
 	tmp, err := os.MkdirTemp("", "zpinit-it-*")
@@ -25,15 +28,23 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(tmp)
 
-	bin := filepath.Join(tmp, "zpinit")
-	build := exec.Command("go", "build", "-o", bin, "../../cmd/zpinit")
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "TestMain: build: %v\n", err)
-		os.Exit(1)
+	for _, target := range []struct {
+		name string
+		bin  *string
+	}{
+		{"zpinit", &zpinitBin},
+		{"zpctl", &zpctlBin},
+	} {
+		path := filepath.Join(tmp, target.name)
+		build := exec.Command("go", "build", "-o", path, "../../cmd/"+target.name)
+		build.Stderr = os.Stderr
+		if err := build.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "TestMain: build %s: %v\n", target.name, err)
+			os.Exit(1)
+		}
+		*target.bin = path
 	}
 
-	zpinitBin = bin
 	os.Exit(m.Run())
 }
 
@@ -441,6 +452,115 @@ stop_timeout = "1s"
 	}
 	if !strings.Contains(stderr.String(), "SIGKILL") {
 		t.Errorf("expected stderr to mention SIGKILL escalation; got:\n%s", stderr.String())
+	}
+}
+
+// Phase 8: zpctl talks to zpinit over the control socket; status,
+// stop, and shutdown all work end-to-end.
+func TestZpctlEndToEnd(t *testing.T) {
+	cfg := t.TempDir()
+	socket := filepath.Join(t.TempDir(), "zpinit.sock")
+	writeFile(t, filepath.Join(cfg, "zpinit.toml"), fmt.Sprintf(`
+control_socket = "%s"
+`, socket))
+	writeFile(t, filepath.Join(cfg, "services", "10_alpha.toml"), `
+command = ["/bin/sh", "-c", "sleep 30"]
+restart = "always"
+stop_timeout = "1s"
+`)
+	writeFile(t, filepath.Join(cfg, "services", "20_beta.toml"), `
+command = ["/bin/sh", "-c", "sleep 30"]
+restart = "always"
+stop_timeout = "1s"
+`)
+
+	envFile := filepath.Join(t.TempDir(), "env")
+	zp := exec.Command(zpinitBin, "--config", cfg)
+	zp.Env = append(os.Environ(), "ZPINIT_ENV_FILE="+envFile)
+	var zpStderr bytes.Buffer
+	zp.Stderr = &zpStderr
+	if err := zp.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = zp.Process.Signal(syscall.SIGKILL)
+		_ = zp.Wait()
+	})
+
+	// Wait for the socket to appear (zpinit boots services then opens it).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(socket); err == nil {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if _, err := os.Stat(socket); err != nil {
+		t.Fatalf("control socket never appeared; zpinit stderr:\n%s", zpStderr.String())
+	}
+
+	zpctl := func(args ...string) (string, int) {
+		t.Helper()
+		full := append([]string{"--socket", socket}, args...)
+		c := exec.Command(zpctlBin, full...)
+		var out, errBuf bytes.Buffer
+		c.Stdout = &out
+		c.Stderr = &errBuf
+		err := c.Run()
+		code := 0
+		if ee, ok := err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+		} else if err != nil {
+			t.Fatalf("zpctl run: %v\nstderr:\n%s", err, errBuf.String())
+		}
+		return out.String() + errBuf.String(), code
+	}
+
+	// status: both services should be RUNNING.
+	out, code := zpctl("status")
+	if code != 0 {
+		t.Fatalf("status exit %d:\n%s", code, out)
+	}
+	if !strings.Contains(out, "alpha") || !strings.Contains(out, "RUNNING") {
+		t.Errorf("status output missing expected lines:\n%s", out)
+	}
+	if strings.Index(out, "alpha") > strings.Index(out, "beta") {
+		t.Errorf("status not in filename order:\n%s", out)
+	}
+
+	// stop alpha
+	out, code = zpctl("stop", "alpha")
+	if code != 0 {
+		t.Fatalf("stop alpha exit %d:\n%s", code, out)
+	}
+
+	// status should now show alpha STOPPED, beta RUNNING.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		out, _ = zpctl("status")
+		if strings.Contains(out, "STOPPED") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(out, "STOPPED") {
+		t.Errorf("alpha never reached STOPPED:\n%s", out)
+	}
+
+	// pid command without a name returns zpinit's pid.
+	out, code = zpctl("pid")
+	if code != 0 {
+		t.Fatalf("pid exit %d:\n%s", code, out)
+	}
+	pid := strings.TrimSpace(out)
+	if pid != fmt.Sprintf("%d", zp.Process.Pid) {
+		t.Errorf("pid = %s, want %d", pid, zp.Process.Pid)
+	}
+
+	// shutdown ends the supervisor.
+	_, _ = zpctl("shutdown")
+	if err := zp.Wait(); err != nil {
+		t.Fatalf("zpinit didn't exit cleanly: %v\nstderr:\n%s", err, zpStderr.String())
 	}
 }
 

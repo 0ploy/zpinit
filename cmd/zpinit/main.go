@@ -224,6 +224,18 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Control socket: zpctl talks to us over /run/zpinit.sock (or
+	// whatever the config sets). The shutdown verb cancels ctx, which
+	// propagates to the orchestrator just like SIGTERM would.
+	ctrlCtx, ctrlCancel := context.WithCancel(context.Background())
+	defer ctrlCancel()
+	ctrl := supervisor.NewControlServer(orch, cancel, log)
+	go func() {
+		if err := ctrl.Listen(ctrlCtx, cfg.Globals.ControlSocket); err != nil {
+			log.Error("control socket", "err", err)
+		}
+	}()
+
 	exitCh := make(chan int, 1)
 	go func() { exitCh <- orch.Run(ctx) }()
 
