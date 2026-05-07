@@ -227,6 +227,9 @@ func validate(cfg *Config) error {
 	if _, ok := ParseSignal(cfg.Globals.DefaultStopSignal); !ok {
 		errs = append(errs, fmt.Sprintf("default_stop_signal %q is not a recognised signal name", cfg.Globals.DefaultStopSignal))
 	}
+	if !filepath.IsAbs(cfg.Globals.ControlSocket) {
+		errs = append(errs, fmt.Sprintf("control_socket %q must be an absolute path", cfg.Globals.ControlSocket))
+	}
 	for k := range cfg.Globals.Env {
 		if !envKeyPattern.MatchString(k) {
 			errs = append(errs, fmt.Sprintf("env key %q must match %s", k, envKeyPattern))

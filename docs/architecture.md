@@ -53,6 +53,13 @@ a time in filename order, so readiness still blocks the next start.
 The boot goroutine uses `runnerCtx`, not the reload caller's context,
 so it survives client disconnect.
 
+Back-to-back reloads serialize their boot phases on `reloadBootMu`:
+reload N+1's adds wait for reload N's adds to finish booting before
+they start. Without this, two reloads landing seconds apart could
+boot their adds concurrently and break the "later filename does not
+start until earlier filename is ready" invariant that initial boot
+relies on.
+
 `exit_code_from` is rebound on every reload, so the watched service
 can be added, removed, or retargeted.
 
@@ -88,8 +95,33 @@ fast-dying children.
 `zpctl` talks to zpinit over a Unix socket (default
 `/run/zpinit.sock`) with a line-based plaintext format. Each request
 is one line, each response is a status line plus zero or more body
-lines, terminated by a blank line. Operators can debug live with `nc`
-or `socat`.
+lines, terminated by `.` on its own line. Operators can debug live
+with `nc` or `socat`.
 
 State names match supervisorctl exactly (`RUNNING`, `STOPPED`,
 `BACKOFF`, `FATAL`, ...) so existing muscle memory transfers.
+
+### Access control
+
+Two layered gates:
+
+1. **Filesystem.** Umask is tightened to `0o077` across the bind so
+   the socket is born `0700`; an explicit `chmod 0600` follows as
+   belt-and-braces. Without the umask flip, `bind(2)` creates the
+   socket as `0777 & ~umask` (typically `0755`) for the few
+   microseconds before chmod — long enough for a non-root local
+   process to `connect()` and keep the FD past chmod.
+2. **Peer credentials.** Every accepted connection is gated by
+   `SO_PEERCRED`: peer UID must equal the daemon's effective UID.
+   Connections from any other UID are rejected without dispatch and
+   logged with peer PID. Linux-only; the macOS dev build skips this
+   check.
+
+Net effect in a typical container (PID 1 = root): only root can use
+zpctl. A future move to allow non-root operators would lift the
+`SO_PEERCRED` check rather than loosen the filesystem permissions.
+
+Response framing escapes CR/LF and lone `.` body lines via
+`ctlproto.sanitizeLine`, so a tainted log line surfaced by
+`zpctl tail` (or a multi-line TOML parse error from `zpctl update`)
+can't end the body early or split a single field across lines.

@@ -107,11 +107,11 @@ func (c *Conn) ReadResponse() (*Response, error) {
 }
 
 func (c *Conn) WriteResponse(resp *Response) error {
-	if _, err := fmt.Fprintf(c.w, "%d %s\n", resp.Code, resp.Msg); err != nil {
+	if _, err := fmt.Fprintf(c.w, "%d %s\n", resp.Code, sanitizeLine(resp.Msg)); err != nil {
 		return err
 	}
 	for _, b := range resp.Body {
-		if _, err := fmt.Fprintln(c.w, b); err != nil {
+		if _, err := fmt.Fprintln(c.w, sanitizeLine(b)); err != nil {
 			return err
 		}
 	}
@@ -119,6 +119,26 @@ func (c *Conn) WriteResponse(resp *Response) error {
 		return err
 	}
 	return c.w.Flush()
+}
+
+// sanitizeLine fixes content that would break the line-based wire
+// frame: CR/LF would split a single field across multiple lines, and
+// a body line consisting solely of "." (Terminator) would end the
+// body early at the client. Service log content surfaced by `tail`
+// and TOML parse errors surfaced by `update` can each contain
+// newlines, so doing this once at the wire layer covers every
+// caller. Replacement is intentionally lossy (whitespace) rather
+// than escaped — the protocol has no decoder for escapes and we'd
+// rather render mangled than risk a malformed frame.
+func sanitizeLine(s string) string {
+	if !strings.ContainsAny(s, "\r\n") && s != Terminator {
+		return s
+	}
+	if s == Terminator {
+		return " " + Terminator
+	}
+	r := strings.NewReplacer("\r", " ", "\n", " ")
+	return r.Replace(s)
 }
 
 // errLineTooLong signals that the peer sent more than MaxLineLen bytes

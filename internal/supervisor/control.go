@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/0ploy/zpinit/internal/config"
@@ -46,9 +47,20 @@ func NewControlServer(orch *Orchestrator, shutdownFn func(), log *slog.Logger) *
 
 // Listen binds a Unix socket at path (mode 0600) and serves until ctx
 // is canceled. Removes any stale socket file before binding.
+//
+// Umask is tightened to 0o077 across the bind so the socket is born
+// 0700 from the kernel's perspective; without that, the bind creates
+// the file as 0777&~umask (typically 0755) and a non-root local
+// process can connect during the window between bind and the chmod
+// below. Umask is process-global, but at this point in startup no
+// other goroutine is creating files (entrypoint.d already finished;
+// runner goroutines are spawned later by the orchestrator), so the
+// flip is safe. The chmod is kept as belt-and-braces.
 func (s *ControlServer) Listen(ctx context.Context, path string) error {
 	_ = os.Remove(path)
+	old := syscall.Umask(0o077)
 	l, err := net.Listen("unix", path)
+	syscall.Umask(old)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", path, err)
 	}
@@ -92,6 +104,18 @@ func (s *ControlServer) handleConn(conn net.Conn) {
 			s.log.Error("control dispatch panic; connection dropped", "panic", p)
 		}
 	}()
+
+	// Defense in depth: filesystem perms (0600) are the first gate;
+	// SO_PEERCRED is the second. A peer with a different UID than the
+	// daemon is rejected without dispatch — covers the (narrow) case
+	// where someone slipped in an FD before the chmod and then forked
+	// across a privilege boundary, plus any future relaxation of the
+	// socket mode. No-op on non-Linux; zpinit only runs production on
+	// Linux.
+	if err := authorizePeer(conn); err != nil {
+		s.log.Warn("control: peer rejected", "err", err)
+		return
+	}
 
 	// Two-phase deadline: a short read budget for the request line, then
 	// a verb-aware budget for the dispatch + write. The old single-60s
@@ -297,18 +321,10 @@ func (s *ControlServer) cmdReread() *ctlproto.Response {
 }
 
 func (s *ControlServer) cmdTail(args []string) *ctlproto.Response {
-	follow := false
-	name := ""
-	for _, a := range args {
-		if a == "-f" {
-			follow = true
-			continue
-		}
-		name = a
+	if len(args) != 1 {
+		return errResp("usage: tail NAME")
 	}
-	if name == "" {
-		return errResp("usage: tail [-f] NAME")
-	}
+	name := args[0]
 	r := s.orch.findRunner(name)
 	if r == nil {
 		return errResp("unknown service: " + name)
@@ -316,9 +332,6 @@ func (s *ControlServer) cmdTail(args []string) *ctlproto.Response {
 	cfg := r.Cfg()
 	if cfg.Log.Stdout == "" || cfg.Log.Stdout == "inherit" {
 		return errResp(fmt.Sprintf("%s logs to stdout (no file to tail)", name))
-	}
-	if follow {
-		return errResp("tail -f is not yet implemented; rerun without -f for a snapshot")
 	}
 	body, err := readLastBytes(cfg.Log.Stdout, 8192)
 	if err != nil {
@@ -366,7 +379,7 @@ func (s *ControlServer) cmdHelp() *ctlproto.Response {
 		"update              reload config and apply (= SIGHUP)",
 		"reload              alias for update (note: differs from supervisord's reload)",
 		"reread              dry-run config diff",
-		"tail [-f] NAME      dump last 8KB of file-logged stdout (-f not yet supported)",
+		"tail NAME           dump last 8KB of file-logged stdout (snapshot only)",
 		"signal NAME SIG     send arbitrary signal to service's process group",
 		"shutdown            stop supervisor and exit",
 		"help                this list",
@@ -469,7 +482,13 @@ func formatUptime(d time.Duration) string {
 }
 
 func readLastBytes(path string, n int64) (string, error) {
-	f, err := os.Open(path)
+	// O_NOFOLLOW rejects the open if the final path component is a
+	// symlink, so a service config that points log.stdout at a
+	// symlink can't trick `zpctl tail` into reading whatever the
+	// link targets. The IsRegular check below covers the rest:
+	// device files, FIFOs, and directories all return non-regular
+	// from Stat and would either hang or dump nonsense.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return "", err
 	}
@@ -477,6 +496,9 @@ func readLastBytes(path string, n int64) (string, error) {
 	st, err := f.Stat()
 	if err != nil {
 		return "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", fmt.Errorf("not a regular file: %s", path)
 	}
 	offset := st.Size() - n
 	if offset < 0 {

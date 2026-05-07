@@ -55,7 +55,12 @@ default_stop_timeout = "10s"
 # service's exit code when it terminates.
 exit_code_from = "default"
 
-# Path of the zpctl Unix socket.
+# Path of the zpctl Unix socket. Must be absolute. The socket is bound
+# 0700 (umask-tightened across bind so the file is never briefly
+# world-accessible) and chmod'd 0600. Connecting peers are then gated
+# by SO_PEERCRED: only processes running as the daemon's UID can talk
+# to it. In a normal container that means root only; non-root services
+# (php-fpm workers, etc.) cannot use zpctl.
 control_socket = "/run/zpinit.sock"
 
 # Fleet-wide default env. Visible to entrypoint.d scripts and to the
@@ -139,7 +144,9 @@ DATABASE_URL = "postgres://..."
 
 # stdout/stderr destination. "inherit" (default) writes to the
 # container's stdout/stderr (the right answer for almost everything).
-# A path writes to a file with O_APPEND.
+# A path writes to a file with O_APPEND|O_NOFOLLOW: a symlink at the
+# leaf of the path is rejected at spawn time. Symlinked parent
+# directories resolve normally.
 [log]
 stdout = "inherit"
 stderr = "inherit"
@@ -186,3 +193,4 @@ one-line OK summary or every error found in one pass. Exit 0 / 1.
 - `default_stop_signal` and per-service `stop_signal` are recognised.
 - `exit_code_from` references an existing service (or is `"default"`).
 - `entrypoint.d/` files are executable (warning, not error).
+- `control_socket` is an absolute path.

@@ -52,6 +52,55 @@ func TestEmptyRequest(t *testing.T) {
 	}
 }
 
+func TestSanitizeLine(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"ok", "ok"},
+		{"line\nwith\nnewlines", "line with newlines"},
+		{"crlf\r\nmix", "crlf  mix"},
+		{".", " ."},
+		{"..", ".."},
+	}
+	for _, c := range cases {
+		if got := sanitizeLine(c.in); got != c.want {
+			t.Errorf("sanitizeLine(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestWriteResponse_RobustToTaintedBody(t *testing.T) {
+	var buf bytes.Buffer
+	c := NewConn(&buf)
+	// Body line containing both a newline (would split) and a lone "."
+	// (would terminate body early). After sanitization the wire frame
+	// must still round-trip cleanly with both body lines preserved.
+	want := &Response{
+		Code: 0,
+		Msg:  "ok\nbroken",
+		Body: []string{"normal line", ".", "embedded\nnewline"},
+	}
+	if err := c.WriteResponse(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.ReadResponse()
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	if got.Code != 0 {
+		t.Errorf("code = %d", got.Code)
+	}
+	if strings.Contains(got.Msg, "\n") {
+		t.Errorf("msg still contains newline: %q", got.Msg)
+	}
+	if len(got.Body) != 3 {
+		t.Fatalf("body lines = %d, want 3 (body framing broke): %v", len(got.Body), got.Body)
+	}
+	for _, b := range got.Body {
+		if strings.Contains(b, "\n") {
+			t.Errorf("body line still contains newline: %q", b)
+		}
+	}
+}
+
 func TestErrorResponse(t *testing.T) {
 	var buf bytes.Buffer
 	c := NewConn(&buf)

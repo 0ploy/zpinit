@@ -38,6 +38,17 @@ exit code is lost. `SpawnTracked` holds its mutex across `cmd.Start()` so
 the new PID is registered atomically, closing the spawn-then-track race
 for fast-dying children.
 
+**Control socket has two layered access gates.** (1) Filesystem: bind
+runs under `syscall.Umask(0o077)` so the socket is born `0700`, then
+explicit `chmod 0600`. Don't drop the umask flip: without it the
+socket is briefly `0755` and a non-root local process wins a TOCTOU
+race. (2) Peer credentials: every accepted connection is gated by
+`SO_PEERCRED` (`authorizePeer` in `peercred_linux.go`) and rejected
+unless the peer UID equals the daemon's effective UID. Linux-only;
+the macOS dev stub returns `nil`. If you ever loosen socket perms
+to allow non-root operators, lift the peer-cred check, don't widen
+the chmod.
+
 ## Non-Goals (Don't Add These)
 No log rotation (use logrotate or stdout → host logging), no log capture
 via pipes (FD inheritance only; pipes deadlock), no service dependency
@@ -87,6 +98,12 @@ these, push back and reconfirm before coding.
   goroutine per service (loses the readiness-blocks-next-service
   property that initial boot relies on). Boots use `o.runnerCtx`, not
   the reload caller's ctx, so they survive client disconnect.
+  `runReloadBoots` takes `o.reloadBootMu` for the duration of its loop
+  so back-to-back reloads serialize their boot phases; without that,
+  reload N+1's adds could interleave with reload N's still-running
+  boots and break filename order. `reloadBootMu` is separate from
+  `reloadMu` so the diff phase of N+1 isn't blocked by the boot phase
+  of N (which can run for many seconds).
 
 - `Reload` propagates `globals.Env` changes by adding every reloadable
   service to the restart list (children can't be re-env'd in place).
@@ -117,3 +134,18 @@ these, push back and reconfirm before coding.
   add services or bump `stop_timeout` after launch, and the supervisor
   outer wait must always cover stopAll's serial inner wait, otherwise
   the runtime hard-kills PID 1 mid-graceful-shutdown.
+
+- Service log files (`log.stdout`/`log.stderr`) and `cmdTail`'s reads
+  open with `O_NOFOLLOW`; a symlink at the leaf of the configured path
+  is rejected. `readLastBytes` additionally enforces `Mode().IsRegular()`.
+  Standard log-writer hardening: an operator typo or hostile config
+  can't cause zpinit to append a child's stdout into `/etc/shadow` via
+  a planted symlink. Symlinked parent directories still resolve; only
+  the leaf is gated.
+
+- Wire-protocol responses (`ctlproto.WriteResponse`) sanitize `Msg`
+  and every body line via `sanitizeLine`: CR/LF become spaces and a
+  lone `.` is prefixed with a space. `cmdTail` surfaces service-
+  controlled log content and `cmdUpdate` surfaces multi-line TOML
+  errors; without sanitization either could split a single field
+  across frames or end the body early at the client.

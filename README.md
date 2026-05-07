@@ -231,6 +231,9 @@ Loads everything, applies defaults, validates, and either prints an OK
 summary or every error in one pass. Exit 0 / 1.
 
 **Operator commands.** `zpctl` talks to zpinit over `/run/zpinit.sock`.
+The socket is bound `0600` and gated by `SO_PEERCRED`: only processes
+running as the daemon's UID (root in a normal container) can issue
+commands. Non-root services in the same container cannot use zpctl.
 State names match supervisorctl exactly so existing muscle memory
 transfers.
 

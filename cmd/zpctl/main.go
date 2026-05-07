@@ -79,6 +79,7 @@ Common commands:
   stop NAME | all       stop service(s)
   restart NAME | all    stop then start
   pid [NAME]            PID of zpinit or a service
+  tail NAME             dump last 8KB of file-logged stdout
   update                apply config changes (= SIGHUP)
   reread                dry-run config diff
   signal NAME SIG       send arbitrary signal

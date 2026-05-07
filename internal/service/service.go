@@ -82,8 +82,22 @@ func Spawn(cfg config.Service, baseEnv []string, r *reaper.Reaper, log *slog.Log
 		return nil, fmt.Errorf("start: %w", spawnErr)
 	}
 
+	// Defensive: any future error between here and successful return
+	// must Untrack the PID, otherwise the reaper map keeps the entry
+	// (and its 1-buffered channel) alive until the OS eventually
+	// delivers SIGCHLD. The release at the end of the happy path
+	// hands ownership of the channel to the returned Process, which
+	// the supervisor consumes — so the bookkeeping is balanced.
+	released := false
+	defer func() {
+		if !released {
+			r.Untrack(proc.Pid)
+		}
+	}()
+
 	log.Info("spawned", "service", cfg.Name, "pid", proc.Pid, "cmd", cfg.Command)
 
+	released = true
 	return &Process{
 		Name:      cfg.Name,
 		PID:       proc.Pid,
@@ -163,7 +177,15 @@ func isNumeric(s string) bool {
 // openLogTarget interprets a [log].stdout/stderr value:
 //
 //	"" or "inherit" -> use inheritFrom (typically os.Stdout/os.Stderr)
-//	absolute path   -> open with O_APPEND|O_CREATE|O_WRONLY, mode 0o644
+//	absolute path   -> open with O_APPEND|O_CREATE|O_WRONLY|O_NOFOLLOW, mode 0o644
+//
+// O_NOFOLLOW rejects the open if the *final* path component is a
+// symlink. Without it, an attacker (or careless config) that put a
+// symlink at the configured log path would have zpinit append the
+// service's stdout to the symlink target — which could be any file
+// the daemon's UID can write. Symlinked parent directories are still
+// followed normally; only the leaf is protected, matching standard
+// log-writer hardening.
 //
 // Returns (file, target). The caller passes target to cmd.Stdout/Stderr
 // and must Close file (if non-nil) after Start; the kernel duplicates
@@ -175,7 +197,7 @@ func openLogTarget(spec string, inheritFrom *os.File) (*os.File, *os.File, error
 	if !filepath.IsAbs(spec) {
 		return nil, nil, fmt.Errorf("log path must be absolute: %s", spec)
 	}
-	f, err := os.OpenFile(spec, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(spec, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW, 0o644)
 	if err != nil {
 		return nil, nil, err
 	}

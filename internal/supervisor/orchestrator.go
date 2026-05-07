@@ -56,6 +56,15 @@ type Orchestrator struct {
 	// boot of newly-added services.
 	reloadMu sync.Mutex
 
+	// reloadBootMu serializes the detached boot phase across
+	// back-to-back reloads. Without this, reload N's runReloadBoots
+	// could interleave with reload N+1's adds — losing the
+	// filename-order invariant that initial boot relies on (a later
+	// service must not start while an earlier one is still booting).
+	// Separate from reloadMu so the diff phase of N+1 doesn't have
+	// to wait for the boot phase of N (which can be many seconds).
+	reloadBootMu sync.Mutex
+
 	// mu protects runners and cfg. Reload takes a write lock around
 	// each slice mutation; readers (status/findRunner/exitCode) take a
 	// read lock and either iterate while held or copy out under it.
@@ -460,7 +469,15 @@ type reloadBootJob struct {
 // serially, mirroring initial boot. A boot failure logs and moves on
 // to the next service; the per-runner restart loop handles recovery
 // for transient errors.
+//
+// reloadBootMu serializes this against any prior reload's still-running
+// boot phase, so two back-to-back reloads do not interleave their adds
+// and break filename order. Boot goroutines are not part of the Run
+// waitgroup; on orchestrator shutdown they die with the process, so a
+// plain mutex without ctx-aware acquisition is sufficient.
 func (o *Orchestrator) runReloadBoots(root context.Context, jobs []reloadBootJob, globals config.Globals) {
+	o.reloadBootMu.Lock()
+	defer o.reloadBootMu.Unlock()
 	for _, j := range jobs {
 		if root.Err() != nil {
 			return

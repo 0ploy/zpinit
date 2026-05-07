@@ -107,6 +107,18 @@ control_socket = "/tmp/zpinit.sock"
 	}
 }
 
+func TestLoad_RejectsRelativeControlSocket(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "zpinit.toml"), `control_socket = "zpinit.sock"`+"\n")
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("Load: want error for relative control_socket, got nil")
+	}
+	if !strings.Contains(err.Error(), "absolute path") {
+		t.Errorf("Load: error %q does not mention absolute path", err)
+	}
+}
+
 func TestLoad_NameOverride(t *testing.T) {
 	dir := t.TempDir()
 	write(t, filepath.Join(dir, "services", "10_bar.toml"), `
