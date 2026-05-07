@@ -27,13 +27,15 @@ const (
 
 func main() {
 	var (
-		showVersion bool
-		checkConfig string
-		configDir   string
+		showVersion    bool
+		checkConfig    string
+		configDir      string
+		skipEntrypoint bool
 	)
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.StringVar(&checkConfig, "check-config", "", "validate configuration in `dir` and exit")
 	flag.StringVar(&configDir, "config", defaultConfigDir, "configuration `dir`")
+	flag.BoolVar(&skipEntrypoint, "skip-entrypoint", false, "skip entrypoint.d scripts (useful for `docker run image bash` debug shells)")
 	flag.Parse()
 
 	if showVersion {
@@ -51,7 +53,7 @@ func main() {
 		log.Warn("zpinit is not running as PID 1; orphan reaping is unreliable outside containers", "pid", pid)
 	}
 
-	os.Exit(run(log, configDir, flag.Args()))
+	os.Exit(run(log, configDir, flag.Args(), skipEntrypoint))
 }
 
 func runCheckConfig(dir string) int {
@@ -67,7 +69,7 @@ func runCheckConfig(dir string) int {
 	return 0
 }
 
-func run(log *slog.Logger, configDir string, cmdline []string) int {
+func run(log *slog.Logger, configDir string, cmdline []string, skipEntrypoint bool) int {
 	cfg, err := config.Load(configDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -79,7 +81,14 @@ func run(log *slog.Logger, configDir string, cmdline []string) int {
 
 	r := reaper.New(log)
 
-	finalEnv, err := runEntrypoint(log, configDir, cfg)
+	// Layered env composition: globals.Env (lowest) under container env.
+	// entrypoint.d scripts can write further overrides to /run/zpinit/env,
+	// which run on top. Container env beats globals.Env so an operator
+	// can override a baked-in default via `docker run -e`.
+	containerEnv := mapFromEnviron(os.Environ())
+	initialEnv := layeredMerge(cfg.Globals.Env, containerEnv)
+
+	finalEnv, err := runEntrypoint(log, configDir, cfg, skipEntrypoint, initialEnv)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -94,7 +103,13 @@ func run(log *slog.Logger, configDir string, cmdline []string) int {
 	case modeWrap:
 		return execCmd(log, cmdline, finalEnv)
 	case modeSupervise:
-		return runSupervise(log, configDir, cfg, finalEnv, r)
+		// scriptEnv is the delta entrypoint.d wrote to /run/zpinit/env
+		// (or set on its own children that bubbled up via the env
+		// file). Captured here so SIGHUP reloads can recompute the
+		// per-service env from the *new* globals.Env without re-running
+		// scripts: newBaseEnv = newGlobals.Env + containerEnv + scriptEnv.
+		scriptEnv := envDelta(initialEnv, finalEnv)
+		return runSupervise(log, configDir, cfg, finalEnv, containerEnv, scriptEnv, r)
 	case modeError:
 		fmt.Fprintf(os.Stderr,
 			"zpinit: nothing to do — provide a CMD or populate %s\n",
@@ -102,6 +117,33 @@ func run(log *slog.Logger, configDir string, cmdline []string) int {
 		return 1
 	}
 	return 1 // unreachable
+}
+
+// layeredMerge merges maps left-to-right; later maps override earlier ones.
+// Used to compose the env precedence chain: globals.Env (lowest), container
+// env, scripts (highest).
+func layeredMerge(layers ...map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, m := range layers {
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// envDelta returns the keys in final whose value differs from base (or
+// that are absent from base). Used to extract the "what scripts added or
+// changed" portion of the entrypoint result, so reloads can recompose
+// the env from layered sources without re-running scripts.
+func envDelta(base, final map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range final {
+		if bv, ok := base[k]; !ok || bv != v {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 type mode int
@@ -122,10 +164,17 @@ func detectMode(cmdline []string, services []config.Service) mode {
 	return modeError
 }
 
-func runEntrypoint(log *slog.Logger, configDir string, cfg *config.Config) (map[string]string, error) {
+func runEntrypoint(log *slog.Logger, configDir string, cfg *config.Config, skipFlag bool, initialEnv map[string]string) (map[string]string, error) {
+	if skipFlag {
+		log.Info("--skip-entrypoint set; skipping entrypoint.d")
+		// Return the layered initial env so globals.Env still reaches
+		// the wrapped CMD (and any debug shell) even when scripts are
+		// skipped.
+		return initialEnv, nil
+	}
 	if os.Getenv("ZPINIT_SKIP_ENTRYPOINT") == "1" {
 		log.Info("ZPINIT_SKIP_ENTRYPOINT=1; skipping entrypoint.d")
-		return mapFromEnviron(os.Environ()), nil
+		return initialEnv, nil
 	}
 
 	envFile := defaultEnvFile
@@ -144,6 +193,7 @@ func runEntrypoint(log *slog.Logger, configDir string, cfg *config.Config) (map[
 		OnFailure:     entrypoint.OnFailure(cfg.Globals.EntrypointOnFailure),
 		ScriptTimeout: cfg.Globals.EntrypointScriptTimeout.Std(),
 		EnvFile:       envFile,
+		InitialEnv:    initialEnv,
 		Logger:        log,
 	})
 }
@@ -191,7 +241,7 @@ func indexEq(s string) int {
 //
 // SIGHUP triggers a reload via orchestrator.Reload (Phase 7): re-load
 // config from disk, diff against the running set, apply add/remove/restart.
-func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env map[string]string, r *reaper.Reaper) int {
+func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env map[string]string, containerEnv, scriptEnv map[string]string, r *reaper.Reaper) int {
 	chldCh := make(chan os.Signal, 16)
 	signal.Notify(chldCh, syscall.SIGCHLD)
 	userCh := make(chan os.Signal, 8)
@@ -199,14 +249,27 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 
 	reaperStop := make(chan struct{})
 	reaperDone := make(chan struct{})
+	// Reap is wrapped with recover() so an unforeseen panic doesn't
+	// take the entire SIGCHLD handler offline (which would silently
+	// wedge every Runner waiting on its child's Exit channel). The
+	// recover survives, the loop continues, and the next SIGCHLD
+	// retries.
+	safeReap := func() {
+		defer func() {
+			if p := recover(); p != nil {
+				log.Error("reaper panic; continuing", "panic", p)
+			}
+		}()
+		r.Reap()
+	}
 	go func() {
 		defer close(reaperDone)
 		for {
 			select {
 			case <-chldCh:
-				r.Reap()
+				safeReap()
 			case <-reaperStop:
-				r.Reap() // final drain
+				safeReap() // final drain
 				return
 			}
 		}
@@ -220,6 +283,15 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 
 	envSlice := entrypoint.SliceFromEnviron(env)
 	orch := supervisor.NewOrchestrator(cfg, envSlice, r, log)
+	// On reload, recompose the per-service base env from the *new*
+	// globals.Env layered with the boot-time container env and the
+	// boot-time script-set deltas. Scripts only run once at boot, so
+	// reload can't re-derive their additions; capturing scriptEnv here
+	// preserves those additions across reloads.
+	orch.SetBaseEnvBuilder(func(globalsEnv map[string]string) []string {
+		merged := layeredMerge(globalsEnv, containerEnv, scriptEnv)
+		return entrypoint.SliceFromEnviron(merged)
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -246,14 +318,23 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 		case sig := <-userCh:
 			switch sig {
 			case syscall.SIGTERM, syscall.SIGINT:
-				log.Info("shutdown signal", "signal", sig.String())
+				// Recompute the budget against the *current* runner
+				// set rather than reusing a boot-time snapshot —
+				// reload may have added services or bumped
+				// stop_timeout since startup, and the supervisor's
+				// outer wait must cover stopAll's serial inner wait.
+				budget := orch.ShutdownBudget()
+				log.Info("shutdown signal", "signal", sig.String(), "budget", budget)
 				cancel()
+				shutdownTimer := time.NewTimer(budget)
 				select {
 				case code := <-exitCh:
+					shutdownTimer.Stop()
 					cleanup()
 					return code
-				case <-time.After(120 * time.Second):
-					log.Error("orchestrator did not return within 120s of cancel; exiting anyway")
+				case <-shutdownTimer.C:
+					log.Error("orchestrator did not return within budget; exiting anyway",
+						"budget", budget)
 					cleanup()
 					return 1
 				}

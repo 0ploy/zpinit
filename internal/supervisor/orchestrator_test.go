@@ -391,7 +391,7 @@ func TestDiff_Empty(t *testing.T) {
 		mustService("b", "20_b.toml", nil),
 	}
 	o := diffFixture(t, svcs)
-	d := o.computeDiff(svcs)
+	d := o.computeDiff(&config.Config{Services: svcs})
 	if len(d.add)+len(d.remove)+len(d.restart) != 0 {
 		t.Errorf("expected empty diff; got %+v", d)
 	}
@@ -404,7 +404,7 @@ func TestDiff_Add(t *testing.T) {
 		mustService("b", "20_b.toml", nil),
 	}
 	o := diffFixture(t, old)
-	d := o.computeDiff(new_)
+	d := o.computeDiff(&config.Config{Services: new_})
 	if len(d.add) != 1 || d.add[0].Filename != "20_b.toml" {
 		t.Errorf("add = %+v", d.add)
 	}
@@ -420,7 +420,7 @@ func TestDiff_Remove(t *testing.T) {
 	}
 	new_ := []config.Service{mustService("a", "10_a.toml", nil)}
 	o := diffFixture(t, old)
-	d := o.computeDiff(new_)
+	d := o.computeDiff(&config.Config{Services: new_})
 	if len(d.remove) != 1 || d.remove[0].Cfg().Filename != "20_b.toml" {
 		t.Errorf("remove = %+v", d.remove)
 	}
@@ -432,7 +432,7 @@ func TestDiff_Restart(t *testing.T) {
 		s.Command = []string{"x", "a", "--new-flag"}
 	})}
 	o := diffFixture(t, old)
-	d := o.computeDiff(new_)
+	d := o.computeDiff(&config.Config{Services: new_})
 	if len(d.restart) != 1 {
 		t.Fatalf("restart count = %d, want 1", len(d.restart))
 	}
@@ -451,9 +451,69 @@ func TestDiff_NotReloadableSkipsRestart(t *testing.T) {
 		s.Command = []string{"x", "a", "--changed"}
 	})}
 	o := diffFixture(t, old)
-	d := o.computeDiff(new_)
+	d := o.computeDiff(&config.Config{Services: new_})
 	if len(d.restart) != 0 {
 		t.Errorf("non-reloadable service should not be restarted: %+v", d.restart)
+	}
+}
+
+func TestDiff_GlobalsEnvChangeAddsRestart(t *testing.T) {
+	svcs := []config.Service{
+		mustService("a", "10_a.toml", nil),
+		mustService("b", "20_b.toml", nil),
+	}
+	o := diffFixture(t, svcs)
+	o.cfg.Globals.Env = map[string]string{"FOO": "old"}
+
+	// Same services, only globals.Env differs. All reloadable services
+	// should be added to the restart list so they pick up the new env
+	// on respawn.
+	d := o.computeDiff(&config.Config{
+		Services: svcs,
+		Globals:  config.Globals{Env: map[string]string{"FOO": "new"}},
+	})
+	if len(d.restart) != 2 {
+		t.Fatalf("restart count = %d, want 2 (env change should restart all reloadable services)", len(d.restart))
+	}
+	if len(d.add)+len(d.remove) != 0 {
+		t.Errorf("unexpected add/remove on env-only change: %+v", d)
+	}
+}
+
+func TestDiff_GlobalsEnvChangeSkipsNonReloadable(t *testing.T) {
+	notReload := false
+	svcs := []config.Service{
+		mustService("a", "10_a.toml", func(s *config.Service) {
+			s.Reloadable = &notReload
+		}),
+		mustService("b", "20_b.toml", nil),
+	}
+	o := diffFixture(t, svcs)
+	o.cfg.Globals.Env = map[string]string{"FOO": "old"}
+
+	d := o.computeDiff(&config.Config{
+		Services: svcs,
+		Globals:  config.Globals{Env: map[string]string{"FOO": "new"}},
+	})
+	if len(d.restart) != 1 {
+		t.Fatalf("restart count = %d, want 1 (non-reloadable service must keep old env)", len(d.restart))
+	}
+	if d.restart[0].new.Name != "b" {
+		t.Errorf("restarted service = %q, want b", d.restart[0].new.Name)
+	}
+}
+
+func TestDiff_GlobalsEnvUnchanged_NoRestart(t *testing.T) {
+	svcs := []config.Service{mustService("a", "10_a.toml", nil)}
+	o := diffFixture(t, svcs)
+	o.cfg.Globals.Env = map[string]string{"FOO": "v"}
+
+	d := o.computeDiff(&config.Config{
+		Services: svcs,
+		Globals:  config.Globals{Env: map[string]string{"FOO": "v"}},
+	})
+	if len(d.restart)+len(d.add)+len(d.remove) != 0 {
+		t.Errorf("unchanged env should produce empty diff: %+v", d)
 	}
 }
 
@@ -461,7 +521,7 @@ func TestDiff_RenameIsRemoveAdd(t *testing.T) {
 	old := []config.Service{mustService("redis", "10_redis.toml", nil)}
 	new_ := []config.Service{mustService("redis", "20_redis.toml", nil)}
 	o := diffFixture(t, old)
-	d := o.computeDiff(new_)
+	d := o.computeDiff(&config.Config{Services: new_})
 	if len(d.remove) != 1 || d.remove[0].Cfg().Filename != "10_redis.toml" {
 		t.Errorf("expected to remove 10_redis.toml; got %+v", d.remove)
 	}
@@ -539,6 +599,373 @@ func TestReload_RemovesService(t *testing.T) {
 	cancel()
 	// a's process still alive — deliver its synthetic exit.
 	go captured.snapshot()[0].pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	f.awaitExit(3 * time.Second)
+}
+
+// waitOrchReady spins until the orchestrator's Run goroutine has
+// committed runnerCtx (the publish point after which Reload is safe).
+// Needed for tests that start with an empty service set, where there
+// is no spawn we can wait on.
+func waitOrchReady(t *testing.T, o *Orchestrator, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		o.mu.RLock()
+		ready := o.runnerCtx != nil
+		o.mu.RUnlock()
+		if ready {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("orchestrator did not initialise runnerCtx within timeout")
+}
+
+func TestReload_RemoveStopFailureKeepsRunner(t *testing.T) {
+	initial := []config.Service{
+		mustService("a", "10_a.toml", nil),
+		mustService("b", "20_b.toml", func(s *config.Service) {
+			s.StopTimeout = config.Duration(50 * time.Millisecond)
+		}),
+	}
+	f, captured := newCapturingFixture(t, initial, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+	waitForSpawnCount(t, captured, 2, 2*time.Second)
+
+	// Reload removes b. b's fakeProcess never reaches terminal on
+	// its own, so removeService's WaitTerminal must time out and
+	// surface an error. We bound the wait via a tight reloadCtx
+	// instead of waiting the full stop_timeout+reapGrace; the same
+	// "WaitTerminal returned non-nil" code path fires.
+	newCfg := &config.Config{
+		Services: []config.Service{mustService("a", "10_a.toml", nil)},
+		Globals:  f.cfg.Globals,
+	}
+	reloadCtx, reloadCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer reloadCancel()
+
+	err := f.orch.Reload(reloadCtx, newCfg)
+	if err == nil {
+		t.Fatal("expected reload to return an error when stop fails")
+	}
+
+	// b's runner must still be registered so its Run goroutine can
+	// keep tracking the still-live child.
+	f.orch.mu.RLock()
+	var stillThere bool
+	for _, r := range f.orch.runners {
+		if r.Cfg().Filename == "20_b.toml" {
+			stillThere = true
+			break
+		}
+	}
+	f.orch.mu.RUnlock()
+	if !stillThere {
+		t.Fatal("b dropped from runners after stop-failure; orchestrator lost control of live child")
+	}
+
+	cancel()
+	for _, p := range captured.snapshot() {
+		go p.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}
+	f.awaitExit(3 * time.Second)
+}
+
+func TestReload_AddsBootSerialInFilenameOrder(t *testing.T) {
+	f, captured := newCapturingFixture(t, nil, "")
+
+	// Wrap the fixture's spawner so we capture the order spawn() is
+	// called in (filename), independent of the unordered input slice.
+	var spawnOrderMu sync.Mutex
+	var spawnOrder []string
+	prev := f.orch.spawner
+	f.orch.spawner = func(svc config.Service, env []string) (Process, error) {
+		spawnOrderMu.Lock()
+		spawnOrder = append(spawnOrder, svc.Filename)
+		spawnOrderMu.Unlock()
+		return prev(svc, env)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+	waitOrchReady(t, f.orch, 2*time.Second)
+
+	// Input is deliberately *out* of filename order; reload must
+	// boot 10_a → 20_b → 30_c regardless.
+	newCfg := &config.Config{
+		Services: []config.Service{
+			mustService("c", "30_c.toml", nil),
+			mustService("a", "10_a.toml", nil),
+			mustService("b", "20_b.toml", nil),
+		},
+		Globals: f.cfg.Globals,
+	}
+	if err := f.orch.Reload(ctx, newCfg); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	waitForSpawnCount(t, captured, 3, 2*time.Second)
+
+	spawnOrderMu.Lock()
+	got := append([]string(nil), spawnOrder...)
+	spawnOrderMu.Unlock()
+	want := []string{"10_a.toml", "20_b.toml", "30_c.toml"}
+	if len(got) < len(want) {
+		t.Fatalf("spawn order = %v, want %v", got, want)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("spawn[%d] = %s, want %s (full=%v)", i, got[i], w, got)
+		}
+	}
+
+	cancel()
+	for _, p := range captured.snapshot() {
+		go p.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}
+	f.awaitExit(3 * time.Second)
+}
+
+func TestStopAll_SerialReverseOrder(t *testing.T) {
+	svcs := []config.Service{
+		mustService("a", "10_a.toml", nil),
+		mustService("b", "20_b.toml", nil),
+		mustService("c", "30_c.toml", nil),
+	}
+	f, captured := newCapturingFixture(t, svcs, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+	waitForSpawnCount(t, captured, 3, 2*time.Second)
+
+	procs := captured.snapshot()
+	if len(procs) != 3 {
+		t.Fatalf("want 3 procs, got %d", len(procs))
+	}
+
+	// We assert the event order is c-signal, c-exit, b-signal,
+	// b-exit, a-signal, a-exit. The artificial inter-event sleeps
+	// (100ms after c-signal, 50ms after b-signal) make the test
+	// flunk loudly under the old "signal-all-then-wait" parallel
+	// teardown — under that scheme all three signals would fire
+	// nearly simultaneously, well before c-exit's recorded marker.
+	var orderMu sync.Mutex
+	var order []string
+	record := func(s string) {
+		orderMu.Lock()
+		order = append(order, s)
+		orderMu.Unlock()
+	}
+	waitSignaled := func(p *fakeProcess) bool {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if len(p.signalsReceived()) > 0 {
+				return true
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return false
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		if !waitSignaled(procs[2]) {
+			t.Error("c never signaled")
+			return
+		}
+		record("c-signal")
+		time.Sleep(100 * time.Millisecond)
+		record("c-exit")
+		procs[2].pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}()
+	go func() {
+		defer wg.Done()
+		if !waitSignaled(procs[1]) {
+			t.Error("b never signaled")
+			return
+		}
+		record("b-signal")
+		time.Sleep(50 * time.Millisecond)
+		record("b-exit")
+		procs[1].pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}()
+	go func() {
+		defer wg.Done()
+		if !waitSignaled(procs[0]) {
+			t.Error("a never signaled")
+			return
+		}
+		record("a-signal")
+		record("a-exit")
+		procs[0].pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}()
+
+	cancel()
+	wg.Wait()
+	f.awaitExit(3 * time.Second)
+
+	orderMu.Lock()
+	got := append([]string(nil), order...)
+	orderMu.Unlock()
+	want := []string{
+		"c-signal", "c-exit",
+		"b-signal", "b-exit",
+		"a-signal", "a-exit",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("event order = %v, want %v", got, want)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("event[%d] = %s, want %s (full=%v)", i, got[i], w, got)
+			break
+		}
+	}
+}
+
+// TestReload_GlobalsEnvPropagatesToRestartedServices verifies that
+// SIGHUP-style reloads with a changed globals.Env (a) restart
+// reloadable services and (b) spawn them with the rebuilt baseEnv from
+// the installed builder.
+func TestReload_GlobalsEnvPropagatesToRestartedServices(t *testing.T) {
+	initial := []config.Service{mustService("a", "10_a.toml", nil)}
+	f, captured := newCapturingFixture(t, initial, "")
+	f.cfg.Globals.Env = map[string]string{"FOO": "old"}
+
+	// Wrap spawner to capture the env passed to each spawn.
+	var (
+		envMu  sync.Mutex
+		envSeq [][]string
+	)
+	prev := f.orch.spawner
+	f.orch.spawner = func(svc config.Service, env []string) (Process, error) {
+		envMu.Lock()
+		envSeq = append(envSeq, append([]string(nil), env...))
+		envMu.Unlock()
+		return prev(svc, env)
+	}
+
+	// Install a builder that maps globals.Env directly to the slice.
+	// Production wires layeredMerge here; for the test we want the
+	// new globals to show up verbatim so we can assert on it.
+	f.orch.SetBaseEnvBuilder(func(g map[string]string) []string {
+		out := make([]string, 0, len(g))
+		for k, v := range g {
+			out = append(out, k+"="+v)
+		}
+		return out
+	})
+	// Seed the orchestrator's baseEnv to match the initial Env so the
+	// post-spawn assertion below is meaningful.
+	f.orch.baseEnv = []string{"FOO=old"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+	waitForSpawnCount(t, captured, 1, 2*time.Second)
+
+	// First spawn must use FOO=old (sanity check).
+	envMu.Lock()
+	first := envSeq[0]
+	envMu.Unlock()
+	if !envContains(first, "FOO=old") {
+		t.Fatalf("first spawn env missing FOO=old: %v", first)
+	}
+
+	// Reload with new globals.Env. Push the existing process's exit so
+	// removeService's WaitTerminal unblocks during the restart path.
+	bProc := captured.snapshot()[0]
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		bProc.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}()
+	newCfg := &config.Config{
+		Services: initial,
+		Globals:  config.Globals{Env: map[string]string{"FOO": "new"}, BootTimeout: f.cfg.Globals.BootTimeout, ExitCodeFrom: f.cfg.Globals.ExitCodeFrom},
+	}
+	if err := f.orch.Reload(ctx, newCfg); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	// Reload's restart-new boot is detached; wait for the second spawn.
+	waitForSpawnCount(t, captured, 2, 3*time.Second)
+
+	envMu.Lock()
+	second := envSeq[1]
+	envMu.Unlock()
+	if !envContains(second, "FOO=new") {
+		t.Errorf("post-reload spawn env missing FOO=new: %v", second)
+	}
+	if envContains(second, "FOO=old") {
+		t.Errorf("post-reload spawn env still has FOO=old: %v", second)
+	}
+
+	cancel()
+	// Only the post-reload spawn is still alive; pushing exit on the
+	// pre-reload process would re-close its channel and panic.
+	go captured.snapshot()[1].pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	f.awaitExit(3 * time.Second)
+}
+
+func envContains(env []string, kv string) bool {
+	for _, e := range env {
+		if e == kv {
+			return true
+		}
+	}
+	return false
+}
+
+func TestShutdownBudget_RecomputedFromCurrentRunners(t *testing.T) {
+	initial := []config.Service{
+		mustService("a", "10_a.toml", func(s *config.Service) {
+			s.StopTimeout = config.Duration(2 * time.Second)
+		}),
+	}
+	f, captured := newCapturingFixture(t, initial, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+	waitForSpawnCount(t, captured, 1, 2*time.Second)
+
+	wantInitial := shutdownHeadroom + (2*time.Second + reapGrace)
+	if got := f.orch.ShutdownBudget(); got != wantInitial {
+		t.Errorf("initial ShutdownBudget = %v, want %v", got, wantInitial)
+	}
+
+	newCfg := &config.Config{
+		Services: []config.Service{
+			mustService("a", "10_a.toml", func(s *config.Service) {
+				s.StopTimeout = config.Duration(2 * time.Second)
+			}),
+			mustService("b", "20_b.toml", func(s *config.Service) {
+				s.StopTimeout = config.Duration(10 * time.Second)
+			}),
+		},
+		Globals: f.cfg.Globals,
+	}
+	if err := f.orch.Reload(ctx, newCfg); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	waitForSpawnCount(t, captured, 2, 2*time.Second)
+
+	wantNew := shutdownHeadroom + (2*time.Second + reapGrace) + (10*time.Second + reapGrace)
+	if got := f.orch.ShutdownBudget(); got != wantNew {
+		t.Errorf("post-reload ShutdownBudget = %v, want %v", got, wantNew)
+	}
+
+	cancel()
+	for _, p := range captured.snapshot() {
+		go p.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}
 	f.awaitExit(3 * time.Second)
 }
 

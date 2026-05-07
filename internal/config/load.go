@@ -21,8 +21,9 @@ const (
 )
 
 var (
-	namePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-	prefixStrip = regexp.MustCompile(`^\d+[-_]?`)
+	namePattern   = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	prefixStrip   = regexp.MustCompile(`^\d+[-_]?`)
+	envKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 // Load reads zpinit.toml and services/*.toml from dir, applies defaults,
@@ -225,6 +226,11 @@ func validate(cfg *Config) error {
 	}
 	if _, ok := ParseSignal(cfg.Globals.DefaultStopSignal); !ok {
 		errs = append(errs, fmt.Sprintf("default_stop_signal %q is not a recognised signal name", cfg.Globals.DefaultStopSignal))
+	}
+	for k := range cfg.Globals.Env {
+		if !envKeyPattern.MatchString(k) {
+			errs = append(errs, fmt.Sprintf("env key %q must match %s", k, envKeyPattern))
+		}
 	}
 
 	nameToFile := map[string]string{}

@@ -26,6 +26,13 @@ import (
 
 const Terminator = "."
 
+// MaxLineLen caps the size of any single line read from the wire.
+// Without this, a misbehaving (or malicious) local client could keep
+// sending bytes with no newline and grow our bufio buffer until OOM.
+// 64 KiB is comfortably larger than any legitimate verb+args + status
+// line + body line we produce.
+const MaxLineLen = 64 * 1024
+
 type Request struct {
 	Verb string
 	Args []string
@@ -37,15 +44,17 @@ type Response struct {
 	Body []string // additional lines, may be empty
 }
 
-// Conn pairs a buffered reader with a writer for the lifetime of a
-// single connection.
+// Conn pairs a buffered reader with a buffered writer for the lifetime
+// of a single connection. The writer is buffered so a status response
+// over many services flushes in one syscall instead of one per body
+// line.
 type Conn struct {
 	r *bufio.Reader
-	w io.Writer
+	w *bufio.Writer
 }
 
 func NewConn(rw io.ReadWriter) *Conn {
-	return &Conn{r: bufio.NewReader(rw), w: rw}
+	return &Conn{r: bufio.NewReader(rw), w: bufio.NewWriter(rw)}
 }
 
 func (c *Conn) ReadRequest() (*Request, error) {
@@ -61,12 +70,18 @@ func (c *Conn) ReadRequest() (*Request, error) {
 }
 
 func (c *Conn) WriteRequest(req *Request) error {
-	out := req.Verb
+	var b strings.Builder
+	b.Grow(len(req.Verb) + 1)
+	b.WriteString(req.Verb)
 	for _, a := range req.Args {
-		out += " " + a
+		b.WriteByte(' ')
+		b.WriteString(a)
 	}
-	_, err := io.WriteString(c.w, out+"\n")
-	return err
+	b.WriteByte('\n')
+	if _, err := io.WriteString(c.w, b.String()); err != nil {
+		return err
+	}
+	return c.w.Flush()
 }
 
 func (c *Conn) ReadResponse() (*Response, error) {
@@ -100,16 +115,41 @@ func (c *Conn) WriteResponse(resp *Response) error {
 			return err
 		}
 	}
-	_, err := fmt.Fprintln(c.w, Terminator)
-	return err
+	if _, err := fmt.Fprintln(c.w, Terminator); err != nil {
+		return err
+	}
+	return c.w.Flush()
 }
 
+// errLineTooLong signals that the peer sent more than MaxLineLen bytes
+// without a newline. Treated as a hard read failure.
+var errLineTooLong = errors.New("line too long")
+
 func (c *Conn) readLine() (string, error) {
-	line, err := c.r.ReadString('\n')
-	if err != nil && line == "" {
-		return "", err
+	// ReadSlice returns ErrBufferFull instead of growing without bound;
+	// we cap to MaxLineLen so a misbehaving local client can't OOM PID 1.
+	var buf []byte
+	for {
+		chunk, err := c.r.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			if len(buf)+len(chunk) > MaxLineLen {
+				return "", errLineTooLong
+			}
+			buf = append(buf, chunk...)
+			continue
+		}
+		if err != nil && len(chunk) == 0 && len(buf) == 0 {
+			return "", err
+		}
+		if len(buf)+len(chunk) > MaxLineLen {
+			return "", errLineTooLong
+		}
+		buf = append(buf, chunk...)
+		if err != nil && err != io.EOF {
+			return "", err
+		}
+		return strings.TrimRight(string(buf), "\r\n"), nil
 	}
-	return strings.TrimRight(line, "\r\n"), nil
 }
 
 func parseStatus(line string) (int, string, error) {

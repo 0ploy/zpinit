@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +21,26 @@ import (
 // during the boot phase, which lets tests drop in a fake.
 type Prober func(ctx context.Context, cmd []string, env []string, cwd string) error
 
+// probeNull is a write-only handle to /dev/null shared by every probe
+// invocation. We don't use io.Discard because exec.Cmd allocates pipes
+// (and goroutines) for any non-*os.File stdout/stderr, and the
+// centralized-reaper rule forbids cmd.Wait() — which is what would
+// otherwise close those pipes. Result: per-probe FD leak until GC.
+// Opening /dev/null once and reusing it sidesteps both the pipe and
+// the FD lifetime problem.
+var (
+	probeNullOnce sync.Once
+	probeNull     *os.File
+	probeNullErr  error
+)
+
+func openProbeNull() (*os.File, error) {
+	probeNullOnce.Do(func() {
+		probeNull, probeNullErr = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	})
+	return probeNull, probeNullErr
+}
+
 // defaultProber spawns the probe command via the centralized reaper.
 // stdout/stderr are discarded — probes are noisy and the result is
 // already captured in the exit code.
@@ -29,12 +49,21 @@ func defaultProber(r *reaper.Reaper, log *slog.Logger) Prober {
 		if len(cmd) == 0 {
 			return errors.New("empty probe command")
 		}
+		// /dev/null is the only safe sink: io.Discard makes exec.Cmd
+		// allocate pipes + reader goroutines, and the centralized-reaper
+		// rule forbids cmd.Wait (which is what would close them) — net
+		// result one FD + one goroutine leak per probe. Refuse the probe
+		// rather than leaking; in any real container /dev/null exists.
+		devNull, err := openProbeNull()
+		if err != nil {
+			return fmt.Errorf("open /dev/null for probe: %w", err)
+		}
 		c := exec.Command(cmd[0], cmd[1:]...)
 		c.Env = env
 		c.Dir = cwd
 		c.Stdin = nil
-		c.Stdout = io.Discard
-		c.Stderr = io.Discard
+		c.Stdout = devNull
+		c.Stderr = devNull
 		// Setpgid so a single Kill(-pid) reaches the probe and any
 		// subcommands it spawns. No Pdeathsig — probe is short-lived.
 		c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -74,14 +103,29 @@ func waitReady(ctx context.Context, ready *config.Ready, env []string, cwd strin
 	probeCtx, probeCancel := context.WithDeadline(ctx, deadline)
 	defer probeCancel()
 
+	// One reusable timer for the inter-probe interval. NewTimer + Stop
+	// avoids the per-iteration allocation of time.After (whose Timer
+	// keeps running even when the select picks a different case).
+	intervalTimer := time.NewTimer(ready.Interval.Std())
+	defer intervalTimer.Stop()
+
 	for {
 		if err := prober(probeCtx, ready.Command, env, cwd); err == nil {
 			return nil
 		} else {
 			log.Debug("probe failed; retrying", "err", err)
 		}
+		// Reset for the next interval. Drain a stale tick if Stop
+		// reports the timer had already fired (rare but possible).
+		if !intervalTimer.Stop() {
+			select {
+			case <-intervalTimer.C:
+			default:
+			}
+		}
+		intervalTimer.Reset(ready.Interval.Std())
 		select {
-		case <-time.After(ready.Interval.Std()):
+		case <-intervalTimer.C:
 		case <-probeCtx.Done():
 			if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
 				return fmt.Errorf("readiness timeout after %v", ready.Timeout.Std())

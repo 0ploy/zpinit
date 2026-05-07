@@ -38,7 +38,12 @@ type Config struct {
 	ScriptTimeout time.Duration // 0 disables; default applied by caller
 	KillGrace     time.Duration // SIGTERM-to-SIGKILL grace on timeout (default 5s)
 	EnvFile       string        // path scripts write KEY=value to (e.g. /run/zpinit/env)
-	Logger        *slog.Logger
+	// InitialEnv is the starting env that scripts inherit and that the
+	// returned env layers on top of. nil falls back to os.Environ() for
+	// backwards-compat (and tests). Production callers compose
+	// container env + globals.Env here so scripts see the merged map.
+	InitialEnv map[string]string
+	Logger     *slog.Logger
 }
 
 // Run executes entrypoint.d/* sequentially. Returns the accumulated env
@@ -66,7 +71,15 @@ func Run(ctx context.Context, cfg Config) (map[string]string, error) {
 		return nil, err
 	}
 
-	env := mapFromEnviron(os.Environ())
+	var env map[string]string
+	if cfg.InitialEnv != nil {
+		env = make(map[string]string, len(cfg.InitialEnv))
+		for k, v := range cfg.InitialEnv {
+			env[k] = v
+		}
+	} else {
+		env = mapFromEnviron(os.Environ())
+	}
 
 	for _, path := range scripts {
 		if err := mergeEnvFile(env, cfg.EnvFile, cfg.Logger); err != nil {
@@ -131,34 +144,51 @@ func runOne(ctx context.Context, cfg Config, path string, env []string) error {
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = nil
 	cmd.Env = env
+	// Setpgid puts the script in its own process group so SIGTERM/SIGKILL
+	// reaches grandchildren too. Without this, a script that forks
+	// (e.g. wraps `composer install`) would leave its children running
+	// after timeout/cancel — they get reparented to PID 1 (us) and
+	// continue to consume resources into the supervise phase.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start: %w", err)
 	}
+	pgid := cmd.Process.Pid
 
+	// cmd.Wait() runs in its own goroutine. If the kernel can't deliver
+	// SIGKILL (process pinned in uninterruptible sleep — e.g. wedged
+	// NFS), Wait blocks forever and this goroutine leaks. Buffered chan
+	// (cap 1) so the eventual send succeeds even if no one reads.
+	// Acceptable: entrypoint runs once at boot before the centralized
+	// reaper exists, so we can't route through SpawnTracked here.
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
-	var timeout <-chan time.Time
+	var timeoutCh <-chan time.Time
 	if cfg.ScriptTimeout > 0 {
-		timeout = time.After(cfg.ScriptTimeout)
+		t := time.NewTimer(cfg.ScriptTimeout)
+		defer t.Stop()
+		timeoutCh = t.C
 	}
 
 	select {
 	case err := <-done:
 		return err
-	case <-timeout:
+	case <-timeoutCh:
 		cfg.Logger.Warn("entrypoint script timed out", "name", filepath.Base(path), "timeout", cfg.ScriptTimeout)
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
 	case <-ctx.Done():
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
 	}
 
+	graceTimer := time.NewTimer(cfg.KillGrace)
+	defer graceTimer.Stop()
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(cfg.KillGrace):
-		_ = cmd.Process.Kill()
+	case <-graceTimer.C:
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		<-done
 		return errors.New("script killed after timeout / cancellation")
 	}

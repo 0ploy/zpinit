@@ -2,7 +2,9 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -21,6 +23,17 @@ type ControlServer struct {
 	shutdown func() // called by `zpctl shutdown` to trigger orderly exit
 	log      *slog.Logger
 }
+
+// readRequestTimeout caps how long a client may take to send the
+// request line. Bounded so a slow client can't pin a handler
+// goroutine waiting on the read.
+const readRequestTimeout = 5 * time.Second
+
+// minDispatchBudget is the floor for the post-request connection
+// deadline — covers status/pid/help/etc. that don't touch the
+// runners. Stop-driven verbs add per-target stop_timeout on top via
+// dispatchBudget.
+const minDispatchBudget = 30 * time.Second
 
 // NewControlServer wires the server to an orchestrator. shutdownFn
 // should cancel whatever context Orchestrator.Run is parked on.
@@ -56,6 +69,13 @@ func (s *ControlServer) Listen(ctx context.Context, path string) error {
 				return nil
 			}
 			s.log.Warn("control accept", "err", err)
+			// Back off briefly so a persistent error (EMFILE etc.)
+			// doesn't busy-loop and flood logs.
+			select {
+			case <-time.After(100 * time.Millisecond):
+			case <-ctx.Done():
+				return nil
+			}
 			continue
 		}
 		go s.handleConn(conn)
@@ -64,32 +84,93 @@ func (s *ControlServer) Listen(ctx context.Context, path string) error {
 
 func (s *ControlServer) handleConn(conn net.Conn) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	// Recover from any panic in dispatch — without this a single bad
+	// request crashes PID 1 and takes the container down. Mirrors
+	// safeReap in cmd/zpinit/main.go.
+	defer func() {
+		if p := recover(); p != nil {
+			s.log.Error("control dispatch panic; connection dropped", "panic", p)
+		}
+	}()
 
+	// Two-phase deadline: a short read budget for the request line, then
+	// a verb-aware budget for the dispatch + write. The old single-60s
+	// deadline expired mid-loop on `restart all` for many services,
+	// leaving operator and PID-1 state inconsistent.
+	_ = conn.SetReadDeadline(time.Now().Add(readRequestTimeout))
 	pc := ctlproto.NewConn(conn)
 	req, err := pc.ReadRequest()
 	if err != nil {
+		_ = conn.SetWriteDeadline(time.Now().Add(readRequestTimeout))
 		_ = pc.WriteResponse(&ctlproto.Response{Code: 1, Msg: "bad request: " + err.Error()})
 		return
 	}
-	resp := s.dispatch(req)
+
+	deadline := time.Now().Add(s.dispatchBudget(req))
+	_ = conn.SetDeadline(deadline)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	resp := s.dispatch(ctx, req)
 	_ = pc.WriteResponse(resp)
 }
 
-func (s *ControlServer) dispatch(req *ctlproto.Request) *ctlproto.Response {
+// dispatchBudget returns how long the connection may stay open for
+// this verb's work. Verbs that drive Stop on services need to cover
+// sum-of-(stop_timeout+grace) over the affected runners; everything
+// else gets the floor.
+func (s *ControlServer) dispatchBudget(req *ctlproto.Request) time.Duration {
+	switch req.Verb {
+	case "stop", "restart", "update", "reload", "shutdown":
+	default:
+		return minDispatchBudget
+	}
+
+	snap := s.orch.snapshotRunners()
+	var targets []*Runner
+	switch {
+	case req.Verb == "shutdown" || req.Verb == "update" || req.Verb == "reload":
+		// These touch every running service in the worst case.
+		targets = snap
+	case len(req.Args) == 0:
+		// dispatch will reject with usage error; floor budget is enough.
+		return minDispatchBudget
+	case len(req.Args) == 1 && req.Args[0] == "all":
+		targets = snap
+	default:
+		targets = make([]*Runner, 0, len(req.Args))
+		for _, n := range req.Args {
+			for _, r := range snap {
+				if r.Cfg().Name == n {
+					targets = append(targets, r)
+					break
+				}
+			}
+		}
+	}
+
+	const perTargetGrace = 10 * time.Second
+	budget := minDispatchBudget
+	for _, r := range targets {
+		budget += r.Cfg().StopTimeout.Std() + perTargetGrace
+	}
+	return budget
+}
+
+func (s *ControlServer) dispatch(ctx context.Context, req *ctlproto.Request) *ctlproto.Response {
 	switch req.Verb {
 	case "status":
 		return s.cmdStatus(req.Args)
 	case "start":
-		return s.cmdStartStopRestart(req.Args, "start")
+		return s.cmdStartStopRestart(ctx, req.Args, "start")
 	case "stop":
-		return s.cmdStartStopRestart(req.Args, "stop")
+		return s.cmdStartStopRestart(ctx, req.Args, "stop")
 	case "restart":
-		return s.cmdStartStopRestart(req.Args, "restart")
+		return s.cmdStartStopRestart(ctx, req.Args, "restart")
 	case "pid":
 		return s.cmdPID(req.Args)
 	case "update", "reload":
-		return s.cmdUpdate()
+		return s.cmdUpdate(ctx)
 	case "reread":
 		return s.cmdReread()
 	case "tail":
@@ -117,7 +198,7 @@ func (s *ControlServer) cmdStatus(args []string) *ctlproto.Response {
 	return resp
 }
 
-func (s *ControlServer) cmdStartStopRestart(args []string, action string) *ctlproto.Response {
+func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, action string) *ctlproto.Response {
 	if len(args) == 0 {
 		return errResp(fmt.Sprintf("usage: %s NAME [NAME...] | %s all", action, action))
 	}
@@ -126,21 +207,47 @@ func (s *ControlServer) cmdStartStopRestart(args []string, action string) *ctlpr
 		return errResp(err.Error())
 	}
 	resp := okResp("ok")
+	var anyErr error
 	for _, r := range targets {
 		switch action {
 		case "start":
-			r.Start()
+			if err := r.StartCtx(ctx); err != nil {
+				anyErr = fmt.Errorf("%s: start: %w", r.Cfg().Name, err)
+				resp.Body = append(resp.Body, fmt.Sprintf("%s: start failed: %v", r.Cfg().Name, err))
+				continue
+			}
 		case "stop":
-			r.Stop()
+			if err := r.StopCtx(ctx); err != nil {
+				anyErr = fmt.Errorf("%s: stop: %w", r.Cfg().Name, err)
+				resp.Body = append(resp.Body, fmt.Sprintf("%s: stop failed: %v", r.Cfg().Name, err))
+				continue
+			}
 		case "restart":
-			r.Stop()
-			ctx, cancel := context.WithTimeout(context.Background(),
-				r.Cfg().StopTimeout.Std()+5*time.Second)
-			_, _ = r.WaitTerminal(ctx)
+			if err := r.StopCtx(ctx); err != nil {
+				anyErr = fmt.Errorf("%s: restart-stop: %w", r.Cfg().Name, err)
+				resp.Body = append(resp.Body, fmt.Sprintf("%s: stop failed: %v", r.Cfg().Name, err))
+				continue
+			}
+			waitCtx, cancel := context.WithTimeout(ctx, r.Cfg().StopTimeout.Std()+5*time.Second)
+			state, werr := r.WaitTerminal(waitCtx)
 			cancel()
-			r.Start()
+			if werr != nil {
+				anyErr = fmt.Errorf("%s: restart-wait: %w", r.Cfg().Name, werr)
+				resp.Body = append(resp.Body,
+					fmt.Sprintf("%s: did not stop within timeout (state=%s); restart aborted", r.Cfg().Name, state))
+				continue
+			}
+			if err := r.StartCtx(ctx); err != nil {
+				anyErr = fmt.Errorf("%s: restart-start: %w", r.Cfg().Name, err)
+				resp.Body = append(resp.Body, fmt.Sprintf("%s: start failed: %v", r.Cfg().Name, err))
+				continue
+			}
 		}
 		resp.Body = append(resp.Body, fmt.Sprintf("%s: %s", r.Cfg().Name, action))
+	}
+	if anyErr != nil {
+		resp.Code = 1
+		resp.Msg = anyErr.Error()
 	}
 	return resp
 }
@@ -156,23 +263,23 @@ func (s *ControlServer) cmdPID(args []string) *ctlproto.Response {
 	return okBody("ok", []string{strconv.Itoa(r.PID())})
 }
 
-func (s *ControlServer) cmdUpdate() *ctlproto.Response {
-	newCfg, err := config.Load(s.orch.cfg.Dir)
+func (s *ControlServer) cmdUpdate(ctx context.Context) *ctlproto.Response {
+	newCfg, err := config.Load(s.orch.configDir())
 	if err != nil {
 		return errResp("load: " + err.Error())
 	}
-	if err := s.orch.Reload(context.Background(), newCfg); err != nil {
+	if err := s.orch.Reload(ctx, newCfg); err != nil {
 		return errResp("reload: " + err.Error())
 	}
 	return okResp("ok")
 }
 
 func (s *ControlServer) cmdReread() *ctlproto.Response {
-	newCfg, err := config.Load(s.orch.cfg.Dir)
+	newCfg, err := config.Load(s.orch.configDir())
 	if err != nil {
 		return errResp("load: " + err.Error())
 	}
-	diff := s.orch.computeDiff(newCfg.Services)
+	diff := s.orch.computeDiff(newCfg)
 	resp := okResp("ok")
 	for _, r := range diff.remove {
 		resp.Body = append(resp.Body, fmt.Sprintf("- %s (will stop)", r.Cfg().Name))
@@ -267,22 +374,29 @@ func (s *ControlServer) cmdHelp() *ctlproto.Response {
 }
 
 func (s *ControlServer) expandTargets(args []string, allOnEmpty bool) ([]*Runner, error) {
+	snap := s.orch.snapshotRunners()
 	if len(args) == 0 {
 		if allOnEmpty {
-			return s.orch.runners, nil
+			return snap, nil
 		}
 		return nil, fmt.Errorf("no service named")
 	}
 	if len(args) == 1 && args[0] == "all" {
-		return s.orch.runners, nil
+		return snap, nil
 	}
 	out := make([]*Runner, 0, len(args))
 	for _, n := range args {
-		r := s.orch.findRunner(n)
-		if r == nil {
+		var found *Runner
+		for _, r := range snap {
+			if r.Cfg().Name == n {
+				found = r
+				break
+			}
+		}
+		if found == nil {
 			return nil, fmt.Errorf("unknown service: %s", n)
 		}
-		out = append(out, r)
+		out = append(out, found)
 	}
 	return out, nil
 }
@@ -372,8 +486,7 @@ func readLastBytes(path string, n int64) (string, error) {
 		return "", err
 	}
 	buf := make([]byte, st.Size()-offset)
-	_, err = f.Read(buf)
-	if err != nil {
+	if _, err := io.ReadFull(f, buf); err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return "", err
 	}
 	return string(buf), nil

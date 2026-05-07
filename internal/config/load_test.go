@@ -339,3 +339,41 @@ backoff_initial = "two seconds"
 		t.Fatal("expected duration parse error")
 	}
 }
+
+func TestLoad_GlobalsEnvParses(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "zpinit.toml"), `
+[env]
+APP_ENV = "production"
+LOG_LEVEL = "info"
+EMPTY = ""
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Globals.Env["APP_ENV"]; got != "production" {
+		t.Errorf("APP_ENV = %q, want production", got)
+	}
+	if got := cfg.Globals.Env["LOG_LEVEL"]; got != "info" {
+		t.Errorf("LOG_LEVEL = %q, want info", got)
+	}
+	if v, ok := cfg.Globals.Env["EMPTY"]; !ok || v != "" {
+		t.Errorf("EMPTY = (%q, %v), want (\"\", true)", v, ok)
+	}
+}
+
+func TestLoad_GlobalsEnvInvalidKey(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "zpinit.toml"), `
+[env]
+"BAD-KEY" = "x"
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected validation error for hyphen in env key")
+	}
+	if !strings.Contains(err.Error(), "env key") {
+		t.Errorf("error should mention env key: %v", err)
+	}
+}

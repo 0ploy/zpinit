@@ -135,6 +135,78 @@ func TestRun_NoDir(t *testing.T) {
 	}
 }
 
+func TestRun_InitialEnv_VisibleToScriptsAndReturnedMerged(t *testing.T) {
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "ep")
+	envFile := filepath.Join(tmp, "env")
+	// Script reads ZP_INITIAL from its env (proves InitialEnv reaches
+	// the child) and writes ZP_FROM_SCRIPT to the env file (proves the
+	// merge picks it up afterwards).
+	writeExec(t, filepath.Join(dir, "10-check.sh"), `#!/bin/sh
+set -e
+test "$ZP_INITIAL" = "from-toml" || { echo "ZP_INITIAL=$ZP_INITIAL" >&2; exit 1; }
+echo "ZP_FROM_SCRIPT=hello" >> "$1"
+`)
+	// Pass the env file as $1 by wrapping the call: easier to embed
+	// the path in the script directly.
+	if err := os.WriteFile(filepath.Join(dir, "10-check.sh"), []byte(`#!/bin/sh
+set -e
+test "$ZP_INITIAL" = "from-toml" || { echo "ZP_INITIAL=$ZP_INITIAL" >&2; exit 1; }
+echo "ZP_FROM_SCRIPT=hello" >> "`+envFile+`"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := Run(context.Background(), Config{
+		Dir:           dir,
+		EnvFile:       envFile,
+		ScriptTimeout: 5 * time.Second,
+		KillGrace:     500 * time.Millisecond,
+		InitialEnv:    map[string]string{"ZP_INITIAL": "from-toml", "PATH": os.Getenv("PATH")},
+		Logger:        discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := out["ZP_INITIAL"]; got != "from-toml" {
+		t.Errorf("ZP_INITIAL = %q, want from-toml (InitialEnv must survive merge)", got)
+	}
+	if got := out["ZP_FROM_SCRIPT"]; got != "hello" {
+		t.Errorf("ZP_FROM_SCRIPT = %q, want hello (env file must be merged in)", got)
+	}
+}
+
+func TestRun_InitialEnv_EnvFileOverrides(t *testing.T) {
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "ep")
+	envFile := filepath.Join(tmp, "env")
+	// InitialEnv sets OVERRIDE=initial; the script overwrites it via
+	// the env file. Confirms script-set vars win over InitialEnv.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "10-override.sh"), []byte(`#!/bin/sh
+echo "OVERRIDE=from-script" >> "`+envFile+`"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := Run(context.Background(), Config{
+		Dir:           dir,
+		EnvFile:       envFile,
+		ScriptTimeout: 5 * time.Second,
+		KillGrace:     500 * time.Millisecond,
+		InitialEnv:    map[string]string{"OVERRIDE": "initial", "PATH": os.Getenv("PATH")},
+		Logger:        discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := out["OVERRIDE"]; got != "from-script" {
+		t.Errorf("OVERRIDE = %q, want from-script (env file must override InitialEnv)", got)
+	}
+}
+
 func TestRun_TimeoutKills(t *testing.T) {
 	tmp := t.TempDir()
 	dir := filepath.Join(tmp, "ep")

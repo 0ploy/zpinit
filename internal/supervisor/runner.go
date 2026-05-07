@@ -80,6 +80,35 @@ type Runner struct {
 	// are non-blocking — observers that fall behind miss events.
 	observersMu sync.Mutex
 	observers   []chan State
+
+	// runCancel cancels the Run goroutine's context. Set by the
+	// orchestrator's spawnRunnerGoroutine before Run starts; called by
+	// removeService so the goroutine exits and the Runner can be GC'd.
+	// Nil for runners constructed outside the orchestrator (e.g. tests
+	// that call NewRunner directly). Always accessed via setRunCancel/
+	// cancelRun so the read in removeService gets a happens-before edge
+	// to the write in spawnRunnerGoroutine.
+	runCancel context.CancelFunc
+}
+
+// setRunCancel stores the cancel function for the runner's own Run
+// goroutine. Lock-protected so external readers (cancelRun) observe
+// the write through r.mu.
+func (r *Runner) setRunCancel(cancel context.CancelFunc) {
+	r.mu.Lock()
+	r.runCancel = cancel
+	r.mu.Unlock()
+}
+
+// cancelRun cancels the runner's Run goroutine if one was registered.
+// Idempotent.
+func (r *Runner) cancelRun() {
+	r.mu.Lock()
+	c := r.runCancel
+	r.mu.Unlock()
+	if c != nil {
+		c()
+	}
 }
 
 // NewRunner constructs a Runner in state Pending. Caller must invoke
@@ -180,18 +209,39 @@ func (r *Runner) Run(ctx context.Context) {
 }
 
 // Start brings the runner from Pending/Stopped/Fatal/Backoff to a fresh
-// spawn cycle. Blocks until the command is processed by Run.
-func (r *Runner) Start() { r.send(cmdStart) }
+// spawn cycle. Blocks until the command is processed by Run; if the
+// Run goroutine has already exited (e.g. orchestrator shutdown) this
+// will block until the cmds-channel buffer is exhausted, then forever.
+// Production code should prefer StartCtx so a dead Run goroutine
+// doesn't permanently hang the caller.
+func (r *Runner) Start() { _ = r.sendCtx(context.Background(), cmdStart) }
 
 // Stop signals the running process (or skips signaling if not running)
-// and transitions the runner to Stopping/Stopped. Blocks until the
-// command is processed by Run.
-func (r *Runner) Stop() { r.send(cmdStop) }
+// and transitions the runner to Stopping/Stopped. Same blocking caveat
+// as Start; prefer StopCtx in production.
+func (r *Runner) Stop() { _ = r.sendCtx(context.Background(), cmdStop) }
 
-func (r *Runner) send(kind cmdKind) {
+// StartCtx is the context-aware variant of Start. Returns ctx.Err if
+// ctx fires before Run consumes the command — which happens cleanly
+// when Run has exited because its own context was canceled.
+func (r *Runner) StartCtx(ctx context.Context) error { return r.sendCtx(ctx, cmdStart) }
+
+// StopCtx is the context-aware variant of Stop.
+func (r *Runner) StopCtx(ctx context.Context) error { return r.sendCtx(ctx, cmdStop) }
+
+func (r *Runner) sendCtx(ctx context.Context, kind cmdKind) error {
 	done := make(chan struct{})
-	r.cmds <- command{kind: kind, done: done}
-	<-done
+	select {
+	case r.cmds <- command{kind: kind, done: done}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // State returns the current state.
@@ -231,7 +281,12 @@ func (r *Runner) Observe() (<-chan State, func()) {
 		r.observersMu.Lock()
 		for i, c := range r.observers {
 			if c == ch {
-				r.observers = append(r.observers[:i], r.observers[i+1:]...)
+				// copy+nil+truncate, not append-splice — see the same
+				// pattern in orchestrator.removeService for why the
+				// trailing slot must be cleared to avoid leaking.
+				copy(r.observers[i:], r.observers[i+1:])
+				r.observers[len(r.observers)-1] = nil
+				r.observers = r.observers[:len(r.observers)-1]
 				break
 			}
 		}
@@ -240,11 +295,15 @@ func (r *Runner) Observe() (<-chan State, func()) {
 	return ch, cancel
 }
 
-// WaitBootResult blocks until the runner reaches Running (success) or
-// Fatal (failure), or ctx expires. Returns nil on Running, an error on
-// Fatal, ctx.Err on cancellation. Used by the orchestrator to block the
-// ordered-boot phase on each service in turn — the runner's autonomous
-// retries are honoured up to ctx's deadline (boot_timeout).
+// WaitBootResult blocks until the runner reaches Running (success),
+// Fatal (failure), or Stopped/Stopping (removed before boot), or ctx
+// expires. Returns nil on Running, an error otherwise.
+//
+// Stopped/Stopping early-return matters for reload churn: addService
+// spawns a boot goroutine parked here; if a follow-up Reload removes
+// the service before it reaches Running, that goroutine would
+// otherwise stay blocked until boot_timeout (default 60s), leaking
+// the runner reference for that whole window.
 //
 // Subscribe-before-check ordering avoids the classic race where the
 // runner transitions to the target state between a State() probe and
@@ -257,6 +316,8 @@ func (r *Runner) WaitBootResult(ctx context.Context) error {
 		return nil
 	case StateFatal:
 		return errors.New("service is fatal")
+	case StateStopped, StateStopping:
+		return errors.New("service stopped before boot completed")
 	}
 	for {
 		select {
@@ -266,6 +327,8 @@ func (r *Runner) WaitBootResult(ctx context.Context) error {
 				return nil
 			case StateFatal:
 				return errors.New("service is fatal")
+			case StateStopped, StateStopping:
+				return errors.New("service stopped before boot completed")
 			}
 		case <-ctx.Done():
 			return ctx.Err()
@@ -380,8 +443,10 @@ func (r *Runner) handleStart(timers *runnerTimers) {
 	r.mu.Unlock()
 	switch r.State() {
 	case StatePending, StateStopped, StateFatal:
+		r.mu.Lock()
 		r.crashes = 0
 		r.nextDelay = r.cfg.BackoffInitial.Std()
+		r.mu.Unlock()
 		r.spawnNext(timers)
 	case StateBackoff:
 		// Caller wants the service NOW; cancel the pending backoff.
@@ -447,12 +512,11 @@ func (r *Runner) handleExit(info reaper.ExitInfo, timers *runnerTimers) {
 		upFor = r.clock.Now().Sub(r.upSince)
 	}
 	r.upSince = time.Time{}
-	r.mu.Unlock()
-
 	if upFor >= r.cfg.BackoffResetAfter.Std() {
 		r.crashes = 0
 		r.nextDelay = r.cfg.BackoffInitial.Std()
 	}
+	r.mu.Unlock()
 
 	r.recordFailure(timers)
 }
@@ -461,14 +525,17 @@ func (r *Runner) handleExit(info reaper.ExitInfo, timers *runnerTimers) {
 // backoff or transitions to fatal once the retry budget is exhausted.
 // Shared between spawn-failed and process-exit-needs-restart paths.
 func (r *Runner) recordFailure(timers *runnerTimers) {
+	r.mu.Lock()
 	r.crashes++
-	if r.crashes >= MaxConsecutiveCrashes {
-		r.log.Warn("retry budget exceeded; fatal", "service", r.cfg.Name, "crashes", r.crashes)
+	crashes := r.crashes
+	r.mu.Unlock()
+	if crashes >= MaxConsecutiveCrashes {
+		r.log.Warn("retry budget exceeded; fatal", "service", r.cfg.Name, "crashes", crashes)
 		r.setState(StateFatal)
 		return
 	}
 	delay := r.backoffStep()
-	r.log.Info("backoff", "service", r.cfg.Name, "delay", delay, "crashes", r.crashes)
+	r.log.Info("backoff", "service", r.cfg.Name, "delay", delay, "crashes", crashes)
 	timers.backoff = r.clock.NewTimer(delay)
 	r.setState(StateBackoff)
 }
@@ -477,6 +544,8 @@ func (r *Runner) recordFailure(timers *runnerTimers) {
 // at BackoffMax). Initialises from BackoffInitial on first call after
 // reset.
 func (r *Runner) backoffStep() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.nextDelay <= 0 {
 		r.nextDelay = r.cfg.BackoffInitial.Std()
 	}

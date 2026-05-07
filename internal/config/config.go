@@ -35,6 +35,13 @@ type Globals struct {
 	DefaultStopTimeout      Duration            `toml:"default_stop_timeout"`
 	ExitCodeFrom            string              `toml:"exit_code_from"`
 	ControlSocket           string              `toml:"control_socket"`
+	// Env is the fleet-wide default env map for this image. Lowest
+	// precedence: container env (Dockerfile ENV, docker run -e) and
+	// entrypoint.d-set vars both override it. Visible to the wrap-mode
+	// CMD and to supervise-mode services, but NOT to docker exec, since
+	// it travels via the syscall.Exec / spawn env path rather than the
+	// container's stored config.
+	Env map[string]string `toml:"env"`
 }
 
 type Logging struct {
