@@ -1,25 +1,19 @@
 # zpinit
 
 A single static Go binary that runs as PID 1 in your Docker container.
-The same binary covers three distinct use cases, replacing the three
-tools most images stitch together to do that job:
+The same binary covers all three use cases:
 
-1. [**Single Process Mode**](#single-process-mode): replaces **tini**.
-2. [**Setup, then Run Mode**](#setup-then-run-mode): replaces **`docker-entrypoint.sh`**.
-3. [**Manage Services Mode**](#manage-services-mode): replaces **supervisord**.
-
-One binary. One mental model. ~3 MB on disk, no Python, no shell wrappers.
+1. [**Single Process Mode**](#single-process-mode) (replaces **tini**)
+2. [**Setup, then Run Mode**](#setup-then-run-mode) (replaces **`docker-entrypoint.sh`**)
+3. [**Manage Services Mode**](#manage-services-mode) (replaces **supervisord**)
 
 ![zpinit: run containers the way you want. Three Docker use cases, one binary.](docs/modes.png)
 
-## Single Process Mode
+## 1. Single Process Mode
 
 **When to use it.** Your image runs one well-behaved workload (a Go
-server, a Node app, a long-running CLI) and you don't need any setup
-work before it starts. Use this mode when you want every image in your
-fleet to ship the same supervisor binary, even the trivial
-single-process ones, so an image can grow into mode 2 or 3 later
-without changing its `ENTRYPOINT`.
+server, a long-running CLI) and you don't need any setup
+work before it starts.
 
 **What zpinit does.** Validates config, then `syscall.Exec`s your CMD.
 The CMD takes over as PID 1; zpinit is gone after the exec. (If your
@@ -27,107 +21,86 @@ workload doesn't reap its own children and you need that, use [Manage
 Services Mode](#manage-services-mode) with one entry instead. Then
 zpinit stays as PID 1 and reaps for you.)
 
-**Getting the binary.** Easiest path is multi-stage `COPY --from` out
-of our published image: one Dockerfile line, no curl, no checksums,
-layer cache plays nicely. Pin to a tag in production (`zpinit:v1.2.3`),
-not `:latest`. `zpctl` is only needed for mode 3, so omit it here.
+**Why zpinit here?** You want to inject Environment Variables into the CMD 
+instead of the whole Container. Via `[env]` in `zpinit.toml` these variables 
+will not been seen by `docker exec` but are available for the CMD itself.
 
+Example Dockerfile:
 ```dockerfile
-FROM debian:stable-slim
-
-RUN apt-get update && apt-get install -y my-app && rm -rf /var/lib/apt/lists/*
+FROM alpine:latest
 
 COPY --from=ghcr.io/0ploy/zpinit:latest /usr/local/bin/zpinit /usr/local/bin/
+COPY zpinit.toml /etc/zpinit/zpinit.toml
+COPY my-app /usr/local/bin/
 
 ENTRYPOINT ["zpinit"]
 CMD ["my-app", "--port", "8080"]
 ```
-
-**Fleet-wide env defaults.** A `[env]` block in `zpinit.toml` reaches
-the wrapped CMD via the exec path, but NOT `docker exec` (which uses
-the container's stored config). Container env (`docker run -e`)
-overrides the toml. Full precedence chain in
-[docs/configuration.md](docs/configuration.md).
-
+Example `[env]` section in `/etc/zpinit/zpinit.toml`:
 ```toml
-# /etc/zpinit/zpinit.toml
 [env]
-APP_ENV   = "production"
+API_KEY   = "xxxxxxxxxxxxx"
 LOG_LEVEL = "info"
 ```
+See [docs/configuration.md](docs/configuration.md) and [docs/security.md](docs/security.md) for details about this.
 
-## Setup, then Run Mode
+## 2. Setup, then Run Mode
 
 **When to use it.** You need preparation work before the workload
 starts: render config from env, apply migrations, fix permissions, warm
 a cache. Today this lives in a `docker-entrypoint.sh` that ends with
-`exec "$@"`. zpinit replaces that script with a directory of small
-executables.
+`exec "$@"`. zpinit replaces that script.
 
-**What zpinit does.** Runs every executable in `/etc/zpinit/entrypoint.d/`
+**What zpinit does.** Runs every executable (or script) in `/etc/zpinit/entrypoint.d/`
 in lexicographic order, drains any zombies they leave behind, then
 `syscall.Exec`s your CMD. A non-zero exit from a script aborts the
 container (or continues, with `entrypoint_on_failure = "continue"`).
 
-**Bonus: same image, three behaviors.** Because the CMD comes from
-`docker run`, the same image is your daemon, your debug shell, and your
-one-off task runner. The `entrypoint.d/` setup runs in all three:
+**Why zpinit here?** A hand-rolled docker-entrypoint.sh reinvents the same plumbing in every image: `set -e`,
+signal traps, `exec "$@"`, ad-hoc timeouts etc. zpinit replaces that file with a
+directory of small executables in any language. Each script gets a per-step timeout (a stuck `composer
+install` hits its own deadline instead of hanging container boot), zombies left behind by sub-shells are
+drained between steps, and `entrypoint_on_failure = "continue"` marks a step non-critical without
+re-implementing skip logic per script. The `[env]` injection from mode 1 still applies, plus scripts can
+write to `/run/zpinit/env` to hand variables forward to the next script or the CMD.
 
-```sh
-docker run myimage                            # production: setup, then my-app
-docker run -it myimage bash                   # debug: setup, then a shell
-docker run --rm myimage php bin/console fix   # one-off task with the same setup
-```
-
-No separate "debug" image, no flags to flip modes. (Use
-`zpinit --skip-entrypoint bash` if you want a shell without any
-side-effecting setup.)
-
+Example Dockerfile:
 ```dockerfile
-FROM debian:stable-slim
+FROM node:20-alpine
 
-RUN apt-get update && apt-get install -y my-app && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 
 COPY --from=ghcr.io/0ploy/zpinit:latest /usr/local/bin/zpinit /usr/local/bin/
 COPY entrypoint.d/ /etc/zpinit/entrypoint.d/
 
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+COPY dist/    ./dist/
+COPY drizzle/ ./drizzle/
+
 ENTRYPOINT ["zpinit"]
-CMD ["my-app"]
+CMD ["node", "./dist/server.js"]
 ```
 
-**Fleet-wide env defaults.** A `[env]` block in `zpinit.toml` is visible
-to every entrypoint.d script and to the wrapped CMD, but NOT to
-`docker exec` (the env travels via the exec path, not the container's
-stored config). Container env (`docker run -e`) overrides; scripts
-writing to `/run/zpinit/env` override further. Full precedence chain in
-[docs/configuration.md](docs/configuration.md).
-
-```toml
-# zpinit.toml
-[env]
-APP_ENV   = "production"
-LOG_LEVEL = "info"
-```
-
-A setup script is just an executable. Any language with a shebang works:
-
-```sh
+Example `entrypoint.d/10-drizzle-migrate.sh`:
+```bash
 #!/bin/sh
-# entrypoint.d/10-migrate.sh
-set -e
-my-app db migrate
-chown -R app:app /var/lib/my-app
-```
+set -eu
 
-Files have to be executable. Non-executable files are skipped at
+: "${DATABASE_URL:?DATABASE_URL must be set}"
+
+echo "applying drizzle migrations..."
+node ./dist/migrate.js
+echo "migrations done."
+```
+A setup script is just an executable. Any language with a shebang works. Files have to be executable. Non-executable files are skipped at
 runtime and surfaced as a warning by `--check-config`. Files starting
 with `.` or ending in `.disabled` are ignored.
 
-## Manage Services Mode
+## 3. Manage Services Mode
 
-**When to use it.** Your image runs multiple processes that have to
-come up in order: redis before the app, php-fpm before nginx, a worker
-alongside php-fpm. Today this is supervisord plus tini in front.
+**When to use it.** Your image runs multiple processes. Today this is supervisord plus tini in front.
 
 **What zpinit does.** Reads `/etc/zpinit/services/*.toml`, starts each
 service in filename order, and uses readiness probes to gate the next
@@ -135,81 +108,62 @@ service's start. zpinit stays around as PID 1: it reaps, restarts on
 crash with backoff, applies config reloads, and handles graceful
 shutdown.
 
-The Dockerfile has **no `CMD`**. CMD wins over services, so adding one
-puts you back in wrap mode and `services/` is ignored.
+**Why zpinit here?** supervisord drags 80 MB of Python into every image and isn't real PID 1; it still
+wants tini in front to reap orphans. zpinit is one ~3 MB Go binary that does both jobs, with the same
+TOML schema you saw in modes 1 and 2 — one mental model across every image in the fleet. Boot ordering
+is declarative (filename order + readiness probes gate the next service's start), no priority plus
+pre-start sleeps to fake it.
 
+Example Dokcerfile:
 ```dockerfile
-FROM debian:stable-slim
+FROM ubuntu:24.04
 
-RUN apt-get update && apt-get install -y nginx redis-server php-fpm \
- && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      nginx \
+      php8.4-fpm \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/0ploy/zpinit:latest /usr/local/bin/zpinit /usr/local/bin/
 COPY --from=ghcr.io/0ploy/zpinit:latest /usr/local/bin/zpctl  /usr/local/bin/
 
-COPY entrypoint.d/ /etc/zpinit/entrypoint.d/
-COPY services/     /etc/zpinit/services/
+COPY services/ /etc/zpinit/services/
 
+EXPOSE 80
 ENTRYPOINT ["zpinit"]
 # No CMD: supervise mode.
 ```
+The Dockerfile has **no `CMD`**. CMD wins over services, so adding one
+puts you back in wrap mode and `services/` is ignored.
 
-**Service files.** Filename order is boot order. Numeric prefixes
-(`10_`, `30-`) are stripped from the resolved name (`10_redis.toml`
-becomes `redis`). The optional `[ready]` block blocks the next
-service's start until the probe exits 0.
-
+Exmaple `services/10_php-fpm.toml`:
 ```toml
-# services/10_redis.toml
-command = ["redis-server", "--daemonize", "no"]
+command = ["/usr/sbin/php-fpm8.3", "-F"]
 restart = "always"
 
 [ready]
-command  = ["redis-cli", "ping"]
-interval = "500ms"
-timeout  = "30s"
-```
+command  = ["sh", "-c", "test -S /run/php/php8.3-fpm.sock"]
+interval = "200ms"
+timeout  = "10s"
 
+[log]
+stdout = "/var/log/zpinit/php-fpm.out.log"
+stderr = "/var/log/zpinit/php-fpm.err.log"
+```
+`[ready]` is an optional probe block on a service. zpinit runs the command on a loop every `interval` for a maximm time of `timeout` after starting the
+service and treats the service as "ready" the first time it exits 0. The next service in filename order
+doesn't start until then. If `[ready]` is omitted, the service is ready the instant it spawns (no gating).
+
+`[log]` redirects the service's stdout/stderr fds at spawn time. `inherit` (the default, used by nginx
+above) hands them to the container's own stdout/stderr - what your docker/k8s log collector wants. A
+path opens the file with `O_APPEND|O_NOFOLLOW` and the service writes directly, no pipe in zpinit's data
+path. File-logged services are inspectable live with `zpctl tail php-fpm`.
+
+Example `services/20_nginx.toml`
 ```toml
-# services/20_php-fpm.toml
-command = ["php-fpm", "-F"]
+command = ["/usr/sbin/nginx", "-g", "daemon off;"]
 restart = "always"
-
-[ready]
-command = ["sh", "-c", "test -S /run/php/php-fpm.sock"]
 ```
-
-```toml
-# services/30_nginx.toml
-command = ["nginx", "-g", "daemon off;"]
-restart = "always"
-```
-
-Boot order: redis starts, `redis-cli ping` is polled until it exits 0,
-then php-fpm starts, the socket check passes, then nginx starts. Full
-schema (env, cwd, user/group, log destinations, backoff, stop signals)
-in [docs/configuration.md](docs/configuration.md).
-
-**Foreground worker pattern.** Some services exist only to support the
-*real* job. The Symfony case: php-fpm has to run, but the actual job is
-a `messenger:consume` worker that should end the container when it
-exits (so Kubernetes / Nomad / your scheduler can take over). Express
-the worker as a service with `restart = "never"` plus `exit_code_from`:
-
-```toml
-# zpinit.toml
-exit_code_from = "worker"
-```
-
-```toml
-# services/99_worker.toml
-name    = "worker"
-command = ["php", "bin/console", "messenger:consume"]
-restart = "never"
-```
-
-When `worker` exits, zpinit gracefully stops every other service (in
-reverse filename order) and exits with the worker's exit code.
 
 **Reload without restart.** `SIGHUP` (or `zpctl update`) re-reads
 `/etc/zpinit/`, diffs against the running set, and applies:
@@ -254,6 +208,7 @@ zpctl help
 - [docs/why.md](docs/why.md): why we built this, design decisions, philosophy, non-goals.
 - [docs/configuration.md](docs/configuration.md): full config schema (env, cwd, user/group, logs, backoff, stop signals, defaults).
 - [docs/architecture.md](docs/architecture.md): packages, state machine, internals.
+- [docs/security.md](docs/security.md): security considerations.
 - [docs/development.md](docs/development.md): build, test, contribute.
 
 ## License

@@ -67,6 +67,68 @@ these, push back and reconfirm before coding.
 - If a design decision is ambiguous, ask before coding. The architecture is
   the result of multi-round discussion; re-litigating without surfacing
   burns time and risks shipping a different product than intended.
+- GitHub Actions in both workflows are pinned to commit SHAs, never
+  floating tags, so a compromised upstream can't inject code into the
+  release pipeline (which has GHCR push rights). When upgrading an
+  action, dereference the new tag with
+  `gh api repos/<owner>/<repo>/git/refs/tags/<tag> --jq '.object.sha'`
+  and put the human-readable version in the trailing comment.
+
+## Changelog (CHANGELOG.md)
+
+The release workflow extracts the latest `## vX.Y.Z` section verbatim
+into the GitHub release body. Treat CHANGELOG.md as user-facing release
+notes, not a commit log.
+
+**When to update.** Every commit that ships user-visible behavior
+appends to the *unreleased* top section under the appropriate H3
+(`### Features`, `### Bug Fixes`, `### Security`, `### Tests` for
+test-only changes worth advertising). Internal refactors, doc fixes,
+and CI tweaks usually don't appear; they live in `git log`. If
+unsure, ask whether the user would care.
+
+**How to write entries.** Lead with **bold headline**, then a short
+prose paragraph that includes *what changed* and *why it matters to
+the user* (or *what was broken*, for fixes). Match the voice in
+existing entries: no marketing language, no "this commit", no
+mention of phase numbers or internal package paths unless they're
+load-bearing for users. Reference external behavior, not
+implementation. Example shape:
+
+```markdown
+- **`zpctl reread` no longer hangs on huge configs.** The diff
+  walker held `o.mu` across file reads; with 200+ services on a
+  cold cache, control-socket calls timed out. The walk now
+  snapshots paths first, then reads outside the lock.
+```
+
+**Version heading rules.** New `## vX.Y.Z` sections go at the very
+top. The release workflow's awk script extracts everything between
+the first `## ` (skipped) and the second `## `, so anything above
+the top heading leaks into the release body.
+
+**Cutting a release** (procedure when the user asks for one):
+
+1. Confirm a clean working tree and that CI is green on `main`.
+2. In CHANGELOG.md, rename the unreleased section to `## vX.Y.Z`.
+   Choose the bump (patch/minor/major) based on the entries: any
+   breaking change → major; any new feature → minor; otherwise
+   patch. Pre-1.0 we may still bump minor for breaking changes;
+   confirm with the user if ambiguous.
+3. Commit with message `release: vX.Y.Z` (or fold into the final
+   feature commit if the user prefers).
+4. Tag: `git tag vX.Y.Z && git push origin main vX.Y.Z`. Don't push
+   the tag without confirming first; the tag push triggers a
+   public release.
+5. After the tag pushes, the `Release` workflow builds binaries,
+   pushes the multiarch image to `ghcr.io/0ploy/zpinit`, and
+   creates the GitHub release with the latest CHANGELOG section.
+   Watch for failures: a failed release leaves the tag in place
+   but the artifacts missing.
+
+Don't tag without going through CHANGELOG.md first. The release
+body comes from there; an empty or stale top section produces a
+release page with nothing useful in it.
 
 ## Gotchas
 - `ZPINIT_ENV_FILE` is an internal/test override for the env-file path.

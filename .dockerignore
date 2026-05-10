@@ -1,0 +1,13 @@
+.git
+.github
+bin/
+test/
+docs/
+*.md
+LICENSE
+internal/
+cmd/
+go.mod
+go.sum
+Makefile
+FEATURE_IDEAS.md
