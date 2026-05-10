@@ -79,6 +79,11 @@ jobs:
 
       - name: Build release body
         run: |
+          # Image tags follow the semver convention (no `v` prefix:
+          # `0.1.0`, not `v0.1.0`). Strip the leading `v` from the git
+          # tag for image references; keep the raw tag for git refs.
+          IMAGE_TAG="${GITHUB_REF_NAME#v}"
+
           cat > release-body.md << 'HEADER'
           ## Use in your Dockerfile
 
@@ -86,12 +91,12 @@ jobs:
           COPY --from=ghcr.io/0ploy/zpinit:latest /usr/local/bin/zpinit /usr/local/bin/zpctl /usr/local/bin/
           ```
 
-          Pin to this exact release with `ghcr.io/0ploy/zpinit:VERSION_TAG` (the tag at the top of this page).
+          Pin to this exact release with `ghcr.io/0ploy/zpinit:IMAGE_TAG_PLACEHOLDER`.
 
           ## Try it standalone
 
           ```bash
-          docker run --rm -it ghcr.io/0ploy/zpinit:VERSION_TAG sh
+          docker run --rm -it ghcr.io/0ploy/zpinit:IMAGE_TAG_PLACEHOLDER sh
           # then: zpinit --version, zpinit --check-config /etc/zpinit, zpctl help
           ```
 
@@ -101,8 +106,7 @@ jobs:
 
           HEADER
 
-          # Inject the actual tag into the placeholder above.
-          sed -i "s/VERSION_TAG/${GITHUB_REF_NAME}/g" release-body.md
+          sed -i "s/IMAGE_TAG_PLACEHOLDER/${IMAGE_TAG}/g" release-body.md
 
           # Append the latest CHANGELOG section (skips the version heading
           # itself; that already appears as the GitHub release title).
