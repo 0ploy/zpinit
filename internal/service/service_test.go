@@ -232,6 +232,38 @@ func TestSpawn_RelativeLogPathRejected(t *testing.T) {
 	}
 }
 
+// openLogTarget mkdir-p's the parent of the log path before opening it,
+// so users don't have to ship a per-image entrypoint.d/00-mklogdir.sh.
+// The test points the log at a path several levels deep that doesn't
+// exist yet and verifies Spawn succeeds and the file ends up populated.
+func TestSpawn_LogParentDirCreated(t *testing.T) {
+	r, log := setup(t)
+
+	deep := filepath.Join(t.TempDir(), "var", "log", "zpinit", "writer.out.log")
+	cfg := config.Service{
+		Name:    "test",
+		Command: []string{"/bin/sh", "-c", "echo line-from-deep-dir"},
+		Log:     config.Logging{Stdout: deep, Stderr: "inherit"},
+	}
+
+	p, err := Spawn(cfg, os.Environ(), r, log)
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	select {
+	case <-p.Exit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout")
+	}
+	body, err := os.ReadFile(deep)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if string(body) != "line-from-deep-dir\n" {
+		t.Errorf("log content = %q", string(body))
+	}
+}
+
 func TestResolveCredentials_NoUser(t *testing.T) {
 	cred, err := resolveCredentials("", "")
 	if err != nil {

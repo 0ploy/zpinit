@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -47,13 +49,23 @@ func main() {
 		os.Exit(runCheckConfig(checkConfig))
 	}
 
+	// Track whether --config was passed explicitly so missing-dir
+	// handling can distinguish "operator gave a wrong path" (hard
+	// error) from "default path doesn't exist, just wrap the CMD".
+	configExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "config" {
+			configExplicit = true
+		}
+	})
+
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	if pid := os.Getpid(); pid != 1 {
 		log.Warn("zpinit is not running as PID 1; orphan reaping is unreliable outside containers", "pid", pid)
 	}
 
-	os.Exit(run(log, configDir, flag.Args(), skipEntrypoint))
+	os.Exit(run(log, configDir, configExplicit, flag.Args(), skipEntrypoint))
 }
 
 func runCheckConfig(dir string) int {
@@ -69,11 +81,22 @@ func runCheckConfig(dir string) int {
 	return 0
 }
 
-func run(log *slog.Logger, configDir string, cmdline []string, skipEntrypoint bool) int {
+func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []string, skipEntrypoint bool) int {
 	cfg, err := config.Load(configDir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+		// Lenient case: no --config flag was passed and the default
+		// dir simply doesn't exist. Fall back to an empty config with
+		// defaults applied; mode dispatch will then either wrap the
+		// CMD (mode 1) or fail with the existing "nothing to do"
+		// message if no CMD was supplied either. An explicit
+		// --config to a missing path is still a hard error.
+		if errors.Is(err, fs.ErrNotExist) && !configExplicit {
+			log.Info("no config dir; running with built-in defaults", "dir", configDir)
+			cfg = config.NewEmpty(configDir)
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
 	}
 	for _, w := range cfg.Warnings {
 		log.Warn("config", "warning", w)

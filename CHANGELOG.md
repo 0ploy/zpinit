@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+- **`zpinit` no longer requires `/etc/zpinit/` to exist for wrap mode.** When `--config` was not passed explicitly and the default config dir is missing, zpinit now logs `no config dir; running with built-in defaults` and execs the supplied CMD with sensible defaults applied. An explicit `--config` to a missing path is still a hard error (operator typo or mount mistake). Surfaced during smoke testing of v0.1.0: standalone `docker run --rm ghcr.io/0ploy/zpinit:0.1.0 zpinit echo hi` failed because the image's default config dir is empty. Now works.
+
+- **`zpctl help` (and `--help` / `-h`) prints local usage without dialing the daemon.** Previously the source comment claimed a local short-circuit but the code dialed unconditionally, so `zpctl help` in a debug shell or pre-zpinit state would fail with `connect: no such file or directory`. Now the three help variants answer locally and exit 0; everything else still talks to the daemon. Also dropped the now-stale "Run zpctl help against a running zpinit" line from local usage.
+
+- **Auto-create the parent directory of `[log].stdout` / `[log].stderr` paths at spawn time.** Previously, a service config like `stdout = "/var/log/zpinit/foo.out"` would fail to spawn with `open ...: no such file or directory` unless the operator shipped a per-image `entrypoint.d/00-mklogdir.sh`. zpinit now `MkdirAll`s the parent (mode 0755) before opening the file. Contained: zpinit only mkdirs paths the operator explicitly named in `[log]`. The `O_NOFOLLOW` symlink-leaf check on the file open is unaffected, so the existing security guarantee against planted symlinks at the log leaf is preserved.
+
 ## v0.1.0
 
 Initial release.

@@ -1,6 +1,8 @@
 package config
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -387,5 +389,45 @@ func TestLoad_GlobalsEnvInvalidKey(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "env key") {
 		t.Errorf("error should mention env key: %v", err)
+	}
+}
+
+// Load returns an error wrapping fs.ErrNotExist when the dir is
+// missing. Callers (notably cmd/zpinit/main.go) detect this with
+// errors.Is to permit wrap-mode-with-no-config; this test pins the
+// contract so a future refactor can't silently break that path.
+func TestLoad_MissingDirIsErrNotExist(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "definitely-not-here")
+	_, err := Load(missing)
+	if err == nil {
+		t.Fatal("expected error for missing config dir")
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("error should wrap fs.ErrNotExist, got: %v", err)
+	}
+}
+
+// NewEmpty produces a Config that supervise mode would refuse (zero
+// services) but wrap mode runs fine on. Defaults must be populated
+// because runEntrypoint and the orchestrator both read them.
+func TestNewEmpty_AppliesDefaults(t *testing.T) {
+	cfg := NewEmpty("/etc/zpinit")
+	if cfg == nil {
+		t.Fatal("NewEmpty returned nil")
+	}
+	if cfg.Dir != "/etc/zpinit" {
+		t.Errorf("Dir = %q, want /etc/zpinit", cfg.Dir)
+	}
+	if len(cfg.Services) != 0 {
+		t.Errorf("Services should be empty, got %d", len(cfg.Services))
+	}
+	if cfg.Globals.EntrypointOnFailure == "" {
+		t.Error("EntrypointOnFailure default not applied")
+	}
+	if cfg.Globals.DefaultStopSignal == "" {
+		t.Error("DefaultStopSignal default not applied")
+	}
+	if cfg.Globals.BootTimeout == 0 {
+		t.Error("BootTimeout default not applied")
 	}
 }

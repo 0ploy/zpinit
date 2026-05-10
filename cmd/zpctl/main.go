@@ -34,8 +34,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Local short-circuit: `zpctl help` should work even with no daemon.
-	// Forwarding to the daemon would fail with a connection error.
+	// Local short-circuit: `zpctl help` (and -h / --help) prints local
+	// usage without dialing the socket, so it works in containers where
+	// zpinit isn't running yet (e.g. interactive debug shells, image
+	// inspection). The daemon-side help endpoint mirrors this list, so
+	// nothing is lost by answering locally.
+	switch args[0] {
+	case "help", "-h", "--help":
+		usage()
+		return
+	}
+
 	conn, err := net.DialTimeout("unix", socket, 5*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "zpctl: connect %s: %v\n", socket, err)
@@ -70,8 +79,7 @@ func main() {
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage: zpctl [--socket PATH] COMMAND [ARGS...]
 
-Commands match supervisorctl naming where possible. Run "zpctl help"
-against a running zpinit for the full list.
+Commands match supervisorctl naming where possible.
 
 Common commands:
   status [NAME...]      list service states

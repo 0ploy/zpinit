@@ -30,6 +30,10 @@ var (
 // validates everything, and returns a fully-populated Config. On validation
 // failure it returns an error that wraps every problem found, so several
 // mistakes can be fixed in one cycle instead of one per run.
+//
+// If dir doesn't exist the returned error wraps fs.ErrNotExist, so callers
+// that want to permit a missing default config dir (wrap-mode-with-no-config)
+// can detect it via errors.Is and fall back to NewEmpty.
 func Load(dir string) (*Config, error) {
 	cfg := &Config{Dir: dir}
 
@@ -58,6 +62,19 @@ func Load(dir string) (*Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// NewEmpty returns a Config with global defaults applied and no
+// services or entrypoint scripts. Used when the config dir is missing
+// at the default path: zpinit can still wrap a CMD with sensible
+// defaults rather than refusing to start, mirroring tini's behavior of
+// "give me a CMD and I'll just exec it." Operators who pass --config
+// explicitly still get a hard error if the path is missing, since that
+// is unambiguously a typo or mount mistake.
+func NewEmpty(dir string) *Config {
+	cfg := &Config{Dir: dir}
+	applyGlobalDefaults(&cfg.Globals)
+	return cfg
 }
 
 func loadGlobals(path string, g *Globals) error {

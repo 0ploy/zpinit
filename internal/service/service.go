@@ -187,6 +187,13 @@ func isNumeric(s string) bool {
 // followed normally; only the leaf is protected, matching standard
 // log-writer hardening.
 //
+// The parent directory of the log path is created with MkdirAll
+// (mode 0o755) before the open. zpinit only ever mkdirs paths the
+// operator explicitly named in [log], and the symlink-leaf check
+// happens unchanged on the OpenFile call below, so the security
+// guarantee is preserved. This removes the per-image
+// `entrypoint.d/00-mklogdir.sh` boilerplate.
+//
 // Returns (file, target). The caller passes target to cmd.Stdout/Stderr
 // and must Close file (if non-nil) after Start; the kernel duplicates
 // fds for the child so the parent's copy is no longer needed.
@@ -196,6 +203,9 @@ func openLogTarget(spec string, inheritFrom *os.File) (*os.File, *os.File, error
 	}
 	if !filepath.IsAbs(spec) {
 		return nil, nil, fmt.Errorf("log path must be absolute: %s", spec)
+	}
+	if err := os.MkdirAll(filepath.Dir(spec), 0o755); err != nil {
+		return nil, nil, fmt.Errorf("create log dir: %w", err)
 	}
 	f, err := os.OpenFile(spec, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW, 0o644)
 	if err != nil {

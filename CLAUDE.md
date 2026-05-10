@@ -203,7 +203,11 @@ release page with nothing useful in it.
   Standard log-writer hardening: an operator typo or hostile config
   can't cause zpinit to append a child's stdout into `/etc/shadow` via
   a planted symlink. Symlinked parent directories still resolve; only
-  the leaf is gated.
+  the leaf is gated. The parent directory is auto-created with
+  `MkdirAll` (mode 0755) just before the open, so operators don't need
+  a per-image `entrypoint.d/00-mklogdir.sh`. Only paths the operator
+  explicitly named in `[log]` are ever mkdir'd; the `O_NOFOLLOW` leaf
+  check is unaffected.
 
 - Wire-protocol responses (`ctlproto.WriteResponse`) sanitize `Msg`
   and every body line via `sanitizeLine`: CR/LF become spaces and a
