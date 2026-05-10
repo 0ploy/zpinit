@@ -1035,6 +1035,99 @@ Open questions:
 - Combinable with the foreground-worker `exit_code_from`? Probably
   the foreground-worker rule wins; document the precedence.
 
+## 30. File log forwarding: surface file-only logs as stdout/stderr
+
+Some legacy or third-party software can only write logs to a file, not
+stdout/stderr (Java apps with log4j-XML pinned to a path, PHP with
+`error_log = /var/log/php/errors.log`, MySQL slow-query log, plenty of
+others). Today the workaround is bespoke per image: a
+`tail -F file >&2` background script in `entrypoint.d/`, or a symlink
+from the log path to `/dev/stdout`. Bake this into the service TOML so
+the workaround disappears:
+
+```toml
+# services/20_legacy-app.toml
+command = ["/usr/local/bin/legacy-app"]
+restart = "always"
+
+[[log_forward]]
+path   = "/var/log/legacy/app.log"
+target = "stdout"
+
+[[log_forward]]
+path   = "/var/log/legacy/error.log"
+target = "stderr"
+prefix = "[error] "      # optional, applied per line
+```
+
+`target` accepts `stdout`, `stderr`, or a path (reusing the existing
+`[log]` destination machinery with `O_APPEND|O_NOFOLLOW`).
+
+Two implementation strategies, both worth considering:
+
+**Strategy A: tail-and-forward (file-watch).** zpinit opens the file
+for read, seeks to end, watches via inotify (with polling fallback) and
+forwards new bytes to the target. Works with any writer behaviour:
+truncate-on-start, log rotation by the app, exclusive opens, `O_APPEND`
+writers. The writer never blocks on a slow zpinit because there's no
+pipe between them. The writer writes to the kernel; zpinit reads from
+the kernel. So the load-bearing "no pipes" rule is preserved. The file
+still lives on disk (or tmpfs) and grows; rotation stays the operator's
+job.
+
+**Strategy B: pre-create the file as a symlink to `/dev/stdout` /
+`/dev/stderr`.** The classic Docker idiom
+(`ln -sf /dev/stdout /var/log/nginx/access.log`) baked into zpinit
+instead of into a Dockerfile RUN line. Almost zero runtime cost, no
+data path through zpinit, works for any app that respects the symlink.
+Fails for some app behaviours:
+
+- Apps that truncate the file on startup break (you can't truncate
+  `/dev/stdout`).
+- Apps that unlink-and-recreate (logrotate-style) break the symlink.
+- Apps that use `O_CREAT|O_EXCL` reject an existing symlink.
+- Apps that `lseek` on the fd: character devices don't support seeking.
+
+The two strategies could coexist as `mode = "symlink"` (well-behaved
+apps) vs. `mode = "tail"` (everything else). Default `tail` since it
+always works; operators opt in to `symlink` when they know the app is
+compatible.
+
+Why bake either of these into zpinit:
+
+- Replaces a per-image `entrypoint.d/`-and-shell-script pattern that's
+  currently bespoke per shop, frequently unreaped, and silently breaks
+  on log rotation.
+- For base images we don't fully control (where adding a wrapper script
+  means rebuilding upstream), this is the only sane path to "this app's
+  logs go to docker logs."
+- Lets us drop the per-shop `tail -F` background processes that today
+  clutter the supervisor's child-process list.
+
+Open questions:
+
+- Inotify on tmpfs / overlayfs / weird container filesystems is known
+  to be flaky across runtimes. Polling fallback with a configurable
+  interval covers it.
+- Rotation behaviour: follow rename to a new inode (matches `tail -F`)
+  or stay on the original fd (`tail -f`)? Default `tail -F` semantics.
+- Initial-content policy: replay existing file content on service
+  start, or only forward bytes appended after start? Default: only
+  new.
+- Multi-line records (Java stack traces, multi-line PHP warnings):
+  forward line-by-line, or buffer atomic blocks via a configurable
+  line-prefix regex? v1: line-by-line; structured forwarding deferred.
+- Interaction with `[log] stdout = "..."` (the service's own fd 1/2
+  file destination): independent. `[[log_forward]]` watches files the
+  app writes itself; `[log]` redirects fd 1/2 at spawn.
+- Disk pressure: an unrotated forwarded file grows without bound.
+  Document that operators arrange rotation or a tmpfs cap; zpinit
+  doesn't truncate (the "no log rotation" non-goal still applies).
+- Mode 2 applicability: the same need shows up in `entrypoint.d/`
+  scripts that drive a file-logging tool. Could generalise
+  `[[log_forward]]` to be container-scope (in `zpinit.toml`) rather
+  than service-scope, applied across modes.
+
 ## Mid-tier mode-3 ideas (no dedicated section)
 
 - **Service groups** (`group = "web"`) plus `zpctl restart --group web`.
