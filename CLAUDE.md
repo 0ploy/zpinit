@@ -67,6 +67,12 @@ these, push back and reconfirm before coding.
 - If a design decision is ambiguous, ask before coding. The architecture is
   the result of multi-round discussion; re-litigating without surfacing
   burns time and risks shipping a different product than intended.
+- Don't commit or push on your own. When a change builds, tests green, and
+  looks ready, summarize what's staged and ask whether the user wants to
+  test it further first or whether it can be committed. They often try
+  things in their own environment (docker, real workloads) before a
+  commit lands. Pushing without that check skips that step. Same rule
+  for tags: never tag or push a tag without an explicit go-ahead.
 - GitHub Actions in both workflows are pinned to commit SHAs, never
   floating tags, so a compromised upstream can't inject code into the
   release pipeline (which has GHCR push rights). When upgrading an
