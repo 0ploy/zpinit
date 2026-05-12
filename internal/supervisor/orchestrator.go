@@ -274,61 +274,98 @@ func (o *Orchestrator) installExitCodeWatcher() {
 	}()
 }
 
-// stopAll tears services down in reverse start order, fully draining
-// each one before signalling the next. Sequential teardown matters
-// because filename order encodes dependency order during boot — e.g.
-// php-fpm boots after redis, so on shutdown php-fpm must finish
-// flushing through redis before redis itself receives SIGTERM.
-// Parallel waits would signal everything in the same instant and lose
-// that property. Per-runner SIGKILL escalation
-// (handleStopKillTimeout) keeps any one stuck service from holding up
-// the others past stop_timeout + reapGrace. ShutdownBudget at signal
-// time reports the conservative serial total so the outer
-// runSupervise wait covers stopAll exactly.
+// stopAll tears services down in reverse filename order, fully
+// draining each filename group before signaling the next. Filename
+// order encodes dependency order during boot (e.g. php-fpm at 20_*
+// boots after redis at 10_*), so reverse-serial teardown between
+// groups lets dependents drain through their dependencies before the
+// dependency receives SIGTERM. WITHIN a group (all replicas of the
+// same filename), replicas are signaled and awaited in parallel:
+// they are by definition the same logical service and have no flush
+// ordering between each other, so making them sequential would
+// multiply shutdown time by N for no semantic gain. Per-runner
+// SIGKILL escalation (handleStopKillTimeout) bounds any stuck
+// replica. ShutdownBudget reports a per-group conservative total so
+// the outer runSupervise wait covers stopAll exactly.
 func (o *Orchestrator) stopAll() {
 	o.mu.RLock()
 	snap := append([]*Runner(nil), o.runners...)
 	o.mu.RUnlock()
 
-	for i := len(snap) - 1; i >= 0; i-- {
-		r := snap[i]
+	// snap is sorted by (filename, replicaIndex). Walk it in reverse,
+	// peeling off groups of consecutive same-filename entries and
+	// stopping each group in parallel.
+	for i := len(snap); i > 0; {
+		fn := snap[i-1].Cfg().Filename
+		j := i
+		for j > 0 && snap[j-1].Cfg().Filename == fn {
+			j--
+		}
+		o.stopRunnerGroup(context.Background(), snap[j:i])
+		i = j
+	}
+}
+
+// stopRunnerGroup signals and awaits every runner in a single
+// filename group in parallel. All replicas of a filename share the
+// same stop_timeout (they share the spec), so a single timeout
+// covers the group; per-runner SIGKILL escalation bounds any stuck
+// replica. Skips runners already in a terminal state.
+func (o *Orchestrator) stopRunnerGroup(ctx context.Context, group []*Runner) {
+	if len(group) == 0 {
+		return
+	}
+	timeout := group[0].Cfg().StopTimeout.Std() + reapGrace
+	gctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, r := range group {
 		switch r.State() {
 		case StateStopped, StateFatal, StatePending:
 			continue
 		}
-		cfg := r.Cfg()
-		name := r.DisplayName()
-		o.log.Info("stop: signaling", "service", name)
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.StopTimeout.Std()+reapGrace)
-		if err := r.StopCtx(ctx); err != nil {
-			o.log.Warn("stop signal could not be delivered", "service", name, "err", err)
-			cancel()
-			continue
-		}
-		if _, err := r.WaitTerminal(ctx); err != nil {
-			// Even SIGKILL didn't bring it down within the grace —
-			// process is likely stuck in uninterruptible kernel
-			// sleep. Move on to the next service rather than
-			// blocking the rest of the teardown forever.
-			o.log.Error("service did not terminate even after SIGKILL escalation",
-				"service", name, "state", r.State(), "err", err)
-		}
-		cancel()
+		wg.Add(1)
+		go func(r *Runner) {
+			defer wg.Done()
+			name := r.DisplayName()
+			o.log.Info("stop: signaling", "service", name)
+			if err := r.StopCtx(gctx); err != nil {
+				o.log.Warn("stop signal could not be delivered", "service", name, "err", err)
+				return
+			}
+			if _, err := r.WaitTerminal(gctx); err != nil {
+				o.log.Error("service did not terminate even after SIGKILL escalation",
+					"service", name, "state", r.State(), "err", err)
+			}
+		}(r)
 	}
+	wg.Wait()
 }
 
 // ShutdownBudget reports the conservative wall-clock budget that
 // stopAll needs against the *current* runner set. runSupervise calls
 // this at signal time so reload-induced changes (added services,
-// bumped stop_timeouts) are honored — the previous boot-time snapshot
+// bumped stop_timeouts) are honored: the previous boot-time snapshot
 // could expire mid-teardown and cause the runtime to hard-kill PID 1
 // before the configured grace window finished.
+//
+// Budget is per-filename-group rather than per-runner, matching
+// stopAll's parallel-within-group / serial-between-groups schedule.
+// With replicas = N a service contributes one (stop_timeout +
+// reapGrace) to the total, not N: the kernel sees N parallel signals
+// and they finish concurrently.
 func (o *Orchestrator) ShutdownBudget() time.Duration {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	total := shutdownHeadroom
+	var currentFilename string
 	for _, r := range o.runners {
-		total += r.Cfg().StopTimeout.Std() + reapGrace
+		cfg := r.Cfg()
+		if cfg.Filename != currentFilename {
+			currentFilename = cfg.Filename
+			total += cfg.StopTimeout.Std() + reapGrace
+		}
 	}
 	return total
 }
@@ -386,26 +423,38 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) error 
 	o.log.Info("reload", "add", len(diff.add), "remove", len(diff.remove), "restart", len(diff.restart))
 
 	var errs []error
-	for _, r := range diff.remove {
-		if err := o.removeService(ctx, r); err != nil {
-			o.log.Error("reload: remove failed; runner kept registered", "service", r.Cfg().Name, "err", err)
-			errs = append(errs, err)
+	// diff.remove is built in filename-sorted order and packs every
+	// replica of a filename consecutively (see computeDiffLocked).
+	// Walk it as filename groups so all replicas of one logical
+	// service are removed in parallel within their stop_timeout
+	// rather than serially.
+	for i := 0; i < len(diff.remove); {
+		fn := diff.remove[i].Cfg().Filename
+		j := i
+		for j < len(diff.remove) && diff.remove[j].Cfg().Filename == fn {
+			j++
 		}
+		for _, err := range o.removeServiceGroup(ctx, diff.remove[i:j]) {
+			if err != nil {
+				o.log.Error("reload: remove failed; runner kept registered", "err", err)
+				errs = append(errs, err)
+			}
+		}
+		i = j
 	}
 
-	// Pair restart-new specs with successful removals. For replicated
-	// services every old replica must stop before any new replica is
-	// expanded; a partial stop would double-register the same filename
-	// and break the diff invariant. If any old replica fails to stop,
-	// keep the rest registered (removeService leaves a failed runner
-	// in place on purpose) and skip the new spec for this reload —
-	// next reload's diff retries.
+	// Pair restart-new specs with successful removals. p.old already
+	// holds every replica of the filename being restarted, so the
+	// group form fits directly. If any old replica fails to stop the
+	// new spec is skipped for this reload (removeServiceGroup leaves
+	// failed runners registered so the next reload's diff retries).
 	var addSpecs []config.Service
 	for _, p := range diff.restart {
 		failed := false
-		for _, oldR := range p.old {
-			if err := o.removeService(ctx, oldR); err != nil {
-				o.log.Error("reload: restart-stop failed; new spec skipped", "service", oldR.Cfg().Name, "err", err)
+		for i, err := range o.removeServiceGroup(ctx, p.old) {
+			if err != nil {
+				o.log.Error("reload: restart-stop failed; new spec skipped",
+					"service", p.old[i].DisplayName(), "err", err)
 				errs = append(errs, err)
 				failed = true
 			}
@@ -683,50 +732,77 @@ func servicesEqual(a, b config.Service) bool {
 	return reflect.DeepEqual(a, b)
 }
 
-// removeService stops a runner gracefully and, on success, deregisters
-// it from o.runners. On stop failure (StopCtx couldn't be delivered, or
-// WaitTerminal expired even after SIGKILL escalation) the runner stays
-// registered so its Run goroutine continues tracking the still-live
-// process via SIGCHLD; the next reload diff will see it and retry.
-// This is load-bearing: dropping a runner whose process is still up
-// would leak an unmanaged child under PID 1 with no zpctl handle.
-func (o *Orchestrator) removeService(ctx context.Context, r *Runner) error {
-	cfg := r.Cfg()
-	name := r.DisplayName()
-	o.log.Info("reload: removing", "service", name)
-
-	// Stop with a bounded ctx so we don't get stuck if the runner is
-	// already wedged. The grace beyond StopTimeout matches stopAll.
-	wctx, cancel := context.WithTimeout(ctx, cfg.StopTimeout.Std()+reapGrace)
-	defer cancel()
-	if err := r.StopCtx(wctx); err != nil {
-		return fmt.Errorf("%s: stop send: %w", name, err)
+// removeServiceGroup stops every runner in a filename group in
+// parallel and, for each one that successfully terminated,
+// deregisters it from o.runners under a single critical section.
+// On stop failure (StopCtx couldn't be delivered, or WaitTerminal
+// expired even after SIGKILL escalation) the affected runner stays
+// registered so its Run goroutine keeps tracking the still-live
+// child; the next reload diff will see it and retry. Dropping a
+// runner whose process is still up would leak an unmanaged child
+// under PID 1 with no zpctl handle.
+//
+// Returns a per-runner error slice (nil on success). Callers
+// iterate this to log/collect failures.
+//
+// Parallelism within a group matters at scale: with replicas = 64
+// and the default 10s stop_timeout, sequential removal would burn
+// ~16 minutes per service group on stuck children. All replicas of
+// one filename share the same spec (hence the same stop_timeout),
+// and they have no inter-replica flush dependency, so signaling and
+// awaiting them concurrently is correct.
+func (o *Orchestrator) removeServiceGroup(ctx context.Context, group []*Runner) []error {
+	if len(group) == 0 {
+		return nil
 	}
-	if _, err := r.WaitTerminal(wctx); err != nil {
-		return fmt.Errorf("%s did not terminate within stop_timeout (state=%s): %w", name, r.State(), err)
+	timeout := group[0].Cfg().StopTimeout.Std() + reapGrace
+	errs := make([]error, len(group))
+
+	var wg sync.WaitGroup
+	for i, r := range group {
+		wg.Add(1)
+		go func(i int, r *Runner) {
+			defer wg.Done()
+			name := r.DisplayName()
+			o.log.Info("reload: removing", "service", name)
+			wctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			if err := r.StopCtx(wctx); err != nil {
+				errs[i] = fmt.Errorf("%s: stop send: %w", name, err)
+				return
+			}
+			if _, err := r.WaitTerminal(wctx); err != nil {
+				errs[i] = fmt.Errorf("%s did not terminate within stop_timeout (state=%s): %w", name, r.State(), err)
+				return
+			}
+			// Cancel the runner's Run goroutine so it exits and the
+			// Runner becomes garbage-collectible. Only safe now that
+			// the child is gone.
+			r.cancelRun()
+		}(i, r)
 	}
+	wg.Wait()
 
-	// Cancel the runner's Run goroutine so it exits and the Runner
-	// becomes garbage-collectible. Without this, every removed service
-	// leaks one goroutine until orchestrator shutdown. Only safe now
-	// that we've confirmed the child is gone.
-	r.cancelRun()
-
+	// Deregister successes under one critical section.
 	// copy+nil+truncate, not append-splice: the latter leaves the
 	// removed *Runner alive in the now-unreachable last slot of the
-	// backing array, leaking it until the slice grows past cap. Under
-	// reload churn that's a slow but unbounded leak.
+	// backing array, leaking it until the slice grows past cap.
 	o.mu.Lock()
-	for i, x := range o.runners {
-		if x == r {
-			copy(o.runners[i:], o.runners[i+1:])
-			o.runners[len(o.runners)-1] = nil
-			o.runners = o.runners[:len(o.runners)-1]
-			break
+	for idx, r := range group {
+		if errs[idx] != nil {
+			continue
+		}
+		for i, x := range o.runners {
+			if x == r {
+				copy(o.runners[i:], o.runners[i+1:])
+				o.runners[len(o.runners)-1] = nil
+				o.runners = o.runners[:len(o.runners)-1]
+				break
+			}
 		}
 	}
 	o.mu.Unlock()
-	return nil
+	return errs
 }
 
 func (o *Orchestrator) findRunner(name string) *Runner {

@@ -65,18 +65,31 @@ can be added, removed, or retargeted.
 
 ## Shutdown
 
-`SIGTERM` or `SIGINT` to PID 1 triggers `stopAll`: services are
-signaled and waited one at a time, in reverse filename order.
-Filename order encodes dependency order during boot, so reverse-serial
-teardown lets dependents drain through their dependencies before the
-dependency itself receives `SIGTERM`. Per-service `SIGKILL` escalation
-bounds any one stuck service.
+`SIGTERM` or `SIGINT` to PID 1 triggers `stopAll`. Services are
+teardown'd by filename group, in reverse filename order. Between
+groups the teardown is sequential: filename order encodes dependency
+order during boot, so reverse-serial between groups lets dependents
+drain through their dependencies before the dependency itself
+receives `SIGTERM`. WITHIN a group (all replicas of one filename),
+replicas are signaled and awaited in parallel: they are the same
+logical service and have no inter-replica flush ordering, so
+serializing them would multiply teardown time by N for no semantic
+gain. Per-runner `SIGKILL` escalation (handleStopKillTimeout) bounds
+any stuck replica.
 
 The outer wait budget is recomputed at signal time (it can't be
 snapshotted at boot, because reload can change service count and
-`stop_timeout` after launch). The supervisor outer wait must always
-cover stopAll's serial inner wait, otherwise the runtime hard-kills
-PID 1 mid-graceful-shutdown.
+`stop_timeout` after launch). The budget counts one `(stop_timeout +
+reapGrace)` per filename group, not per runner, matching stopAll's
+parallel-within-group schedule. The supervisor outer wait must always
+cover stopAll's inner wait, otherwise the runtime hard-kills PID 1
+mid-graceful-shutdown.
+
+The same parallel-within-group / serial-between-groups schedule
+applies to `Reload`'s remove and restart-stop paths via
+`removeServiceGroup`. Without that, `replicas = 64` with the default
+10s stop_timeout would burn ~16 minutes per logical service on stuck
+children during a reload.
 
 ## Reaping
 

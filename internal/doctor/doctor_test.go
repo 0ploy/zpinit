@@ -166,6 +166,55 @@ stdout = "`+logBase+`-{index}.log"
 	}
 }
 
+// TestRun_NodeRuntimeAbsolutePath: when a service uses an absolute
+// node binary path, doctor must probe THAT binary, not whatever
+// `node` resolves to on PATH. Otherwise a config that runs an old
+// `/opt/node-v20/bin/node` could be certified by the doctor as
+// "supports reusePort" because a newer node on PATH does — exactly
+// the EADDRINUSE failure the doctor is supposed to catch.
+func TestRun_NodeRuntimeAbsolutePath(t *testing.T) {
+	binDir := t.TempDir()
+	// Synthetic node binary that reports v20.5.0 (below 22.12.0 floor).
+	// Named "node" so doctor recognizes it; lives in its own tempdir
+	// so it never collides with whatever node is on the test host's PATH.
+	fakePath := filepath.Join(binDir, "node")
+	write(t, fakePath,
+		"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'v20.5.0'; exit 0; fi\nsleep 30\n",
+		0o755)
+
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_api.toml"),
+		`command = ["`+fakePath+`", "/app/server.js"]
+replicas = 4
+`, 0o644)
+	write(t, filepath.Join(dir, "zpinit.toml"),
+		`control_socket = "`+filepath.Join(t.TempDir(), "nope.sock")+`"`+"\n", 0o644)
+
+	checks := Run(dir)
+	// Find any runtime check that mentions our fake binary's path.
+	var nodeCheck *Check
+	for i, c := range checks {
+		if c.Category == "runtimes" && strings.Contains(c.Detail, "20.5.0") {
+			nodeCheck = &checks[i]
+			break
+		}
+	}
+	if nodeCheck == nil {
+		t.Fatalf("expected a node runtime check probing the absolute path; got %v", checks)
+	}
+	if nodeCheck.Status != StatusWarn {
+		t.Errorf("expected WARN for node 20.5.0 + replicas > 1; got %s (%s)", nodeCheck.Status, nodeCheck.Detail)
+	}
+	if !strings.Contains(nodeCheck.Detail, "EADDRINUSE") {
+		t.Errorf("expected mention of EADDRINUSE in WARN; got %q", nodeCheck.Detail)
+	}
+	// The check label should reference the configured (absolute) path,
+	// not just "node" — so the operator can tell which binary was probed.
+	if !strings.Contains(nodeCheck.Name, fakePath) {
+		t.Errorf("expected check name to reference configured path %q; got %q", fakePath, nodeCheck.Name)
+	}
+}
+
 func findLogPathsCheck(t *testing.T, checks []Check, svc string) *Check {
 	t.Helper()
 	for i, c := range checks {

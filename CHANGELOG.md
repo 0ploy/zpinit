@@ -23,13 +23,40 @@
 - **`zpinit --doctor` pre-flight environment audit.** New flag runs
   a read-only superset of `--check-config`: confirms the config dir
   layout, parses and validates every service, checks each
-  `command[0]` resolves on PATH (or via absolute path), warns when a
-  declared node service has `replicas > 1` and the node binary on
-  PATH is below 22.12.0 (the reusePort floor), surfaces Bun/Deno
+  `command[0]` resolves on PATH (or as an absolute path), warns when
+  a declared node service has `replicas > 1` and the configured node
+  binary is below 22.12.0 (the reusePort floor), surfaces Bun/Deno
   versions when those runtimes are referenced, and reports whether a
-  zpinit instance is already attached to the control socket. Exit
-  code 0 on green (warnings allowed), 1 on any FAIL, 2 on WARN-only;
+  zpinit instance is already attached to the control socket. Doctor
+  probes the configured node binary, not whatever resolves on PATH,
+  so a config that points at `/opt/node-v20/bin/node` is checked
+  against THAT binary even if PATH has a newer one. Exit code 0 on
+  green (warnings allowed), 1 on any FAIL, 2 on WARN-only;
   `--doctor-quiet` suppresses OK rows.
+
+### Security
+
+- **`ZPINIT_REPLICA_INDEX` is reserved.** Setting this key in
+  globals `[env]` or per-service `[env]` is now a config-load error.
+  The supervisor injects per-replica values at spawn time; allowing
+  user-supplied overrides via the env-merge chain would let one
+  service shadow every replica's identity with a single static
+  value, breaking sharding, log attribution, and any logic keyed on
+  the index.
+
+### Bug Fixes
+
+- **Replica shutdown no longer scales linearly with replica count.**
+  Previously `stopAll` and the reload remove/restart paths walked
+  every runner serially, waiting up to `stop_timeout + reapGrace`
+  per replica. With `replicas = 64` and the default 10s timeout, a
+  single stuck service could burn ~16 minutes of shutdown budget.
+  Teardown now groups by filename: between groups stays
+  sequential (preserves filename-encoded dependency order), within
+  a group all replicas are signaled and awaited in parallel. The
+  budget calculation matches the new schedule, so `ShutdownBudget`
+  reports one `(stop_timeout + reapGrace)` per logical service
+  rather than per process.
 
 ## v0.1.2
 

@@ -169,6 +169,13 @@ func nameFromFilename(filename string) string {
 // zpinit targets. Promote to a config knob only if anyone asks.
 const MaxReplicas = 64
 
+// reservedReplicaIndexKey is owned by the supervisor: it gets injected
+// into each replica's env in `expandServiceToRunners` and must not be
+// overridden by globals or per-service `[env]`. Validation rejects it
+// in either place so operators don't silently shadow the supervisor's
+// per-replica value via the env-merge precedence chain.
+const reservedReplicaIndexKey = "ZPINIT_REPLICA_INDEX"
+
 func applyServiceDefaults(s *Service, g *Globals) {
 	if s.Replicas == 0 {
 		s.Replicas = 1
@@ -259,6 +266,9 @@ func validate(cfg *Config) error {
 		if !envKeyPattern.MatchString(k) {
 			errs = append(errs, fmt.Sprintf("env key %q must match %s", k, envKeyPattern))
 		}
+		if k == reservedReplicaIndexKey {
+			errs = append(errs, fmt.Sprintf("env key %q is reserved (set per-replica by the supervisor)", k))
+		}
 	}
 
 	nameToFile := map[string]string{}
@@ -288,6 +298,14 @@ func validate(cfg *Config) error {
 		}
 		if s.Replicas > MaxReplicas {
 			errs = append(errs, fmt.Sprintf("%s: replicas must be <= %d (got %d)", s.Filename, MaxReplicas, s.Replicas))
+		}
+		for k := range s.Env {
+			if !envKeyPattern.MatchString(k) {
+				errs = append(errs, fmt.Sprintf("%s: env key %q must match %s", s.Filename, k, envKeyPattern))
+			}
+			if k == reservedReplicaIndexKey {
+				errs = append(errs, fmt.Sprintf("%s: env key %q is reserved (set per-replica by the supervisor)", s.Filename, k))
+			}
 		}
 		if s.Ready != nil {
 			if len(s.Ready.Command) == 0 {

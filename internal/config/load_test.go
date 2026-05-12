@@ -449,6 +449,38 @@ replicas = 1000
 	}
 }
 
+func TestLoad_ReservedReplicaIndexInServiceEnv(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `
+command = ["x"]
+[env]
+ZPINIT_REPLICA_INDEX = "0"
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for reserved env key in service [env]")
+	}
+	if !strings.Contains(err.Error(), "reserved") || !strings.Contains(err.Error(), "ZPINIT_REPLICA_INDEX") {
+		t.Errorf("error should mention reserved + ZPINIT_REPLICA_INDEX: %v", err)
+	}
+}
+
+func TestLoad_ReservedReplicaIndexInGlobalsEnv(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "zpinit.toml"), `
+[env]
+ZPINIT_REPLICA_INDEX = "0"
+`)
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `command = ["x"]`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for reserved env key in globals [env]")
+	}
+	if !strings.Contains(err.Error(), "reserved") || !strings.Contains(err.Error(), "ZPINIT_REPLICA_INDEX") {
+		t.Errorf("error should mention reserved + ZPINIT_REPLICA_INDEX: %v", err)
+	}
+}
+
 func TestLoad_ExitCodeFromReplicatedConflict(t *testing.T) {
 	dir := t.TempDir()
 	write(t, filepath.Join(dir, "zpinit.toml"), `exit_code_from = "worker"`)

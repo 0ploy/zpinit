@@ -223,19 +223,24 @@ release page with nothing useful in it.
   `runCancel` is only called on successful removal so the Run loop
   stays alive while the child is still alive.
 
-- `stopAll` signals **and** waits one service at a time, in reverse
-  filename order. Filename order encodes dependency order during boot,
-  so reverse-serial teardown ensures dependents fully drain through
-  their dependencies before the dependency itself receives SIGTERM.
-  The previous "signal reverse, wait parallel" version was faster but
-  could break flush-on-shutdown semantics. Per-service SIGKILL
-  escalation bounds any one stuck service.
+- `stopAll` schedules teardown per filename group, in reverse filename
+  order BETWEEN groups (filename encodes dependency order so dependents
+  drain through their dependencies before the dependency gets SIGTERM)
+  and in parallel WITHIN a group (all replicas of one filename are the
+  same logical service with no inter-replica flush ordering, so serial
+  per-replica teardown would multiply shutdown time by N). The shared
+  helper `stopRunnerGroup` is reused by `removeServiceGroup` so the
+  reload path gets the same parallel-within-group benefit. Per-runner
+  SIGKILL escalation bounds any stuck replica.
 
 - Shutdown wait budget is recomputed at signal time via
-  `Orchestrator.ShutdownBudget()`, not snapshotted at boot. Reload can
-  add services or bump `stop_timeout` after launch, and the supervisor
-  outer wait must always cover stopAll's serial inner wait, otherwise
-  the runtime hard-kills PID 1 mid-graceful-shutdown.
+  `Orchestrator.ShutdownBudget()`, not snapshotted at boot. It counts
+  one `(stop_timeout + reapGrace)` per filename group rather than per
+  runner, matching stopAll's parallel-within-group schedule. With
+  `replicas = N` a service contributes one unit, not N. Reload can
+  add services or bump `stop_timeout` after launch; the supervisor
+  outer wait must always cover stopAll's inner wait, otherwise the
+  runtime hard-kills PID 1 mid-graceful-shutdown.
 
 - Service log files (`log.stdout`/`log.stderr`) and `cmdTail`'s reads
   open with `O_NOFOLLOW`; a symlink at the leaf of the configured path

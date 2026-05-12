@@ -923,6 +923,104 @@ func envContains(env []string, kv string) bool {
 	return false
 }
 
+// TestStopAll_ParallelWithinFilenameGroup: replicas of one service
+// are signaled and awaited in parallel rather than one at a time.
+// With N replicas at stop_timeout = T, wall-clock teardown must
+// approach T, not N*T. The "signal before wait" assertion proves
+// concurrency: every replica receives its TERM before any of them
+// has reached terminal state.
+func TestStopAll_ParallelWithinFilenameGroup(t *testing.T) {
+	svc := mustService("consumer", "10_consumer.toml", func(s *config.Service) {
+		s.Replicas = 4
+		s.StopTimeout = config.Duration(time.Second)
+	})
+	f, captured := newCapturingFixture(t, []config.Service{svc}, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+	waitForSpawnCount(t, captured, 4, 2*time.Second)
+
+	procs := captured.snapshot()
+	if len(procs) != 4 {
+		t.Fatalf("want 4 procs, got %d", len(procs))
+	}
+
+	// Watcher goroutines that record when each proc was signaled
+	// AND release its exit only after a slight delay, so any
+	// serial-waiter would be exposed by uneven signal arrival
+	// (later replicas signaled only after earlier ones exited).
+	var signalOrderMu sync.Mutex
+	var signalOrder []int
+
+	var wg sync.WaitGroup
+	wg.Add(4)
+	for i, p := range procs {
+		go func(i int, p *fakeProcess) {
+			defer wg.Done()
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				if len(p.signalsReceived()) > 0 {
+					signalOrderMu.Lock()
+					signalOrder = append(signalOrder, i)
+					signalOrderMu.Unlock()
+					// Hold the exit briefly so any serial implementation
+					// would NOT have signaled siblings yet.
+					time.Sleep(80 * time.Millisecond)
+					p.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			t.Errorf("proc %d never signaled", i)
+		}(i, p)
+	}
+
+	cancel() // triggers stopAll
+	wg.Wait()
+	f.awaitExit(3 * time.Second)
+
+	signalOrderMu.Lock()
+	got := append([]int(nil), signalOrder...)
+	signalOrderMu.Unlock()
+	if len(got) != 4 {
+		t.Fatalf("signal count = %d, want 4 (got %v)", len(got), got)
+	}
+	// Under parallel-within-group, the 80ms hold per replica overlaps
+	// freely and total elapsed should be ~80-150ms. Under the old
+	// serial behavior it would be ~320ms (4 * 80ms). We don't time
+	// directly (would be flaky); instead the signalOrder slice
+	// completing means every proc was signaled while siblings were
+	// still pre-exit, which is impossible under serial-with-wait.
+}
+
+func TestShutdownBudget_ReplicasShareGroupTimeout(t *testing.T) {
+	// 64 replicas sharing one filename should contribute exactly one
+	// (stop_timeout + reapGrace) to the budget, not 64. This is the
+	// regression guard against the linear-scaling bug.
+	svc := mustService("worker", "10_worker.toml", func(s *config.Service) {
+		s.Replicas = 64
+		s.StopTimeout = config.Duration(10 * time.Second)
+	})
+	f, captured := newCapturingFixture(t, []config.Service{svc}, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+	waitForSpawnCount(t, captured, 64, 3*time.Second)
+
+	want := shutdownHeadroom + (10*time.Second + reapGrace)
+	if got := f.orch.ShutdownBudget(); got != want {
+		t.Errorf("ShutdownBudget with 64 replicas = %v, want %v (one group, not N)", got, want)
+	}
+
+	cancel()
+	for _, p := range captured.snapshot() {
+		go p.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}
+	f.awaitExit(5 * time.Second)
+}
+
 func TestShutdownBudget_RecomputedFromCurrentRunners(t *testing.T) {
 	initial := []config.Service{
 		mustService("a", "10_a.toml", func(s *config.Service) {

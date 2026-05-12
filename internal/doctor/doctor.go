@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -204,85 +205,156 @@ func replicaLogPreview(spec string, idx, total int) string {
 
 func checkRuntimes(cfg *config.Config) []Check {
 	var out []Check
-	// Aggregate per-runtime: which services reference node, bun, deno?
-	// We do this on cfg.Services rather than walking PATH because the
-	// only runtimes we need to inspect are those the services declare.
-	usesNode, usesBun, usesDeno := false, false, false
-	nodeReplicas := 0
+
+	// Group services by resolved runtime binary path so configs that mix
+	// `/opt/node-v20/bin/node` with `node` (PATH) get one check per
+	// actual binary, not one check against whatever node happens to be
+	// first on PATH. The previous PATH-only lookup could certify the
+	// wrong binary as supporting reusePort.
+	type nodeUsage struct {
+		configured      string // exactly what cfg.Command[0] said (for log clarity)
+		resolved        string // absolute path or "" if unresolvable
+		replicaServices int    // count of services with replicas > 1 using this binary
+	}
+	nodeUsages := map[string]*nodeUsage{} // key = resolved (or configured if unresolved)
+	bunPaths := map[string]string{}       // resolved path => configured
+	denoPaths := map[string]string{}
+
 	for _, s := range cfg.Services {
-		base := filepath.Base(commandBin(s.Command))
+		if len(s.Command) == 0 {
+			continue
+		}
+		cmd := s.Command[0]
+		base := filepath.Base(cmd)
 		switch base {
 		case "node", "nodejs":
-			usesNode = true
+			resolved := resolveCommandPath(cmd, []string{"node", "nodejs"})
+			key := resolved
+			if key == "" {
+				key = cmd
+			}
+			u, ok := nodeUsages[key]
+			if !ok {
+				u = &nodeUsage{configured: cmd, resolved: resolved}
+				nodeUsages[key] = u
+			}
 			if s.Replicas > 1 {
-				nodeReplicas++
+				u.replicaServices++
 			}
 		case "bun":
-			usesBun = true
+			resolved := resolveCommandPath(cmd, []string{"bun"})
+			key := resolved
+			if key == "" {
+				key = cmd
+			}
+			if _, ok := bunPaths[key]; !ok {
+				bunPaths[key] = cmd
+			}
 		case "deno":
-			usesDeno = true
+			resolved := resolveCommandPath(cmd, []string{"deno"})
+			key := resolved
+			if key == "" {
+				key = cmd
+			}
+			if _, ok := denoPaths[key]; !ok {
+				denoPaths[key] = cmd
+			}
 		}
 	}
 
-	if usesNode {
-		out = append(out, nodeRuntimeCheck(nodeReplicas))
+	// Deterministic ordering for stable output.
+	for _, key := range sortedKeys(nodeUsages) {
+		u := nodeUsages[key]
+		out = append(out, nodeRuntimeCheckPath(u.configured, u.resolved, u.replicaServices))
 	}
-	if usesBun {
-		out = append(out, runtimeVersionCheck("bun", []string{"--version"}))
+	for _, key := range sortedKeysString(bunPaths) {
+		out = append(out, runtimeVersionCheckPath("bun", bunPaths[key], key))
 	}
-	if usesDeno {
-		out = append(out, runtimeVersionCheck("deno", []string{"--version"}))
+	for _, key := range sortedKeysString(denoPaths) {
+		out = append(out, runtimeVersionCheckPath("deno", denoPaths[key], key))
 	}
 	return out
 }
 
-func commandBin(cmd []string) string {
-	if len(cmd) == 0 {
-		return ""
+// resolveCommandPath turns a configured cmd into an absolute binary
+// path. Absolute inputs are returned verbatim; relative inputs are
+// resolved against PATH, trying alt names (e.g. "nodejs") as a
+// fallback. Returns "" when nothing resolves so the caller can render
+// a FAIL with the configured name.
+func resolveCommandPath(cmd string, altNames []string) string {
+	if filepath.IsAbs(cmd) {
+		return cmd
 	}
-	return cmd[0]
-}
-
-func nodeRuntimeCheck(nodeReplicas int) Check {
-	path, err := exec.LookPath("node")
-	if err != nil {
-		path, err = exec.LookPath("nodejs")
-		if err != nil {
-			return Check{"runtimes", "node", StatusFail, "node binary not found on PATH"}
+	if path, err := exec.LookPath(cmd); err == nil {
+		return path
+	}
+	for _, alt := range altNames {
+		if alt == cmd {
+			continue
+		}
+		if path, err := exec.LookPath(alt); err == nil {
+			return path
 		}
 	}
-	out, err := exec.Command(path, "--version").CombinedOutput()
+	return ""
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedKeysString(m map[string]string) []string { return sortedKeys(m) }
+
+// nodeRuntimeCheckPath probes a specific node binary (preferring its
+// configured path if it's absolute). Reports the version and whether
+// it supports reusePort. The replicaServices count drives whether a
+// below-floor version is OK-with-caveat (no replicated services) or
+// WARN (replicated services would silently EADDRINUSE).
+func nodeRuntimeCheckPath(configured, resolved string, replicaServices int) Check {
+	label := "node (" + configured + ")"
+	if resolved == "" {
+		return Check{"runtimes", label, StatusFail, fmt.Sprintf("%s not found", configured)}
+	}
+	out, err := exec.Command(resolved, "--version").CombinedOutput()
 	if err != nil {
-		return Check{"runtimes", "node", StatusWarn, fmt.Sprintf("`%s --version` failed: %v", path, err)}
+		return Check{"runtimes", label, StatusWarn, fmt.Sprintf("`%s --version` failed: %v", resolved, err)}
 	}
 	maj, min, patch, perr := parseNodeVersion(string(out))
 	if perr != nil {
-		return Check{"runtimes", "node", StatusWarn, fmt.Sprintf("could not parse version %q: %v", strings.TrimSpace(string(out)), perr)}
+		return Check{"runtimes", label, StatusWarn, fmt.Sprintf("could not parse version %q: %v", strings.TrimSpace(string(out)), perr)}
+	}
+	binNote := resolved
+	if configured != resolved {
+		binNote = configured + " -> " + resolved
 	}
 	if versionAtLeast(maj, min, patch, NodeMinMajor, NodeMinMinor, NodeMinPatch) {
-		return Check{"runtimes", "node", StatusOK,
-			fmt.Sprintf("%d.%d.%d supports reusePort (>= %d.%d.%d)", maj, min, patch, NodeMinMajor, NodeMinMinor, NodeMinPatch)}
+		return Check{"runtimes", label, StatusOK,
+			fmt.Sprintf("%s: %d.%d.%d supports reusePort (>= %d.%d.%d)", binNote, maj, min, patch, NodeMinMajor, NodeMinMinor, NodeMinPatch)}
 	}
-	// Below the floor: warn only if any node service has replicas > 1.
-	if nodeReplicas == 0 {
-		return Check{"runtimes", "node", StatusOK,
-			fmt.Sprintf("%d.%d.%d detected; clustering would require >= %d.%d.%d (no replicated node services)", maj, min, patch, NodeMinMajor, NodeMinMinor, NodeMinPatch)}
+	if replicaServices == 0 {
+		return Check{"runtimes", label, StatusOK,
+			fmt.Sprintf("%s: %d.%d.%d detected; clustering would require >= %d.%d.%d (no replicated services use this binary)", binNote, maj, min, patch, NodeMinMajor, NodeMinMinor, NodeMinPatch)}
 	}
-	return Check{"runtimes", "node", StatusWarn,
-		fmt.Sprintf("%d.%d.%d detected; %d node service(s) have replicas > 1, but reusePort needs node >= %d.%d.%d; port-binding replicas will collide on EADDRINUSE",
-			maj, min, patch, nodeReplicas, NodeMinMajor, NodeMinMinor, NodeMinPatch)}
+	return Check{"runtimes", label, StatusWarn,
+		fmt.Sprintf("%s: %d.%d.%d detected; %d service(s) using this binary have replicas > 1, but reusePort needs node >= %d.%d.%d; port-binding replicas will collide on EADDRINUSE",
+			binNote, maj, min, patch, replicaServices, NodeMinMajor, NodeMinMinor, NodeMinPatch)}
 }
 
-func runtimeVersionCheck(bin string, args []string) Check {
-	path, err := exec.LookPath(bin)
-	if err != nil {
-		return Check{"runtimes", bin, StatusFail, bin + " binary not found on PATH"}
+func runtimeVersionCheckPath(name, configured, resolved string) Check {
+	label := name + " (" + configured + ")"
+	if resolved == "" {
+		return Check{"runtimes", label, StatusFail, fmt.Sprintf("%s not found", configured)}
 	}
-	out, err := exec.Command(path, args...).CombinedOutput()
+	out, err := exec.Command(resolved, "--version").CombinedOutput()
 	if err != nil {
-		return Check{"runtimes", bin, StatusWarn, fmt.Sprintf("`%s %s` failed: %v", path, strings.Join(args, " "), err)}
+		return Check{"runtimes", label, StatusWarn, fmt.Sprintf("`%s --version` failed: %v", resolved, err)}
 	}
-	return Check{"runtimes", bin, StatusOK, fmt.Sprintf("%s: %s", path, strings.TrimSpace(string(out)))}
+	return Check{"runtimes", label, StatusOK, fmt.Sprintf("%s: %s", resolved, strings.TrimSpace(string(out)))}
 }
 
 var nodeVersionRe = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)`)
