@@ -89,6 +89,14 @@ type Orchestrator struct {
 	// retargeted exit_code_from doesn't fire shutdown for a stale
 	// target. Mutated only under mu.
 	watcherCancel context.CancelFunc
+	// watcherGen identifies the current watcher installation. Each
+	// installExitCodeWatcher invocation bumps it; spawned goroutines
+	// capture the value at spawn time and re-check it under mu before
+	// firing shutdown. Without this, the old watcher could observe
+	// its target reach terminal state between WaitTerminal returning
+	// and watcherCancel being called by a retarget, and would then
+	// fire shutdown for a service the new config no longer cares about.
+	watcherGen uint64
 }
 
 // SetBaseEnvBuilder installs a function that Reload uses to recompute
@@ -156,6 +164,10 @@ func (o *Orchestrator) Run(ctx context.Context) int {
 	o.runnerCtx = runnerCtx
 	o.wg = &wg
 	o.earlyShutdownCh = make(chan struct{})
+	// Reset the once so a re-Run on the same Orchestrator (only tests
+	// today) can still fire early-shutdown. Pairing the reset with the
+	// fresh earlyShutdownCh keeps the two consistent.
+	o.shutdownOnce = sync.Once{}
 	runnersSnap := append([]*Runner(nil), o.runners...)
 	o.mu.Unlock()
 
@@ -258,6 +270,8 @@ func (o *Orchestrator) installExitCodeWatcher() {
 	}
 	wctx, wcancel := context.WithCancel(o.runnerCtx)
 	o.watcherCancel = wcancel
+	o.watcherGen++
+	gen := o.watcherGen
 	earlyCh := o.earlyShutdownCh
 	once := &o.shutdownOnce
 	o.mu.Unlock()
@@ -267,6 +281,20 @@ func (o *Orchestrator) installExitCodeWatcher() {
 		if err != nil {
 			// Watcher canceled (reload retarget or orchestrator shutdown);
 			// don't fire early-shutdown.
+			return
+		}
+		// Re-check under the lock that we're still the current
+		// installation. A reload that retargets exit_code_from cancels
+		// our wctx, but cancel does not synchronize with our progress:
+		// if the old target reached terminal state at the same instant,
+		// WaitTerminal can return nil here even though Reload has since
+		// installed a new watcher for a different service. Firing
+		// shutdown in that window would terminate the supervisor for
+		// the wrong reason.
+		o.mu.RLock()
+		stillCurrent := o.watcherGen == gen
+		o.mu.RUnlock()
+		if !stillCurrent {
 			return
 		}
 		o.log.Info("exit_code_from terminal", "service", name, "state", state)
@@ -371,11 +399,20 @@ func (o *Orchestrator) ShutdownBudget() time.Duration {
 }
 
 func (o *Orchestrator) spawnRunnerGoroutine(r *Runner) {
-	runCtx, cancel := context.WithCancel(o.runnerCtx)
+	// Snapshot the runner-lifetime ctx and waitgroup under the lock so
+	// reloads racing with Run's setup observe a published value rather
+	// than a torn read. Run is the sole writer and writes both fields
+	// under o.mu.Lock; the matching read here gives the Go race
+	// detector a clean happens-before edge.
+	o.mu.RLock()
+	parent := o.runnerCtx
+	wg := o.wg
+	o.mu.RUnlock()
+	runCtx, cancel := context.WithCancel(parent)
 	r.setRunCancel(cancel)
-	o.wg.Add(1)
+	wg.Add(1)
 	go func() {
-		defer o.wg.Done()
+		defer wg.Done()
 		r.Run(runCtx)
 	}()
 }
@@ -481,8 +518,11 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) error 
 	}
 
 	// Register runners + commit cfg + baseEnv + sort under one critical
-	// section so external readers see a consistent set. Spawning the
-	// per-runner goroutines happens after the unlock —
+	// section so external readers see a consistent set. Capture
+	// runnerCtx under the same lock so the detached boot goroutine
+	// gets a properly-published value (Run is the sole writer; the
+	// pairing makes the read race-detector-clean and refactor-safe).
+	// Spawning the per-runner goroutines happens after the unlock —
 	// spawnRunnerGoroutine takes no orchestrator locks but does pull
 	// o.runnerCtx via setRunCancel.
 	o.mu.Lock()
@@ -492,6 +532,7 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) error 
 	sortRunners(o.runners)
 	o.cfg = newCfg
 	o.baseEnv = newBaseEnv
+	bootRoot := o.runnerCtx
 	o.mu.Unlock()
 
 	for _, j := range jobs {
@@ -505,7 +546,6 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) error 
 		// control server is also too tight for a multi-service boot).
 		// Tying boots to o.runnerCtx ties their lifetime to the
 		// supervisor itself.
-		bootRoot := o.runnerCtx
 		bootJobs := append([]reloadBootJob(nil), jobs...)
 		globals := newCfg.Globals
 		go o.runReloadBoots(bootRoot, bootJobs, globals)
@@ -805,13 +845,12 @@ func (o *Orchestrator) removeServiceGroup(ctx context.Context, group []*Runner) 
 	return errs
 }
 
-func (o *Orchestrator) findRunner(name string) *Runner {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	return o.findRunnerLocked(name)
-}
-
-// findRunnerLocked: caller must hold o.mu (read or write).
+// findRunnerLocked: caller must hold o.mu (read or write). Match is
+// by cfg.Name only; for replicated services this returns the first
+// replica. Callers that need replica granularity should use
+// snapshotRunners + resolveTarget instead. The only production
+// caller is exitCode, which is guarded at config load against
+// targeting a replicated service.
 func (o *Orchestrator) findRunnerLocked(name string) *Runner {
 	for _, r := range o.runners {
 		if r.Cfg().Name == name {

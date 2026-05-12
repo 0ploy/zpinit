@@ -27,12 +27,22 @@ type Prober func(ctx context.Context, cmd []string, env []string, cwd string) er
 // centralized-reaper rule forbids cmd.Wait() — which is what would
 // otherwise close those pipes. Result: per-probe FD leak until GC.
 // Opening /dev/null once and reusing it sidesteps both the pipe and
-// the FD lifetime problem.
+// the FD lifetime problem. Intentionally never closed; the kernel
+// reclaims on process exit.
 var (
 	probeNullOnce sync.Once
 	probeNull     *os.File
 	probeNullErr  error
 )
+
+// probeReapGiveUp bounds how long the prober waits for SIGCHLD after
+// it has issued SIGKILL on a canceled probe. If the probe child is
+// pinned in uninterruptible kernel sleep (D state), the kernel can't
+// deliver SIGKILL until the syscall completes; without this bound,
+// `<-exitCh` would block indefinitely and wedge the entire boot path.
+// The reaper's `tracked` channel is buffered (cap=1) so a later reap
+// still completes correctly even after we abandon the wait.
+const probeReapGiveUp = 5 * time.Second
 
 func openProbeNull() (*os.File, error) {
 	probeNullOnce.Do(func() {
@@ -89,7 +99,17 @@ func defaultProber(r *reaper.Reaper, log *slog.Logger) Prober {
 			return nil
 		case <-ctx.Done():
 			_ = syscall.Kill(-proc.Pid, syscall.SIGKILL)
-			<-exitCh // wait for reap
+			// Bounded wait: a D-state probe will not deliver SIGCHLD
+			// until its kernel I/O completes, which can be arbitrarily
+			// long. Abandoning the channel is safe because the reaper
+			// map entry's buffered (cap=1) channel absorbs the eventual
+			// send and is then GC'd.
+			select {
+			case <-exitCh:
+			case <-time.After(probeReapGiveUp):
+				log.Warn("probe reap timed out; abandoning child",
+					"pid", proc.Pid, "give_up", probeReapGiveUp)
+			}
 			return ctx.Err()
 		}
 	}

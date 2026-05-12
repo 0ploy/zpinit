@@ -297,7 +297,7 @@ func TestResolveCredentials_UnknownUser(t *testing.T) {
 func TestMergeServiceEnv(t *testing.T) {
 	base := []string{"FOO=base", "PATH=/usr/bin", "KEEP=this"}
 	override := map[string]string{"FOO": "override", "NEW": "value"}
-	got := mergeServiceEnv(base, override)
+	got := MergeEnv(base, override)
 
 	want := map[string]string{
 		"FOO":  "override",

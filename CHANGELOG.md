@@ -46,6 +46,39 @@
 
 ### Bug Fixes
 
+- **Entrypoint scripts and readiness probes no longer hang boot when
+  a child wedges in uninterruptible kernel sleep.** Previously
+  `entrypoint.runOne` and the readiness prober both blocked on the
+  child's reap channel after issuing SIGKILL on timeout or
+  cancellation. A child pinned in `D` state (e.g. wedged NFS, broken
+  FUSE, stuck device I/O) cannot be SIGKILL'd until its kernel
+  syscall completes, so the wait was effectively unbounded and pinned
+  PID 1 with no higher-level deadline to bail it out (the entrypoint
+  phase runs before the centralized reaper, so per-script timeouts
+  could not interrupt the post-kill wait). Both sites now cap the
+  post-kill wait at 5s and log when the bound trips. Memory is
+  unchanged: the reaper's per-PID channel is buffered, so the
+  eventual reap completes correctly even after the wait is
+  abandoned.
+
+- **`exit_code_from` retarget on `SIGHUP` reload no longer risks
+  shutting the supervisor down for the wrong service.** The previous
+  watcher cancel did not synchronize with the old goroutine's
+  progress: if the old target reached terminal state at the same
+  instant a reload retargeted `exit_code_from` to a different
+  service, the old watcher could observe the terminal state and
+  trigger early-shutdown for a service the new config no longer
+  references. Watcher installations now carry a generation counter;
+  the goroutine re-checks under the lock that it is still current
+  before firing shutdown.
+
+- **`zpctl tail` no longer emits a leading partial log line.** The
+  8KB tail window almost always starts mid-line; the first chunk
+  rendered was the tail of a line whose head was beyond the window.
+  When the window starts mid-file, the leading partial fragment is
+  now trimmed at the first newline so operators only see whole
+  lines.
+
 - **Replica shutdown no longer scales linearly with replica count.**
   Previously `stopAll` and the reload remove/restart paths walked
   every runner serially, waiting up to `stop_timeout + reapGrace`

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/0ploy/zpinit/internal/config"
 )
 
 func write(t *testing.T, path, content string, mode os.FileMode) {
@@ -70,15 +72,15 @@ func TestVersionAtLeast(t *testing.T) {
 }
 
 func TestReplicaLogPreview(t *testing.T) {
-	if got := replicaLogPreview("/logs/{index}/x.log", 1, 3); got != "/logs/1/x.log" {
+	if got := config.ReplicaLogPath("/logs/{index}/x.log", 1, 3); got != "/logs/1/x.log" {
 		t.Errorf("got %q", got)
 	}
-	if got := replicaLogPreview("inherit", 0, 3); got != "inherit" {
+	if got := config.ReplicaLogPath("inherit", 0, 3); got != "inherit" {
 		t.Errorf("inherit must be unchanged, got %q", got)
 	}
 	// Without {index}, the preview helper is a no-op; the doctor's
 	// upstream caller renders a "shared file" notice instead.
-	if got := replicaLogPreview("/var/log/x.log", 2, 4); got != "/var/log/x.log" {
+	if got := config.ReplicaLogPath("/var/log/x.log", 2, 4); got != "/var/log/x.log" {
 		t.Errorf("got %q, want path unchanged when no placeholder", got)
 	}
 }

@@ -8,6 +8,12 @@ import (
 	"github.com/0ploy/zpinit/internal/config"
 )
 
+// replicaLogPath delegates to config.ReplicaLogPath so the supervisor
+// and doctor share one expansion rule.
+func replicaLogPath(spec string, idx, total int) string {
+	return config.ReplicaLogPath(spec, idx, total)
+}
+
 // expandServiceToRunners turns a single config.Service spec into N
 // Runners, one per replica. For svc.Replicas <= 1 it returns a single
 // runner whose log paths and env are byte-for-byte what they would
@@ -68,25 +74,3 @@ func composeReplicaEnv(base []string, idx, total int) []string {
 	return out
 }
 
-// replicaLogPath rewrites a configured log path for replica idx.
-//
-//	total <= 1                 -> spec verbatim (no rewriting)
-//	spec == "" or "inherit"    -> spec verbatim
-//	spec contains "{index}"    -> placeholder replaced with idx
-//	otherwise                  -> spec verbatim; all replicas share the file
-//
-// Shared file is the default. Linux O_APPEND is atomic for writes
-// below PIPE_BUF (typically 4096 bytes), so concurrent appends from
-// N replicas don't tear at line boundaries for normal log output.
-// Operators who want per-replica files must opt in with `{index}` in
-// the path: `/var/log/consumer-{index}.log` produces
-// `/var/log/consumer-0.log`, etc.
-func replicaLogPath(spec string, idx, total int) string {
-	if total <= 1 || spec == "" || spec == "inherit" {
-		return spec
-	}
-	if strings.Contains(spec, "{index}") {
-		return strings.ReplaceAll(spec, "{index}", strconv.Itoa(idx))
-	}
-	return spec
-}

@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -232,6 +233,7 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 		return errResp(err.Error())
 	}
 	resp := okResp("ok")
+	resp.Body = make([]string, 0, len(targets))
 	var anyErr error
 	for _, r := range targets {
 		switch action {
@@ -603,6 +605,15 @@ func readLastBytes(path string, n int64) (string, error) {
 	buf := make([]byte, st.Size()-offset)
 	if _, err := io.ReadFull(f, buf); err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return "", err
+	}
+	// When the window starts mid-file, the first chunk is almost
+	// certainly the tail of a longer line whose head is past the
+	// window. Drop it so operators see whole log lines only. When
+	// offset == 0 we have the whole file and trim nothing.
+	if offset > 0 {
+		if i := bytes.IndexByte(buf, '\n'); i >= 0 {
+			buf = buf[i+1:]
+		}
 	}
 	return string(buf), nil
 }

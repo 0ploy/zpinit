@@ -40,7 +40,10 @@ entrypoint_script_timeout = "5m"
 
 # Time budget for the service-boot phase (start + readiness probe per
 # service, summed). Starts at the moment service-boot begins, not at
-# zpinit launch.
+# zpinit launch. Covers the WHOLE service list, not a per-service
+# budget: with many services or a slow late service, an early service
+# can be denied its share. Set generously relative to the sum of
+# expected boot times, or split into smaller images.
 boot_timeout = "60s"
 
 # Default signal sent to services on graceful stop.

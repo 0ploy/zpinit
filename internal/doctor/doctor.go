@@ -149,9 +149,9 @@ func checkConfig(configDir string) (*config.Config, []Check) {
 		// what they get before boot.
 		if s.Replicas > 1 && s.Log.Stdout != "" && s.Log.Stdout != "inherit" {
 			if strings.Contains(s.Log.Stdout, "{index}") {
-				var preview []string
+				preview := make([]string, 0, s.Replicas)
 				for i := 0; i < s.Replicas; i++ {
-					preview = append(preview, replicaLogPreview(s.Log.Stdout, i, s.Replicas))
+					preview = append(preview, config.ReplicaLogPath(s.Log.Stdout, i, s.Replicas))
 				}
 				out = append(out, Check{"config", s.Name + ": log paths", StatusOK,
 					fmt.Sprintf("replicas=%d, log.stdout expands to: %s", s.Replicas, strings.Join(preview, ", "))})
@@ -190,17 +190,6 @@ func commandCheck(svcName, field, cmd string) Check {
 		return Check{"config", svcName + ": " + field, StatusFail, fmt.Sprintf("%s not found on PATH", cmd)}
 	}
 	return Check{"config", svcName + ": " + field, StatusOK, fmt.Sprintf("%s found on PATH (%s)", cmd, path)}
-}
-
-// replicaLogPreview expands a {index} placeholder for one replica.
-// Callers handle the shared-path case (no placeholder) before reaching
-// this helper, so the preview only needs to render the per-replica
-// opt-in form.
-func replicaLogPreview(spec string, idx, total int) string {
-	if total <= 1 || spec == "" || spec == "inherit" {
-		return spec
-	}
-	return strings.ReplaceAll(spec, "{index}", strconv.Itoa(idx))
 }
 
 func checkRuntimes(cfg *config.Config) []Check {

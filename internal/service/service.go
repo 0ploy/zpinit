@@ -58,7 +58,7 @@ func Spawn(cfg config.Service, baseEnv []string, r *reaper.Reaper, log *slog.Log
 
 	cmd := exec.Command(cfg.Command[0], cfg.Command[1:]...)
 	cmd.Dir = cfg.Cwd
-	cmd.Env = mergeServiceEnv(baseEnv, cfg.Env)
+	cmd.Env = MergeEnv(baseEnv, cfg.Env)
 	cmd.Stdout = stdoutTarget
 	cmd.Stderr = stderrTarget
 	cmd.SysProcAttr = baseSysProcAttr()
@@ -221,15 +221,9 @@ func closeFile(f *os.File) {
 }
 
 // MergeEnv returns base env with [env] overrides applied. New entries
-// are appended; existing keys are replaced in place. Exported because
-// the supervisor needs the same merge for readiness probes.
+// are appended; existing keys are replaced in place. Used at spawn
+// time and by the supervisor for readiness probes.
 func MergeEnv(base []string, override map[string]string) []string {
-	return mergeServiceEnv(base, override)
-}
-
-// mergeServiceEnv returns base env with [env] overrides applied. New
-// entries are appended; existing keys are replaced in place.
-func mergeServiceEnv(base []string, override map[string]string) []string {
 	if len(override) == 0 {
 		return base
 	}

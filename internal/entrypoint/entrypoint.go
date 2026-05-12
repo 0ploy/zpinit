@@ -32,6 +32,18 @@ const (
 	Continue OnFailure = "continue"
 )
 
+// scriptReapGiveUp bounds how long runOne waits for cmd.Wait to return
+// after SIGKILL has been issued on a timed-out or canceled script. If
+// the child is pinned in uninterruptible kernel sleep (D state), the
+// kernel will not deliver SIGKILL until the syscall completes, which
+// can be arbitrarily long; without this bound, the entrypoint phase
+// would block boot indefinitely with no higher-level timeout to bail
+// it out (the centralized reaper is not yet running). The buffered
+// (cap=1) done channel absorbs the eventual cmd.Wait result, so
+// abandoning the wait does not lose memory beyond one leaked
+// goroutine.
+const scriptReapGiveUp = 5 * time.Second
+
 type Config struct {
 	Dir           string        // entrypoint.d directory
 	OnFailure     OnFailure     // fail | continue (default: fail)
@@ -78,7 +90,7 @@ func Run(ctx context.Context, cfg Config) (map[string]string, error) {
 			env[k] = v
 		}
 	} else {
-		env = mapFromEnviron(os.Environ())
+		env = MapFromEnviron(os.Environ())
 	}
 
 	for _, path := range scripts {
@@ -189,7 +201,12 @@ func runOne(ctx context.Context, cfg Config, path string, env []string) error {
 		return err
 	case <-graceTimer.C:
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		<-done
+		select {
+		case <-done:
+		case <-time.After(scriptReapGiveUp):
+			cfg.Logger.Error("script reap timed out; abandoning child",
+				"name", filepath.Base(path), "pgid", pgid, "give_up", scriptReapGiveUp)
+		}
 		return errors.New("script killed after timeout / cancellation")
 	}
 }
@@ -237,7 +254,11 @@ func mergeEnvFile(env map[string]string, path string, log *slog.Logger) error {
 	return scanner.Err()
 }
 
-func mapFromEnviron(envv []string) map[string]string {
+// MapFromEnviron parses an `os.Environ()`-style slice into a key→value
+// map. Entries without `=`, or with `=` in column 0, are skipped.
+// Exported so cmd/zpinit can share one implementation rather than
+// reinventing it.
+func MapFromEnviron(envv []string) map[string]string {
 	m := make(map[string]string, len(envv))
 	for _, e := range envv {
 		if i := strings.IndexByte(e, '='); i > 0 {

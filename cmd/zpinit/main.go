@@ -130,7 +130,7 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 	// entrypoint.d scripts can write further overrides to /run/zpinit/env,
 	// which run on top. Container env beats globals.Env so an operator
 	// can override a baked-in default via `docker run -e`.
-	containerEnv := mapFromEnviron(os.Environ())
+	containerEnv := entrypoint.MapFromEnviron(os.Environ())
 	initialEnv := layeredMerge(cfg.Globals.Env, containerEnv)
 
 	finalEnv, err := runEntrypoint(log, configDir, cfg, skipEntrypoint, initialEnv)
@@ -250,25 +250,6 @@ func execCmd(log *slog.Logger, cmdline []string, env map[string]string) int {
 		return 1
 	}
 	return 0 // unreachable; Exec replaces the process image
-}
-
-func mapFromEnviron(envv []string) map[string]string {
-	m := make(map[string]string, len(envv))
-	for _, e := range envv {
-		if i := indexEq(e); i > 0 {
-			m[e[:i]] = e[i+1:]
-		}
-	}
-	return m
-}
-
-func indexEq(s string) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '=' {
-			return i
-		}
-	}
-	return -1
 }
 
 // runSupervise is the supervise-mode entry point. It splits signals

@@ -188,10 +188,14 @@ release page with nothing useful in it.
   exited (cmds buffer accepts the send, but `<-done` never fires). Bare
   versions exist only for tests where Run is always alive.
 
-- `Orchestrator.runners` and `.cfg` are protected by `o.mu` (RWMutex);
-  Reload-vs-Reload is serialized by `o.reloadMu`. External readers (control
-  server) must use `snapshotRunners()`: iterating the live slice while
-  Reload mutates it is a data race confirmed by `go test -race`.
+- `Orchestrator.runners`, `.cfg`, `.baseEnv`, `.runnerCtx`, `.wg`,
+  `.earlyShutdownCh`, `.shutdownOnce`, `.watcherCancel`, and
+  `.watcherGen` are all protected by `o.mu` (RWMutex). Reload-vs-Reload
+  is serialized by `o.reloadMu`. External readers (control server) must
+  use `snapshotRunners()`: iterating the live slice while Reload
+  mutates it is a data race confirmed by `go test -race`.
+  `spawnRunnerGoroutine` snapshots `runnerCtx`/`wg` under RLock so it
+  is safe to call from outside the cfg-write critical section.
 
 - `Reload` registers added/restart-new runners synchronously but boots
   them in a single detached goroutine (`runReloadBoots`), one at a time
@@ -280,14 +284,33 @@ release page with nothing useful in it.
   don't tear line-sized log output. Operators wanting per-replica
   files opt in via `{index}` in the path.
 
-- `findRunner(name)` matches by `cfg.Name` only, so for replicated
-  services it returns the first replica. zpctl-side verbs that
-  target a runner use `resolveTarget(snap, arg)` which parses
-  `svc/N` and returns all replicas for the bare-name form. Internal
-  callers that don't need replica granularity (the `exit_code_from`
-  watcher) keep using `findRunner`; `exit_code_from` is rejected at
-  config-load if it points at a replicated service so the ambiguity
-  never reaches runtime.
+- `findRunnerLocked(name)` matches by `cfg.Name` only, so for replicated
+  services it returns the first replica. zpctl-side verbs that target a
+  runner use `resolveTarget(snap, arg)` which parses `svc/N` and returns
+  all replicas for the bare-name form. Internal callers that don't need
+  replica granularity (the `exit_code_from` watcher and `exitCode`) keep
+  using `findRunnerLocked`; `exit_code_from` is rejected at config-load
+  if it points at a replicated service so the ambiguity never reaches
+  runtime.
+
+- The `exit_code_from` watcher uses a per-installation generation
+  counter (`watcherGen`) to gate firing shutdown. Each
+  `installExitCodeWatcher` bumps the counter; the spawned goroutine
+  captures it and re-checks under `o.mu.RLock` before
+  `once.Do(close(earlyCh))`. Cancel of `wctx` doesn't synchronize
+  with the goroutine's progress, so the gen check is required: a
+  retarget that races with the old target reaching terminal state
+  would otherwise shut the supervisor down for a service the new
+  config no longer cares about.
+
+- Bounded post-SIGKILL reap waits in `entrypoint.runOne` and
+  `probe.defaultProber` (constants `scriptReapGiveUp` / `probeReapGiveUp`,
+  both 5s). A child pinned in uninterruptible kernel sleep (D state)
+  can't be SIGKILL'd until its syscall completes; without the bound,
+  boot would hang indefinitely. The buffered (cap=1) channel each
+  helper waits on absorbs the eventual reap send if we've abandoned
+  the wait, so abandoning is safe (one leaked goroutine, no memory
+  growth).
 
 - Listener replicas without app-level `SO_REUSEPORT` opt-in will
   EADDRINUSE on every replica except the first to win the bind race;
