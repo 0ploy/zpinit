@@ -10,13 +10,36 @@ mistake?" If not, cut it.
 
 ## Project Overview
 zpinit: single static Go binary that runs as PID 1 in ScaleCommerce's Docker
-images, replacing supervisord + tini + per-image bespoke `docker-entrypoint.sh`.
-Linux-only in production (Pdeathsig, /proc); macOS dev compiles via build
-tags but doesn't exercise PID-1 paths.
+images, replacing supervisord + tini + per-image bespoke `docker-entrypoint.sh`
+(and PM2 in the Node clustering case). Linux-only in production (Pdeathsig,
+/proc); macOS dev compiles via build tags but doesn't exercise PID-1 paths.
 
-User-facing docs are in `README.md` (onboarding, examples, high-level design
-decisions). Per-phase implementation rationale lives in commit history;
-`git log` is authoritative.
+Per-phase implementation rationale lives in commit history; `git log` is
+authoritative.
+
+## Docs landscape (read before touching the matching code)
+
+User-facing docs are split by concern. When working on a topic, read the
+matching doc first to pick up the contract; when changing the topic, update
+the doc in the same commit (see "Docs sync" under Conventions).
+
+- `README.md` — three-modes overview, quickstart, replica/cluster pitch.
+  Touch when mode behavior, the quickstart, or the operator-command summary
+  changes.
+- `docs/why.md` — motivation, design decisions, non-goals. Touch when a
+  load-bearing design rule or non-goal flips.
+- `docs/configuration.md` — full TOML schema and `--check-config` rules.
+  Touch on every TOML field add/remove/rename, default change, or
+  validation tweak.
+- `docs/clustering.md` — replicas, reusePort, PM2 comparison, migration.
+  Touch on every replicas/log-path/clustering behavior change.
+- `docs/architecture.md` — packages, state machine, boot/reload/shutdown,
+  reaping, control protocol. Touch on changes to those internals that
+  reshape the contract (not pure refactors).
+- `docs/security.md` — threat model, control socket, log handling, env
+  injection. Touch on any change to access gates, log open flags, wire
+  sanitization, or `[env]` propagation.
+- `docs/development.md` — build/test/lint commands and platform notes.
 
 ## Load-Bearing Design Rules
 
@@ -63,6 +86,12 @@ support, no interactive `zpctl fg`. If a feature request matches one of
 these, push back and reconfirm before coding.
 
 ## Conventions
+- **Docs sync.** Every user-visible behavior change updates the matching
+  doc(s) in the same commit, per the "Docs landscape" map above. Also
+  append a CHANGELOG.md entry under `## Unreleased` if the change is the
+  kind a release note would mention (features, fixes, security). Stale
+  docs are worse than missing ones; the release workflow ships whatever
+  is on disk.
 - No em-dashes (—) in any writing. Use periods, colons, or semicolons.
 - Tests use the standard library only. No testify, gomock, or similar.
 - Only approved external dependency: `github.com/BurntSushi/toml`. Anything
@@ -226,3 +255,38 @@ release page with nothing useful in it.
   controlled log content and `cmdUpdate` surfaces multi-line TOML
   errors; without sanitization either could split a single field
   across frames or end the body early at the client.
+
+- `replicas = N` expands one service spec into N first-class
+  Runners with the same `cfg.Filename` but distinct `replicaIndex`
+  values. The diff key stays at the filename level: `existing` in
+  `computeDiffLocked` is `map[string][]*Runner`. Service-spec
+  comparison uses `r.Spec()` (the unmodified spec), not `r.Cfg()`,
+  because `Cfg().Log.Stdout` may have been per-replica rewritten
+  when the path contains `{index}`; comparing `Cfg()` would otherwise
+  show a phantom diff every reload. Per-replica log-path rewriting
+  and `ZPINIT_REPLICA_INDEX` env injection live in
+  `expandServiceToRunners` (replica.go); call it instead of
+  `NewRunner` directly when expanding from a spec.
+
+- Replica log paths default to a *shared file* across all N
+  replicas. `replicaLogPath` only rewrites when the spec contains
+  `{index}`. Linux `O_APPEND` is atomic for writes below `PIPE_BUF`
+  (typically 4096 bytes), so concurrent appends from N replicas
+  don't tear line-sized log output. Operators wanting per-replica
+  files opt in via `{index}` in the path.
+
+- `findRunner(name)` matches by `cfg.Name` only, so for replicated
+  services it returns the first replica. zpctl-side verbs that
+  target a runner use `resolveTarget(snap, arg)` which parses
+  `svc/N` and returns all replicas for the bare-name form. Internal
+  callers that don't need replica granularity (the `exit_code_from`
+  watcher) keep using `findRunner`; `exit_code_from` is rejected at
+  config-load if it points at a replicated service so the ambiguity
+  never reaches runtime.
+
+- Listener replicas without app-level `SO_REUSEPORT` opt-in will
+  EADDRINUSE on every replica except the first to win the bind race;
+  the child crash-loops past `MaxConsecutiveCrashes` and goes FATAL.
+  `zpinit --doctor` is the only pre-flight catch for this; the
+  config layer can't see whether the running interpreter supports
+  the option.

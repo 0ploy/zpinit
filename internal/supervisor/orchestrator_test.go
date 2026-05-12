@@ -360,7 +360,7 @@ func diffFixture(t *testing.T, services []config.Service) *Orchestrator {
 		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	for _, s := range services {
-		r := NewRunner(s, nil, nil, nil, o.log)
+		r := NewRunner(s, nil, 0, nil, nil, o.log)
 		o.runners = append(o.runners, r)
 	}
 	return o
@@ -979,6 +979,203 @@ func waitForSpawnCount(t *testing.T, c *capturedProcs, want int, timeout time.Du
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("got %d spawns, want %d", len(c.snapshot()), want)
+}
+
+func TestReload_AddsReplicatedService(t *testing.T) {
+	initial := []config.Service{mustService("a", "10_a.toml", nil)}
+	f, captured := newCapturingFixture(t, initial, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+	waitForSpawnCount(t, captured, 1, 2*time.Second)
+
+	newCfg := &config.Config{
+		Services: []config.Service{
+			mustService("a", "10_a.toml", nil),
+			mustService("b", "20_b.toml", func(s *config.Service) {
+				s.Replicas = 3
+			}),
+		},
+		Globals: f.cfg.Globals,
+	}
+	if err := f.orch.Reload(ctx, newCfg); err != nil {
+		t.Fatal(err)
+	}
+	// 1 initial + 3 replicas of b.
+	waitForSpawnCount(t, captured, 4, 2*time.Second)
+
+	f.orch.mu.RLock()
+	var bRunners []*Runner
+	for _, r := range f.orch.runners {
+		if r.Cfg().Filename == "20_b.toml" {
+			bRunners = append(bRunners, r)
+		}
+	}
+	f.orch.mu.RUnlock()
+	if len(bRunners) != 3 {
+		t.Fatalf("b replicas after reload = %d, want 3", len(bRunners))
+	}
+	for i, r := range bRunners {
+		if r.ReplicaIndex() != i {
+			t.Errorf("b/%d ReplicaIndex = %d", i, r.ReplicaIndex())
+		}
+	}
+
+	cancel()
+	for _, p := range captured.snapshot() {
+		go p.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}
+	f.awaitExit(3 * time.Second)
+}
+
+func TestReload_RemovesReplicatedService(t *testing.T) {
+	initial := []config.Service{
+		mustService("a", "10_a.toml", nil),
+		mustService("b", "20_b.toml", func(s *config.Service) {
+			s.Replicas = 3
+		}),
+	}
+	f, captured := newCapturingFixture(t, initial, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+	// 1 (a) + 3 (b's replicas) = 4 spawns.
+	waitForSpawnCount(t, captured, 4, 2*time.Second)
+
+	// Reload with b removed entirely.
+	newCfg := &config.Config{
+		Services: []config.Service{mustService("a", "10_a.toml", nil)},
+		Globals:  f.cfg.Globals,
+	}
+
+	// Push exits for all three b replicas as they get SIGTERM'd.
+	procs := captured.snapshot()
+	go func() {
+		// b's replicas are spawns 2,3,4 (after a's spawn 1).
+		time.Sleep(80 * time.Millisecond)
+		for _, p := range procs[1:] {
+			p.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+		}
+	}()
+
+	if err := f.orch.Reload(ctx, newCfg); err != nil {
+		t.Fatal(err)
+	}
+
+	f.orch.mu.RLock()
+	left := len(f.orch.runners)
+	f.orch.mu.RUnlock()
+	if left != 1 {
+		t.Errorf("runners after replica-remove = %d, want 1", left)
+	}
+
+	cancel()
+	go procs[0].pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	f.awaitExit(3 * time.Second)
+}
+
+func TestReload_ReplicasCountChange(t *testing.T) {
+	initial := []config.Service{
+		mustService("consumer", "10_consumer.toml", func(s *config.Service) {
+			s.Replicas = 2
+		}),
+	}
+	f, captured := newCapturingFixture(t, initial, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+	waitForSpawnCount(t, captured, 2, 2*time.Second)
+
+	// Replicas 2 -> 4: spec changes → restart all old, spawn 4 new.
+	newCfg := &config.Config{
+		Services: []config.Service{
+			mustService("consumer", "10_consumer.toml", func(s *config.Service) {
+				s.Replicas = 4
+			}),
+		},
+		Globals: f.cfg.Globals,
+	}
+	// Push exits for the two old replicas as they get SIGTERM'd.
+	procs := captured.snapshot()
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		procs[0].pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+		procs[1].pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}()
+
+	if err := f.orch.Reload(ctx, newCfg); err != nil {
+		t.Fatal(err)
+	}
+	// 2 old + 4 new = 6 total spawns.
+	waitForSpawnCount(t, captured, 6, 3*time.Second)
+
+	f.orch.mu.RLock()
+	left := len(f.orch.runners)
+	f.orch.mu.RUnlock()
+	if left != 4 {
+		t.Errorf("runners after replica-change = %d, want 4", left)
+	}
+
+	cancel()
+	// Only the post-reload 4 are still alive.
+	for _, p := range captured.snapshot()[2:] {
+		go p.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}
+	f.awaitExit(3 * time.Second)
+}
+
+func TestDiff_NoChangeForUnchangedReplicatedService(t *testing.T) {
+	// Regression guard: per-replica log rewriting on the Cfg must not
+	// produce a phantom diff when the spec is unchanged.
+	svc := mustService("consumer", "10_consumer.toml", func(s *config.Service) {
+		s.Replicas = 3
+		s.Log.Stdout = "/var/log/consumer.log"
+	})
+	o := diffFixture(t, []config.Service{svc})
+	// diffFixture wires NewRunner directly; expand manually so we get
+	// per-replica log rewriting (matching production initial-boot).
+	o.runners = expandServiceToRunners(svc, nil, nil, nil, o.log)
+
+	d := o.computeDiff(&config.Config{Services: []config.Service{svc}})
+	if total := len(d.add) + len(d.remove) + len(d.restart); total != 0 {
+		t.Errorf("expected empty diff for unchanged replicated service; got %+v", d)
+	}
+}
+
+func TestOrchestrator_ReplicasSpawnsN(t *testing.T) {
+	svc := dummyService("consumer", false)
+	svc.Replicas = 3
+	f, captured := newCapturingFixture(t, []config.Service{svc}, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.start(ctx)
+
+	waitForSpawnCount(t, captured, 3, 2*time.Second)
+
+	// All three runners must be registered and sorted by replica index.
+	f.orch.mu.RLock()
+	runners := append([]*Runner(nil), f.orch.runners...)
+	f.orch.mu.RUnlock()
+	if len(runners) != 3 {
+		t.Fatalf("runners = %d, want 3", len(runners))
+	}
+	for i, r := range runners {
+		if got := r.ReplicaIndex(); got != i {
+			t.Errorf("runners[%d].ReplicaIndex = %d, want %d", i, got, i)
+		}
+		want := "consumer/" + string(rune('0'+i))
+		if got := r.DisplayName(); got != want {
+			t.Errorf("runners[%d].DisplayName = %q, want %q", i, got, want)
+		}
+	}
+
+	cancel()
+	for _, p := range captured.snapshot() {
+		go p.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
+	}
+	f.awaitExit(3 * time.Second)
 }
 
 func TestOrchestrator_ExitCodeFromWorker(t *testing.T) {

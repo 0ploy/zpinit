@@ -33,11 +33,15 @@ func main() {
 		checkConfig    string
 		configDir      string
 		skipEntrypoint bool
+		doctorFlag     bool
+		doctorQuiet    bool
 	)
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.StringVar(&checkConfig, "check-config", "", "validate configuration in `dir` and exit")
 	flag.StringVar(&configDir, "config", defaultConfigDir, "configuration `dir`")
 	flag.BoolVar(&skipEntrypoint, "skip-entrypoint", false, "skip entrypoint.d scripts (useful for `docker run image bash` debug shells)")
+	flag.BoolVar(&doctorFlag, "doctor", false, "run the pre-flight environment audit and exit (filesystem, config, runtimes, state)")
+	flag.BoolVar(&doctorQuiet, "doctor-quiet", false, "with --doctor: suppress OK rows in the output")
 	flag.Parse()
 
 	if showVersion {
@@ -47,6 +51,10 @@ func main() {
 
 	if checkConfig != "" {
 		os.Exit(runCheckConfig(checkConfig))
+	}
+
+	if doctorFlag {
+		os.Exit(runDoctor(configDir, doctorQuiet))
 	}
 
 	// Track whether --config was passed explicitly so missing-dir

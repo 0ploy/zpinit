@@ -137,6 +137,17 @@ stop_timeout = "10s"
 # config reloads (a long-running batch job, for example).
 reloadable = true
 
+# Number of independent supervised copies of `command`. Default 1.
+# Each replica is a first-class child with its own PID, log file, and
+# crash budget; ZPINIT_REPLICA_INDEX=0..N-1 is injected into each
+# replica's env (only when replicas > 1). Replicas of an app that
+# binds a port without SO_REUSEPORT support will collide with
+# EADDRINUSE on all but the first; `zpinit --doctor` catches the
+# common cases. Maximum 64 (typo guard); promotes to a config knob
+# only if anyone asks. See clustering.md for the listener case and
+# the PM2 comparison.
+replicas = 1
+
 # Per-service environment variables. Merged on top of inherited env.
 [env]
 LOG_LEVEL = "info"
@@ -147,6 +158,16 @@ DATABASE_URL = "postgres://..."
 # A path writes to a file with O_APPEND|O_NOFOLLOW: a symlink at the
 # leaf of the path is rejected at spawn time. Symlinked parent
 # directories resolve normally.
+#
+# For replicas > 1, log paths default to a shared file: every replica
+# writes to the same path. Linux O_APPEND is atomic for line-sized
+# writes (<= PIPE_BUF, typically 4096 bytes), so concurrent appends
+# from N replicas don't tear at line boundaries for normal log output.
+#
+# To get per-replica files instead, put `{index}` in the path; it
+# expands to 0..N-1:
+#   "/var/log/consumer-{index}.log" -> "/var/log/consumer-0.log", ...
+# "inherit" is unchanged across replicas.
 [log]
 stdout = "inherit"
 stderr = "inherit"
@@ -192,5 +213,12 @@ one-line OK summary or every error found in one pass. Exit 0 / 1.
 - `restart`, `entrypoint_on_failure`, `[ready].on_timeout` are valid.
 - `default_stop_signal` and per-service `stop_signal` are recognised.
 - `exit_code_from` references an existing service (or is `"default"`).
+  Pointing it at a service with `replicas > 1` is rejected (ambiguous).
+- `replicas` is in `[1, 64]`.
 - `entrypoint.d/` files are executable (warning, not error).
 - `control_socket` is an absolute path.
+
+For a deeper pre-flight audit (filesystem writability, binary
+resolution, runtime version checks, whether a zpinit instance is
+already running), use `zpinit --doctor /etc/zpinit/` instead — it's a
+superset of `--check-config`.

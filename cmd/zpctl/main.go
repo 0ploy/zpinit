@@ -82,16 +82,19 @@ func usage() {
 Commands match supervisorctl naming where possible.
 
 Common commands:
-  status [NAME...]      list service states
-  start NAME | all      start service(s)
-  stop NAME | all       stop service(s)
-  restart NAME | all    stop then start
-  pid [NAME]            PID of zpinit or a service
-  tail NAME             dump last 8KB of file-logged stdout
-  update                apply config changes (= SIGHUP)
-  reread                dry-run config diff
-  signal NAME SIG       send arbitrary signal
-  shutdown              stop supervisor
+  status [NAME...]        list service states
+  start NAME[/N] | all    start service(s)
+  stop NAME[/N] | all     stop service(s)
+  restart NAME[/N] | all  stop then start
+  pid [NAME[/N]]          PID of zpinit or a service replica
+  tail NAME[/N]           dump last 8KB of file-logged stdout
+  update                  apply config changes (= SIGHUP)
+  reread                  dry-run config diff
+  signal NAME[/N] SIG     send arbitrary signal
+  shutdown                stop supervisor
+
+NAME refers to a service; for services with replicas > 1, NAME selects
+every replica and NAME/N selects replica N (0..replicas-1).
 
 `)
 }

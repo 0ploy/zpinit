@@ -148,10 +148,11 @@ func (o *Orchestrator) Run(ctx context.Context) int {
 	// that reads o.runners/o.runnerCtx — even though those readers
 	// take RLock, the writer must publish via Lock to pair.
 	o.mu.Lock()
-	o.runners = make([]*Runner, len(o.cfg.Services))
-	for i, svc := range o.cfg.Services {
-		o.runners[i] = NewRunner(svc, o.baseEnv, o.spawner, o.clock, o.log)
+	o.runners = nil
+	for _, svc := range o.cfg.Services {
+		o.runners = append(o.runners, expandServiceToRunners(svc, o.baseEnv, o.spawner, o.clock, o.log)...)
 	}
+	sortRunners(o.runners)
 	o.runnerCtx = runnerCtx
 	o.wg = &wg
 	o.earlyShutdownCh = make(chan struct{})
@@ -197,7 +198,7 @@ func (o *Orchestrator) boot(ctx context.Context) error {
 	o.mu.RUnlock()
 	for _, r := range snap {
 		if err := o.bootOne(ctx, r); err != nil {
-			return fmt.Errorf("%s: %w", r.Cfg().Name, err)
+			return fmt.Errorf("%s: %w", r.DisplayName(), err)
 		}
 	}
 	return nil
@@ -205,7 +206,8 @@ func (o *Orchestrator) boot(ctx context.Context) error {
 
 func (o *Orchestrator) bootOne(ctx context.Context, r *Runner) error {
 	cfg := r.Cfg()
-	o.log.Info("boot: starting", "service", cfg.Name)
+	name := r.DisplayName()
+	o.log.Info("boot: starting", "service", name)
 	if err := r.StartCtx(ctx); err != nil {
 		return fmt.Errorf("send start: %w", err)
 	}
@@ -215,15 +217,15 @@ func (o *Orchestrator) bootOne(ctx context.Context, r *Runner) error {
 	}
 
 	if cfg.Ready != nil {
-		env := service.MergeEnv(o.baseEnv, cfg.Env)
+		env := service.MergeEnv(r.baseEnv, cfg.Env)
 		if err := waitReady(ctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
 			if cfg.Ready.OnTimeout == config.ReadyContinue {
-				o.log.Warn("readiness failed; continuing per on_timeout", "service", cfg.Name, "err", err)
+				o.log.Warn("readiness failed; continuing per on_timeout", "service", name, "err", err)
 				return nil
 			}
 			return fmt.Errorf("readiness: %w", err)
 		}
-		o.log.Info("boot: ready", "service", cfg.Name)
+		o.log.Info("boot: ready", "service", name)
 	}
 	return nil
 }
@@ -295,10 +297,11 @@ func (o *Orchestrator) stopAll() {
 			continue
 		}
 		cfg := r.Cfg()
-		o.log.Info("stop: signaling", "service", cfg.Name)
+		name := r.DisplayName()
+		o.log.Info("stop: signaling", "service", name)
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.StopTimeout.Std()+reapGrace)
 		if err := r.StopCtx(ctx); err != nil {
-			o.log.Warn("stop signal could not be delivered", "service", cfg.Name, "err", err)
+			o.log.Warn("stop signal could not be delivered", "service", name, "err", err)
 			cancel()
 			continue
 		}
@@ -308,7 +311,7 @@ func (o *Orchestrator) stopAll() {
 			// sleep. Move on to the next service rather than
 			// blocking the rest of the teardown forever.
 			o.log.Error("service did not terminate even after SIGKILL escalation",
-				"service", cfg.Name, "state", r.State(), "err", err)
+				"service", name, "state", r.State(), "err", err)
 		}
 		cancel()
 	}
@@ -390,28 +393,42 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) error 
 		}
 	}
 
-	// Pair restart-new specs with successful removals. If the old
-	// runner couldn't be stopped, skip its restart-new — adding it
-	// would double-register the same filename and break the diff
-	// invariant on the next reload.
-	var jobs []reloadBootJob
+	// Pair restart-new specs with successful removals. For replicated
+	// services every old replica must stop before any new replica is
+	// expanded; a partial stop would double-register the same filename
+	// and break the diff invariant. If any old replica fails to stop,
+	// keep the rest registered (removeService leaves a failed runner
+	// in place on purpose) and skip the new spec for this reload —
+	// next reload's diff retries.
+	var addSpecs []config.Service
 	for _, p := range diff.restart {
-		if err := o.removeService(ctx, p.old); err != nil {
-			o.log.Error("reload: restart-stop failed; new spec skipped", "service", p.old.Cfg().Name, "err", err)
-			errs = append(errs, err)
+		failed := false
+		for _, oldR := range p.old {
+			if err := o.removeService(ctx, oldR); err != nil {
+				o.log.Error("reload: restart-stop failed; new spec skipped", "service", oldR.Cfg().Name, "err", err)
+				errs = append(errs, err)
+				failed = true
+			}
+		}
+		if failed {
 			continue
 		}
-		jobs = append(jobs, reloadBootJob{cfg: p.new})
+		addSpecs = append(addSpecs, p.new)
 	}
-	for _, s := range diff.add {
-		jobs = append(jobs, reloadBootJob{cfg: s})
-	}
-	sort.Slice(jobs, func(i, j int) bool {
-		return jobs[i].cfg.Filename < jobs[j].cfg.Filename
+	addSpecs = append(addSpecs, diff.add...)
+	sort.Slice(addSpecs, func(i, j int) bool {
+		return addSpecs[i].Filename < addSpecs[j].Filename
 	})
 
-	for i := range jobs {
-		jobs[i].runner = NewRunner(jobs[i].cfg, newBaseEnv, o.spawner, o.clock, o.log)
+	// Expand every (re)added service into per-replica boot jobs. Sort
+	// is preserved at the filename level by addSpecs above; replica
+	// indices then run in 0..N-1 order within a filename.
+	var jobs []reloadBootJob
+	for _, s := range addSpecs {
+		runners := expandServiceToRunners(s, newBaseEnv, o.spawner, o.clock, o.log)
+		for _, r := range runners {
+			jobs = append(jobs, reloadBootJob{cfg: r.Cfg(), runner: r})
+		}
 	}
 
 	// Register runners + commit cfg + baseEnv + sort under one critical
@@ -423,9 +440,7 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) error 
 	for _, j := range jobs {
 		o.runners = append(o.runners, j.runner)
 	}
-	sort.Slice(o.runners, func(i, j int) bool {
-		return o.runners[i].Cfg().Filename < o.runners[j].Cfg().Filename
-	})
+	sortRunners(o.runners)
 	o.cfg = newCfg
 	o.baseEnv = newBaseEnv
 	o.mu.Unlock()
@@ -491,36 +506,45 @@ func (o *Orchestrator) runReloadBoots(root context.Context, jobs []reloadBootJob
 func (o *Orchestrator) bootReloadJob(ctx context.Context, j reloadBootJob) {
 	cfg := j.cfg
 	r := j.runner
-	o.log.Info("reload: booting", "service", cfg.Name)
+	name := r.DisplayName()
+	o.log.Info("reload: booting", "service", name)
 	if err := r.StartCtx(ctx); err != nil {
-		o.log.Error("reload: added service start signal failed", "service", cfg.Name, "err", err)
+		o.log.Error("reload: added service start signal failed", "service", name, "err", err)
 		return
 	}
 	if err := r.WaitBootResult(ctx); err != nil {
-		o.log.Error("reload: added service failed to boot", "service", cfg.Name, "err", err)
+		o.log.Error("reload: added service failed to boot", "service", name, "err", err)
 		return
 	}
 	if cfg.Ready != nil {
-		env := service.MergeEnv(o.baseEnv, cfg.Env)
+		env := service.MergeEnv(r.baseEnv, cfg.Env)
 		if err := waitReady(ctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
 			if cfg.Ready.OnTimeout == config.ReadyContinue {
 				o.log.Warn("reload: readiness failed; continuing per on_timeout",
-					"service", cfg.Name, "err", err)
+					"service", name, "err", err)
 			} else {
 				o.log.Error("reload: added service readiness failed",
-					"service", cfg.Name, "err", err)
+					"service", name, "err", err)
 			}
 		}
 	}
 }
 
 type reloadRestartPair struct {
-	old *Runner
+	// old holds every running replica of the service. For non-replicated
+	// services it has exactly one entry; for replicas > 1 it has N. All
+	// must stop before the new spec is expanded into a fresh set of
+	// runners.
+	old []*Runner
 	new config.Service
 }
 
 type reloadDiff struct {
-	add     []config.Service
+	add []config.Service
+	// remove is a flat list of runners to deregister. Multiple replicas
+	// of the same filename produce multiple entries; the order is
+	// (filename ASC, replicaIndex ASC) so restart-stop and remove
+	// progress predictably.
 	remove  []*Runner
 	restart []reloadRestartPair
 }
@@ -536,10 +560,16 @@ func (o *Orchestrator) computeDiff(newCfg *config.Config) reloadDiff {
 
 // computeDiffLocked produces a stable, filename-sorted action list.
 // Pure function aside from reading o.runners; caller must hold o.mu.
+//
+// Replicated services map a single filename to N runners, all sharing
+// the same Spec(). The diff key remains the filename: a change to the
+// service spec restarts every replica; an unchanged spec leaves all
+// replicas alone.
 func (o *Orchestrator) computeDiffLocked(newCfg *config.Config) reloadDiff {
-	existing := map[string]*Runner{}
+	existing := map[string][]*Runner{}
 	for _, r := range o.runners {
-		existing[r.Cfg().Filename] = r
+		fn := r.Cfg().Filename
+		existing[fn] = append(existing[fn], r)
 	}
 	newSet := map[string]config.Service{}
 	for _, s := range newCfg.Services {
@@ -561,20 +591,22 @@ func (o *Orchestrator) computeDiffLocked(newCfg *config.Config) reloadDiff {
 
 	var diff reloadDiff
 	for _, fn := range ordered {
-		old, hasOld := existing[fn]
+		oldRunners, hasOld := existing[fn]
 		s, hasNew := newSet[fn]
 		switch {
 		case hasOld && !hasNew:
-			diff.remove = append(diff.remove, old)
+			diff.remove = append(diff.remove, oldRunners...)
 		case !hasOld && hasNew:
 			diff.add = append(diff.add, s)
 		case hasOld && hasNew:
-			if !servicesEqual(old.Cfg(), s) {
-				if old.Cfg().IsReloadable() {
-					diff.restart = append(diff.restart, reloadRestartPair{old: old, new: s})
+			// All replicas share the same Spec (filename is the key).
+			oldSpec := oldRunners[0].Spec()
+			if !servicesEqual(oldSpec, s) {
+				if oldSpec.IsReloadable() {
+					diff.restart = append(diff.restart, reloadRestartPair{old: oldRunners, new: s})
 				} else {
 					o.log.Info("reload: config changed but reloadable=false; ignoring",
-						"service", old.Cfg().Name, "file", fn)
+						"service", oldSpec.Name, "file", fn)
 				}
 			}
 		}
@@ -592,10 +624,9 @@ func (o *Orchestrator) computeDiffLocked(newCfg *config.Config) reloadDiff {
 			inDiff[r.Cfg().Filename] = struct{}{}
 		}
 		for _, p := range diff.restart {
-			inDiff[p.old.Cfg().Filename] = struct{}{}
+			inDiff[p.old[0].Cfg().Filename] = struct{}{}
 		}
-		for _, r := range o.runners {
-			fn := r.Cfg().Filename
+		for fn, runners := range existing {
 			if _, skip := inDiff[fn]; skip {
 				continue
 			}
@@ -603,12 +634,13 @@ func (o *Orchestrator) computeDiffLocked(newCfg *config.Config) reloadDiff {
 			if !ok {
 				continue // already in remove
 			}
-			if !r.Cfg().IsReloadable() {
+			spec := runners[0].Spec()
+			if !spec.IsReloadable() {
 				o.log.Info("reload: globals.env changed but reloadable=false; service keeps old env",
-					"service", r.Cfg().Name)
+					"service", spec.Name)
 				continue
 			}
-			diff.restart = append(diff.restart, reloadRestartPair{old: r, new: newSpec})
+			diff.restart = append(diff.restart, reloadRestartPair{old: runners, new: newSpec})
 		}
 	}
 	return diff
@@ -629,6 +661,20 @@ func envMapsEqual(a, b map[string]string) bool {
 	return true
 }
 
+// sortRunners orders runners by (Filename, replicaIndex). Filename is
+// the primary boot-order key; replicaIndex is the tiebreaker for
+// services declared with replicas > 1 so `zpctl status` shows
+// consumer/0 above consumer/1.
+func sortRunners(rs []*Runner) {
+	sort.Slice(rs, func(i, j int) bool {
+		a, b := rs[i], rs[j]
+		if a.Cfg().Filename != b.Cfg().Filename {
+			return a.Cfg().Filename < b.Cfg().Filename
+		}
+		return a.replicaIndex < b.replicaIndex
+	})
+}
+
 // servicesEqual compares two service configs ignoring Filename, which
 // is the diff key rather than a content field.
 func servicesEqual(a, b config.Service) bool {
@@ -646,17 +692,18 @@ func servicesEqual(a, b config.Service) bool {
 // would leak an unmanaged child under PID 1 with no zpctl handle.
 func (o *Orchestrator) removeService(ctx context.Context, r *Runner) error {
 	cfg := r.Cfg()
-	o.log.Info("reload: removing", "service", cfg.Name)
+	name := r.DisplayName()
+	o.log.Info("reload: removing", "service", name)
 
 	// Stop with a bounded ctx so we don't get stuck if the runner is
 	// already wedged. The grace beyond StopTimeout matches stopAll.
 	wctx, cancel := context.WithTimeout(ctx, cfg.StopTimeout.Std()+reapGrace)
 	defer cancel()
 	if err := r.StopCtx(wctx); err != nil {
-		return fmt.Errorf("%s: stop send: %w", cfg.Name, err)
+		return fmt.Errorf("%s: stop send: %w", name, err)
 	}
 	if _, err := r.WaitTerminal(wctx); err != nil {
-		return fmt.Errorf("%s did not terminate within stop_timeout (state=%s): %w", cfg.Name, r.State(), err)
+		return fmt.Errorf("%s did not terminate within stop_timeout (state=%s): %w", name, r.State(), err)
 	}
 
 	// Cancel the runner's Run goroutine so it exits and the Runner

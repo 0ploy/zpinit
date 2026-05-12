@@ -3,3 +3,4 @@
 *.out
 *.prof
 .DS_Store
+PLAN*.md

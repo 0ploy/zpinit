@@ -1,24 +1,36 @@
 # zpinit
 
-A single static Go binary that runs as PID 1 in your Docker container.
-The same binary covers all three use cases:
+> One static Go binary that runs as PID 1 in your Docker container.
+> Replaces:
+> 
+> - **tini**
+> - **`docker-entrypoint.sh`**
+> - **supervisord**
+> - **PM2**
+> 
+> ~3 MB, no Python, no runtime dependencies.
 
-1. [**Single Process Mode**](#single-process-mode) (replaces **tini**)
-2. [**Setup, then Run Mode**](#setup-then-run-mode) (replaces **`docker-entrypoint.sh`**)
-3. [**Manage Services Mode**](#manage-services-mode) (replaces **supervisord**)
+![zpinit: run containers the way you want. Three Docker use cases, one binary.](docs/modes.jpg)
 
-![zpinit: run containers the way you want. Three Docker use cases, one binary.](docs/modes.png)
+## What zpinit solves
 
-## Try it out in Manage Service Mode
+Every container image needs the same three pieces of plumbing:
+
+- **A zombie reaper** so orphans don't pile up under PID 1. Today
+  that's tini, dumb-init, or hope.
+- **A `docker-entrypoint.sh`** that runs migrations, fixes permissions,
+  renders config from env, then `exec`s the real CMD.
+- **A process supervisor** for images that run more than one thing
+  (php-fpm + nginx, redis + worker). Today that's supervisord (~30-50 MB 
+  of Python), or PM2 in front of Node.
+
+Three tools, three config formats, three mental models. zpinit folds all three jobs into one static binary with one TOML schema.
+
+## Try it in 30 seconds
 
 ```sh
 docker run -tid --name zpinit ghcr.io/0ploy/zpinit
-```
 
-The published image runs zpinit as PID 1 with no services. The control
-socket is up, `zpctl` works, and the container stays alive. Now install 
-and configure nginx:
-```sh
 docker exec -it zpinit bash
 
 apk add --no-cache nginx
@@ -30,142 +42,114 @@ EOF
 
 zpctl reread       # diff preview
 zpctl update       # apply
-zpctl status
+zpctl status       # nginx -- RUNNING
 
 curl -I http://localhost
 ```
 
-Same workflow for every other mode below: bake the config into your own
-image once you've got the service files you want.
+The published image runs zpinit as PID 1 with no services configured:
+the control socket is up, `zpctl` works, and the container stays alive.
+Once your service set is right, bake the TOML into your own image.
 
-## 1. Single Process Mode
+## The three modes
 
-**When to use it.** Your image runs one well-behaved workload (a Go
-server, a long-running CLI) and you don't need any setup
-work before it starts.
+zpinit detects the mode from your CMD at startup. Same binary, three
+behaviors, no flags.
 
-**What zpinit does.** Validates config, then `syscall.Exec`s your CMD.
-The CMD takes over as PID 1; zpinit is gone after the exec. (If your
-workload doesn't reap its own children and you need that, use [Manage
-Services Mode](#manage-services-mode) with one entry instead. Then
-zpinit stays as PID 1 and reaps for you.)
+| Mode                                            | When zpinit picks it          | Replaces                |
+| ----------------------------------------------- | ----------------------------- | ----------------------- |
+| [1. Single Process](#1-single-process-mode)     | CMD provided, no setup needed | tini                    |
+| [2. Setup, then Run](#2-setup-then-run-mode)    | CMD provided, `entrypoint.d/` populated | `docker-entrypoint.sh` |
+| [3. Manage Services](#3-manage-services-mode)   | No CMD, `services/` populated | supervisord, PM2        |
 
-**Why zpinit here?** You want to inject Environment Variables into the CMD 
-instead of the whole Container. Via `[env]` in `zpinit.toml` these variables 
-will not been seen by `docker exec` but are available for the CMD itself.
+### 1. Single Process Mode
 
-Example Dockerfile:
+zpinit validates config, then `syscall.Exec`s your CMD. The CMD takes
+over as PID 1; zpinit is gone after the exec.
+
+*Example Dockerfile:*
 ```dockerfile
 FROM alpine:latest
-
 COPY --from=ghcr.io/0ploy/zpinit:latest /usr/local/bin/zpinit /usr/local/bin/
 COPY zpinit.toml /etc/zpinit/zpinit.toml
 COPY my-app /usr/local/bin/
-
 ENTRYPOINT ["zpinit"]
 CMD ["my-app", "--port", "8080"]
 ```
-Example `[env]` section in `/etc/zpinit/zpinit.toml`:
+
+Why use zpinit here at all? You want env vars baked into the image
+(via `[env]` in `zpinit.toml`) that travel via the spawn path: visible
+to the CMD, **not** visible to `docker exec`. Useful for build-time
+defaults you want shielded from interactive shells.
+
+*Example `/etc/zpinit/zpinit.toml`:*
 ```toml
 [env]
 API_KEY   = "xxxxxxxxxxxxx"
 LOG_LEVEL = "info"
 ```
-See [docs/configuration.md](docs/configuration.md) and [docs/security.md](docs/security.md) for details about this.
 
-## 2. Setup, then Run Mode
+If your workload doesn't reap its own children, use
+[Manage Services Mode](#3-manage-services-mode) with one entry instead:
+zpinit stays as PID 1 and reaps for you.
 
-**When to use it.** You need preparation work before the workload
-starts: render config from env, apply migrations, fix permissions, warm
-a cache. Today this lives in a `docker-entrypoint.sh` that ends with
-`exec "$@"`. zpinit replaces that script.
+### 2. Setup, then Run Mode
 
-**What zpinit does.** Runs every executable (or script) in `/etc/zpinit/entrypoint.d/`
-in lexicographic order, drains any zombies they leave behind, then
-`syscall.Exec`s your CMD. A non-zero exit from a script aborts the
-container (or continues, with `entrypoint_on_failure = "continue"`).
+zpinit runs every executable in `/etc/zpinit/entrypoint.d/` in
+lexicographic order (each with `entrypoint_script_timeout` applied),
+drains zombies between steps, then `syscall.Exec`s your CMD. A
+non-zero exit aborts boot unless `entrypoint_on_failure = "continue"`.
 
-**Why zpinit here?** A hand-rolled docker-entrypoint.sh reinvents the same plumbing in every image: `set -e`,
-signal traps, `exec "$@"`, ad-hoc timeouts etc. zpinit replaces that file with a
-directory of small executables in any language. Each script gets a per-step timeout (a stuck `composer
-install` hits its own deadline instead of hanging container boot), zombies left behind by sub-shells are
-drained between steps, and `entrypoint_on_failure = "continue"` marks a step non-critical without
-re-implementing skip logic per script. The `[env]` injection from mode 1 still applies, plus scripts can
-write to `/run/zpinit/env` to hand variables forward to the next script or the CMD.
-
-Example Dockerfile:
+*Example Dockerfile:*
 ```dockerfile
 FROM node:20-alpine
-
 WORKDIR /app
-
 COPY --from=ghcr.io/0ploy/zpinit:latest /usr/local/bin/zpinit /usr/local/bin/
-COPY entrypoint.d/ /etc/zpinit/entrypoint.d/
-
+COPY entrypoint.d/  /etc/zpinit/entrypoint.d/
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-
-COPY dist/    ./dist/
-COPY drizzle/ ./drizzle/
-
+COPY dist/ ./dist/
 ENTRYPOINT ["zpinit"]
 CMD ["node", "./dist/server.js"]
 ```
 
-Example `entrypoint.d/10-drizzle-migrate.sh`:
-```bash
+*Example `entrypoint.d/10-migrate.sh`:*
+```sh
 #!/bin/sh
 set -eu
-
-: "${DATABASE_URL:?DATABASE_URL must be set}"
-
-echo "applying drizzle migrations..."
 node ./dist/migrate.js
-echo "migrations done."
 ```
-A setup script is just an executable. Any language with a shebang works. Files have to be executable. Non-executable files are skipped at
-runtime and surfaced as a warning by `--check-config`. Files starting
-with `.` or ending in `.disabled` are ignored.
 
-## 3. Manage Services Mode
+Each script is a regular executable in any language with a shebang.
+They run sequentially in filename order; the next one (and the CMD)
+won't start until the previous exits 0. Scripts can write `key=value`
+lines to `/run/zpinit/env` to propagate variables to later scripts or
+the CMD. Files starting with `.` or ending in `.disabled` are skipped
+silently; non-executable files are skipped at runtime and surfaced as
+a warning by `--check-config`.
 
-**When to use it.** Your image runs multiple processes. Today this is supervisord plus tini in front.
+### 3. Manage Services Mode
 
-**What zpinit does.** Reads `/etc/zpinit/services/*.toml`, starts each
-service in filename order, and uses readiness probes to gate the next
-service's start. zpinit stays around as PID 1: it reaps, restarts on
-crash with backoff, applies config reloads, and handles graceful
-shutdown.
+zpinit reads `/etc/zpinit/services/*.toml`, starts each service in
+filename order, uses readiness probes to gate the next start, and
+stays as PID 1: it reaps, restarts on crash with capped-exponential
+backoff, applies live config reloads, and handles graceful shutdown.
 
-**Why zpinit here?** supervisord drags 80 MB of Python into every image and isn't real PID 1; it still
-wants tini in front to reap orphans. zpinit is one ~3 MB Go binary that does both jobs, with the same
-TOML schema you saw in modes 1 and 2 — one mental model across every image in the fleet. Boot ordering
-is declarative (filename order + readiness probes gate the next service's start), no priority plus
-pre-start sleeps to fake it.
-
-Example Dokcerfile:
+*Example Dockerfile:*
 ```dockerfile
 FROM ubuntu:24.04
-
 RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      nginx \
-      php8.4-fpm \
-  && rm -rf /var/lib/apt/lists/*
-
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    nginx php8.4-fpm \
+ && rm -rf /var/lib/apt/lists/*
 COPY --from=ghcr.io/0ploy/zpinit:latest /usr/local/bin/zpinit /usr/local/bin/
 COPY --from=ghcr.io/0ploy/zpinit:latest /usr/local/bin/zpctl  /usr/local/bin/
-
 COPY services/ /etc/zpinit/services/
-
 EXPOSE 80
 ENTRYPOINT ["zpinit"]
 # No CMD: supervise mode.
 ```
-The Dockerfile has **no `CMD`**. CMD wins over services, so adding one
-puts you back in wrap mode and `services/` is ignored.
-
-Exmaple `services/10_php-fpm.toml`:
+*Example `services/10_php-fpm.toml`:*
 ```toml
 command = ["/usr/sbin/php-fpm8.3", "-F"]
 restart = "always"
@@ -174,70 +158,103 @@ restart = "always"
 command  = ["sh", "-c", "test -S /run/php/php8.3-fpm.sock"]
 interval = "200ms"
 timeout  = "10s"
+```
+
+`[ready]` is optional; without it, a service is "ready" the instant it
+spawns. `[log]` redirects fds at spawn time. Default `inherit` writes
+to the container's stdout/stderr (the right answer for almost
+everything); a file path is opened with `O_APPEND|O_NOFOLLOW`.
+
+**Reload without restart.** `SIGHUP` or `zpctl update` re-reads the
+config dir, diffs against the running set, and applies adds, removes,
+and restarts (per-service `reloadable = false` opts out). `zpctl
+reread` previews the diff without applying.
+
+See [docs/configuration.md](docs/configuration.md) for the full TOML
+schema: env precedence, `cwd`, `user`/`group`, backoff tuning, stop
+signals, and per-service `[env]`.
+
+#### 3.1 Node.js Clustering (replaces PM2)
+
+Add `replicas = N` to any service to run N supervised copies of the
+same command. Each replica is a first-class child with its own PID,
+log file, crash budget, and `zpctl` row. For listener workloads, the
+app opts into kernel-level port sharing via `reusePort: true`, and the
+kernel load-balances connections across the replicas. No master
+process, no daemon-of-daemons.
+
+*Example `services/30_api.toml`:*
+
+```toml
+command = ["node", "/app/server.js"]
+replicas = 4
 
 [log]
-stdout = "/var/log/zpinit/php-fpm.out.log"
-stderr = "/var/log/zpinit/php-fpm.err.log"
-```
-`[ready]` is an optional probe block on a service. zpinit runs the command on a loop every `interval` for a maximm time of `timeout` after starting the
-service and treats the service as "ready" the first time it exits 0. The next service in filename order
-doesn't start until then. If `[ready]` is omitted, the service is ready the instant it spawns (no gating).
-
-`[log]` redirects the service's stdout/stderr fds at spawn time. `inherit` (the default, used by nginx
-above) hands them to the container's own stdout/stderr - what your docker/k8s log collector wants. A
-path opens the file with `O_APPEND|O_NOFOLLOW` and the service writes directly, no pipe in zpinit's data
-path. File-logged services are inspectable live with `zpctl tail php-fpm`.
-
-Example `services/20_nginx.toml`
-```toml
-command = ["/usr/sbin/nginx", "-g", "daemon off;"]
-restart = "always"
+stdout = "/var/log/api.log"            # all 4 replicas share this file
+# stdout = "/var/log/api-{index}.log"  # opt-in: api-0.log .. api-3.log
 ```
 
-**Reload without restart.** `SIGHUP` (or `zpctl update`) re-reads
-`/etc/zpinit/`, diffs against the running set, and applies:
+*Example `app/server.js`:*
+```js
+// requires Node.js 22.12.0+
+server.listen({
+  port: 3000,
+  reusePort: true,  // ← required: lets all replicas share this port
+});
+```
 
-- New file: start the new service.
-- Removed file: graceful stop.
-- Changed content: restart (unless `reloadable = false`).
-- Renamed file: remove + add.
+Without `reusePort: true`, only the first replica binds the port; the
+rest crash with `EADDRINUSE` and the supervisor loops them to FATAL.
+`zpinit --doctor` catches the most common cause (Node below 22.12.0
+with `replicas > 1`) pre-boot.
 
-`zpctl reread` previews the diff without applying.
+See [docs/clustering.md](docs/clustering.md) for the full PM2
+comparison table, per-runtime examples (Node, Bun, Deno, Python, Go),
+migration guide, and the rolling-reload caveat.
 
-**Validate before deploying.**
+## Operator commands (zpctl)
+
+`zpctl` talks to zpinit over `/run/zpinit.sock` (bound `0600`, gated by
+`SO_PEERCRED`: only processes running as the daemon's UID can issue
+commands; non-root services in the same container cannot). State names
+match supervisorctl exactly.
 
 ```sh
-zpinit --check-config /etc/zpinit/
-```
-
-Loads everything, applies defaults, validates, and either prints an OK
-summary or every error in one pass. Exit 0 / 1.
-
-**Operator commands.** `zpctl` talks to zpinit over `/run/zpinit.sock`.
-The socket is bound `0600` and gated by `SO_PEERCRED`: only processes
-running as the daemon's UID (root in a normal container) can issue
-commands. Non-root services in the same container cannot use zpctl.
-State names match supervisorctl exactly so existing muscle memory
-transfers.
-
-```sh
-zpctl status [service]           # all services, or one
-zpctl start | stop | restart [svc]
-zpctl signal redis HUP           # nginx-style "reload your own config"
-zpctl pid [service]              # zpinit's PID, or the service's
-zpctl tail redis                 # snapshot of file-logged stdout
-zpctl update                     # apply config changes (= SIGHUP)
-zpctl reread                     # dry-run config diff
+zpctl status [NAME[/N]...]    # list states; NAME/N for one replica
+zpctl start | stop | restart NAME[/N] | all
+zpctl signal NAME[/N] HUP     # arbitrary signal (e.g. nginx reload)
+zpctl pid [NAME[/N]]          # zpinit's PID, or a service replica's
+zpctl tail NAME[/N]           # last 8KB of file-logged stdout
+zpctl update                  # apply config changes (= SIGHUP)
+zpctl reread                  # dry-run config diff
 zpctl shutdown
 zpctl help
 ```
 
+## Validate before deploy
+
+```sh
+zpinit --check-config /etc/zpinit/   # TOML + schema validation
+zpinit --doctor       /etc/zpinit/   # superset: binaries, runtimes, live state
+```
+
+`--check-config` parses everything, applies defaults, validates, and
+either prints a one-line OK or every error in a single pass.
+
+`--doctor` extends `--check-config` with runtime checks: it resolves
+each `command[0]` on PATH (or as an absolute path), surfaces runtime
+versions, warns when a node service has `replicas > 1` with Node below
+22.12.0 (the [clustering EADDRINUSE](docs/clustering.md) case), and
+reports whether a zpinit instance is already attached to the control
+socket. Exit 0 on green, 1 on FAIL, 2 on WARN-only.
+
 ## Learn more
 
-- [docs/why.md](docs/why.md): why we built this, design decisions, philosophy, non-goals.
-- [docs/configuration.md](docs/configuration.md): full config schema (env, cwd, user/group, logs, backoff, stop signals, defaults).
-- [docs/architecture.md](docs/architecture.md): packages, state machine, internals.
-- [docs/security.md](docs/security.md): security considerations.
+- [docs/why.md](docs/why.md): motivation, design decisions, non-goals.
+- [docs/configuration.md](docs/configuration.md): full TOML schema and validation rules.
+- [docs/clustering.md](docs/clustering.md): replicas, reusePort, PM2 comparison and migration.
+- [docs/architecture.md](docs/architecture.md): packages, state machine, reload internals.
+- [docs/security.md](docs/security.md): threat model, control socket, env injection.
 - [docs/development.md](docs/development.md): build, test, contribute.
 
 ## License

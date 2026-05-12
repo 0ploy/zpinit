@@ -164,7 +164,15 @@ func nameFromFilename(filename string) string {
 	return prefixStrip.ReplaceAllString(base, "")
 }
 
+// MaxReplicas caps Replicas. The cap prevents accidental fork-bombs
+// from typos (replicas = 1000); 64 is generous for any real workload
+// zpinit targets. Promote to a config knob only if anyone asks.
+const MaxReplicas = 64
+
 func applyServiceDefaults(s *Service, g *Globals) {
+	if s.Replicas == 0 {
+		s.Replicas = 1
+	}
 	if s.Restart == "" {
 		s.Restart = RestartAlways
 	}
@@ -275,6 +283,12 @@ func validate(cfg *Config) error {
 		if _, ok := ParseSignal(s.StopSignal); !ok {
 			errs = append(errs, fmt.Sprintf("%s: stop_signal %q is not a recognised signal name", s.Filename, s.StopSignal))
 		}
+		if s.Replicas < 1 {
+			errs = append(errs, fmt.Sprintf("%s: replicas must be >= 1", s.Filename))
+		}
+		if s.Replicas > MaxReplicas {
+			errs = append(errs, fmt.Sprintf("%s: replicas must be <= %d (got %d)", s.Filename, MaxReplicas, s.Replicas))
+		}
 		if s.Ready != nil {
 			if len(s.Ready.Command) == 0 {
 				errs = append(errs, fmt.Sprintf("%s: [ready].command is required when [ready] is set", s.Filename))
@@ -290,6 +304,13 @@ func validate(cfg *Config) error {
 	if cfg.Globals.ExitCodeFrom != "default" {
 		if _, ok := nameToFile[cfg.Globals.ExitCodeFrom]; !ok {
 			errs = append(errs, fmt.Sprintf("exit_code_from = %q references unknown service", cfg.Globals.ExitCodeFrom))
+		} else {
+			for _, s := range cfg.Services {
+				if s.Name == cfg.Globals.ExitCodeFrom && s.Replicas > 1 {
+					errs = append(errs, fmt.Sprintf("exit_code_from = %q references a replicated service (replicas=%d); the combination is ambiguous", cfg.Globals.ExitCodeFrom, s.Replicas))
+					break
+				}
+			}
 		}
 	}
 

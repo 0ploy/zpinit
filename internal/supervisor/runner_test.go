@@ -66,7 +66,7 @@ func newFixture(t *testing.T, cfg config.Service) *testFixture {
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	f.runner = NewRunner(cfg, nil, spawn, f.clock, log)
+	f.runner = NewRunner(cfg, nil, 0, spawn, f.clock, log)
 	ch, cancel := f.runner.Observe()
 	f.states = ch
 	t.Cleanup(cancel)
@@ -486,6 +486,32 @@ func TestRunner_SpawnFailureIsRetried(t *testing.T) {
 	f.spawnErr = nil
 	f.clock.Advance(time.Second)
 	f.waitState(StateRunning, time.Second)
+}
+
+func TestRunner_DisplayName(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Single replica (Replicas=0 means "default 1" outside of validation;
+	// but the runner accepts a zero-value cfg, so test both 0 and 1).
+	rDefault := NewRunner(config.Service{Name: "api"}, nil, 0, nil, nil, log)
+	if got := rDefault.DisplayName(); got != "api" {
+		t.Errorf("DisplayName(default) = %q, want api", got)
+	}
+	r1 := NewRunner(config.Service{Name: "api", Replicas: 1}, nil, 0, nil, nil, log)
+	if got := r1.DisplayName(); got != "api" {
+		t.Errorf("DisplayName(replicas=1) = %q, want api", got)
+	}
+	// Multi-replica
+	r2a := NewRunner(config.Service{Name: "api", Replicas: 3}, nil, 0, nil, nil, log)
+	if got := r2a.DisplayName(); got != "api/0" {
+		t.Errorf("DisplayName(replicas=3,idx=0) = %q, want api/0", got)
+	}
+	r2b := NewRunner(config.Service{Name: "api", Replicas: 3}, nil, 2, nil, nil, log)
+	if got := r2b.DisplayName(); got != "api/2" {
+		t.Errorf("DisplayName(replicas=3,idx=2) = %q, want api/2", got)
+	}
+	if got := r2b.ReplicaIndex(); got != 2 {
+		t.Errorf("ReplicaIndex = %d, want 2", got)
+	}
 }
 
 var errBoom = errBoomT{}

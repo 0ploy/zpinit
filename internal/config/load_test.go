@@ -392,6 +392,91 @@ func TestLoad_GlobalsEnvInvalidKey(t *testing.T) {
 	}
 }
 
+func TestLoad_ReplicasDefault(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `command = ["x"]`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Services[0].Replicas; got != 1 {
+		t.Errorf("default Replicas = %d, want 1", got)
+	}
+}
+
+func TestLoad_ReplicasExplicit(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `
+command = ["x"]
+replicas = 4
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Services[0].Replicas; got != 4 {
+		t.Errorf("Replicas = %d, want 4", got)
+	}
+}
+
+func TestLoad_ReplicasNegative(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `
+command = ["x"]
+replicas = -1
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for negative replicas")
+	}
+	if !strings.Contains(err.Error(), "replicas must be >= 1") {
+		t.Errorf("error should mention replicas >= 1: %v", err)
+	}
+}
+
+func TestLoad_ReplicasTooLarge(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `
+command = ["x"]
+replicas = 1000
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for too-large replicas")
+	}
+	if !strings.Contains(err.Error(), "replicas must be <= 64") {
+		t.Errorf("error should mention <= 64: %v", err)
+	}
+}
+
+func TestLoad_ExitCodeFromReplicatedConflict(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "zpinit.toml"), `exit_code_from = "worker"`)
+	write(t, filepath.Join(dir, "services", "10_worker.toml"), `
+command = ["x"]
+replicas = 3
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for exit_code_from + replicas")
+	}
+	if !strings.Contains(err.Error(), "replicated service") {
+		t.Errorf("error should mention replicated service: %v", err)
+	}
+}
+
+func TestLoad_ExitCodeFromSingleReplicaOK(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "zpinit.toml"), `exit_code_from = "worker"`)
+	write(t, filepath.Join(dir, "services", "10_worker.toml"), `
+command = ["x"]
+replicas = 1
+`)
+	if _, err := Load(dir); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+}
+
 // Load returns an error wrapping fs.ErrNotExist when the dir is
 // missing. Callers (notably cmd/zpinit/main.go) detect this with
 // errors.Is to permit wrap-mode-with-no-config; this test pins the

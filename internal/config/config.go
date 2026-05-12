@@ -78,6 +78,15 @@ type Service struct {
 	Env        map[string]string `toml:"env"`
 	Log        Logging           `toml:"log"`
 	Ready      *Ready            `toml:"ready"`
+
+	// Replicas is the number of independent copies of Command to
+	// supervise. Default 1. Each replica is a first-class Runner with
+	// its own PID, log file, and crash budget. ZPINIT_REPLICA_INDEX is
+	// injected into each replica's env when Replicas > 1. Replicas of
+	// an app that binds a port without SO_REUSEPORT support will
+	// conflict on EADDRINUSE; see the README's "Node.js clustering"
+	// section. `zpinit doctor` catches the common cases pre-boot.
+	Replicas int `toml:"replicas"`
 }
 
 // IsReloadable returns true unless the service explicitly set

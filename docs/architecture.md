@@ -125,3 +125,31 @@ Response framing escapes CR/LF and lone `.` body lines via
 `ctlproto.sanitizeLine`, so a tainted log line surfaced by
 `zpctl tail` (or a multi-line TOML parse error from `zpctl update`)
 can't end the body early or split a single field across lines.
+
+## Replicas: no cluster harness
+
+`replicas = N` on a service produces N first-class supervised Runners
+from one TOML file. The orchestrator's diff/reload layer keeps
+filename as the identity key (one TOML file = one logical service),
+but the in-memory runner set is the expansion: every replica has its
+own PID, log file, crash budget, and zpctl row.
+
+We deliberately did **not** ship a Node-side cluster harness (a daemon
+that forks N workers behind one listening socket). Modern Node (>=
+22.12.0), Bun (any 1.x), and Deno (any modern) expose `reusePort: true`
+on `listen()` natively; the kernel maintains a single `(addr, port)`
+group with N sockets and dispatches incoming SYNs by 4-tuple hash. No
+master process, no IPC, no shared listener. Each replica is
+independent. zpinit just spawns N copies; the runtime handles port
+sharing.
+
+This dropped a lot of complexity (no master goroutine, no FD passing,
+no per-runtime cluster shim) at the cost of `cluster.worker.id` /
+`process.send` IPC, which apps that hard-depend on Node's `cluster`
+module would need to refactor away from. For the workloads zpinit
+targets (PHP-CLI consumers, Sidekiq-style workers, plain HTTP servers
+with no cross-worker IPC) the trade is one-sided.
+
+`zpinit --doctor` covers the listener-floor case: it detects when any
+service declares `replicas > 1` while the node binary on PATH is below
+22.12.0 and emits a WARN naming the EADDRINUSE failure mode.

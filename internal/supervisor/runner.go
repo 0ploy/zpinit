@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -54,11 +55,29 @@ type command struct {
 // holds the only goroutine that mutates state; external State() and
 // PID() reads use the mutex.
 type Runner struct {
-	cfg     config.Service
+	// cfg is the per-replica config the Spawn uses: log paths are
+	// rewritten with the replica index for services with replicas > 1.
+	// For single-replica services cfg is identical to spec.
+	cfg config.Service
+	// spec is the unmodified TOML-loaded service spec (one per
+	// filename, shared across replicas). reload-diff comparisons use
+	// spec rather than cfg because cfg's rewritten log paths would
+	// otherwise make servicesEqual report a phantom change every
+	// reload for replicated services. Callers that surface log paths
+	// to the user (zpctl tail, log writer) want cfg; callers that
+	// reason about the service identity want spec.
+	spec    config.Service
 	baseEnv []string
 	spawn   Spawner
 	clock   Clock
 	log     *slog.Logger
+
+	// replicaIndex is 0 for single-replica services and 0..N-1 for
+	// services declared with replicas > 1. Used by DisplayName and by
+	// the orchestrator's secondary sort key. Stored on the Runner
+	// rather than re-derived from cfg because cfg.Replicas tells you
+	// the total but not which copy this Runner is.
+	replicaIndex int
 
 	cmds chan command
 
@@ -113,7 +132,9 @@ func (r *Runner) cancelRun() {
 
 // NewRunner constructs a Runner in state Pending. Caller must invoke
 // Run in a goroutine and then drive the lifecycle via Start/Stop.
-func NewRunner(cfg config.Service, baseEnv []string, spawn Spawner, clock Clock, log *slog.Logger) *Runner {
+// replicaIndex is 0 for single-copy services; for replicas > 1 the
+// orchestrator passes 0..N-1 from expandServiceToRunners.
+func NewRunner(cfg config.Service, baseEnv []string, replicaIndex int, spawn Spawner, clock Clock, log *slog.Logger) *Runner {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -121,14 +142,37 @@ func NewRunner(cfg config.Service, baseEnv []string, spawn Spawner, clock Clock,
 		clock = RealClock()
 	}
 	return &Runner{
-		cfg:     cfg,
-		baseEnv: baseEnv,
-		spawn:   spawn,
-		clock:   clock,
-		log:     log,
-		cmds:    make(chan command, 4),
-		state:   StatePending,
+		cfg:          cfg,
+		spec:         cfg,
+		baseEnv:      baseEnv,
+		replicaIndex: replicaIndex,
+		spawn:        spawn,
+		clock:        clock,
+		log:          log,
+		cmds:         make(chan command, 4),
+		state:        StatePending,
 	}
+}
+
+// Spec returns the unmodified service spec (the same content across
+// all replicas of a service). Used by the orchestrator's reload diff;
+// callers that need per-replica state (log paths) should use Cfg.
+func (r *Runner) Spec() config.Service { return r.spec }
+
+// ReplicaIndex returns this runner's 0-based replica index. 0 for
+// single-replica services.
+func (r *Runner) ReplicaIndex() int { return r.replicaIndex }
+
+// DisplayName returns the human-facing identifier: cfg.Name for
+// single-replica services, "<name>/<index>" for replicas > 1. Used
+// everywhere log lines and zpctl rows surface a runner identity.
+// TOML-level concepts like exit_code_from continue to use cfg.Name
+// (those reference the service spec, not a specific replica).
+func (r *Runner) DisplayName() string {
+	if r.cfg.Replicas <= 1 {
+		return r.cfg.Name
+	}
+	return r.cfg.Name + "/" + strconv.Itoa(r.replicaIndex)
 }
 
 // runnerTimers holds the two timer slots Run multiplexes on: backoff
@@ -417,7 +461,7 @@ func (r *Runner) setState(s State) {
 	if s == prev {
 		return
 	}
-	r.log.Info("state", "service", r.cfg.Name, "from", prev, "to", s)
+	r.log.Info("state", "service", r.DisplayName(), "from", prev, "to", s)
 	r.observersMu.Lock()
 	for _, ch := range r.observers {
 		select {
@@ -465,7 +509,7 @@ func (r *Runner) spawnNext(timers *runnerTimers) {
 	r.setState(StateStarting)
 	proc, err := r.spawn(r.cfg, r.baseEnv)
 	if err != nil {
-		r.log.Error("spawn failed", "service", r.cfg.Name, "err", err)
+		r.log.Error("spawn failed", "service", r.DisplayName(), "err", err)
 		r.recordFailure(timers)
 		return
 	}
@@ -530,12 +574,12 @@ func (r *Runner) recordFailure(timers *runnerTimers) {
 	crashes := r.crashes
 	r.mu.Unlock()
 	if crashes >= MaxConsecutiveCrashes {
-		r.log.Warn("retry budget exceeded; fatal", "service", r.cfg.Name, "crashes", crashes)
+		r.log.Warn("retry budget exceeded; fatal", "service", r.DisplayName(), "crashes", crashes)
 		r.setState(StateFatal)
 		return
 	}
 	delay := r.backoffStep()
-	r.log.Info("backoff", "service", r.cfg.Name, "delay", delay, "crashes", crashes)
+	r.log.Info("backoff", "service", r.DisplayName(), "delay", delay, "crashes", crashes)
 	timers.backoff = r.clock.NewTimer(delay)
 	r.setState(StateBackoff)
 }
@@ -577,7 +621,7 @@ func (r *Runner) handleStop(timers *runnerTimers) {
 		}
 		if p := r.currentProcess(); p != nil {
 			if err := p.SignalGroup(sig); err != nil {
-				r.log.Warn("SignalGroup failed", "service", r.cfg.Name, "err", err)
+				r.log.Warn("SignalGroup failed", "service", r.DisplayName(), "err", err)
 			}
 		}
 		r.setState(StateStopping)
@@ -613,8 +657,8 @@ func (r *Runner) handleStopKillTimeout() {
 		return
 	}
 	r.log.Warn("stop_timeout exceeded; escalating to SIGKILL",
-		"service", r.cfg.Name, "pid", p.PID(), "stop_timeout", r.cfg.StopTimeout.Std())
+		"service", r.DisplayName(), "pid", p.PID(), "stop_timeout", r.cfg.StopTimeout.Std())
 	if err := p.SignalGroup(syscall.SIGKILL); err != nil {
-		r.log.Error("SIGKILL failed", "service", r.cfg.Name, "err", err)
+		r.log.Error("SIGKILL failed", "service", r.DisplayName(), "err", err)
 	}
 }

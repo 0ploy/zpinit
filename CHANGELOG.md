@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **`replicas = N` runs N supervised copies of a service.** Set
+  `replicas = N` on any service in `services/*.toml` to run N
+  first-class supervised children of the same command. Each replica
+  has its own PID and crash budget, and shows up as `<name>/<index>`
+  in `zpctl status`. By default all replicas share the same log file
+  (Linux `O_APPEND` is atomic for line-sized writes, so they don't
+  tear); operators wanting per-replica files opt in via `{index}` in
+  the path (`/var/log/api-{index}.log` becomes `api-0.log`,
+  `api-1.log`, ...). Each replica sees `ZPINIT_REPLICA_INDEX` in env.
+  zpctl verbs take a `svc/N` form to target one replica
+  (`zpctl tail consumer/2`, `zpctl restart api/0`); the bare service
+  name fans out to all replicas. Listener workloads share a port via
+  `reusePort: true` in their `listen()` call (Node >= 22.12.0, Bun,
+  Deno); see the README's new "Node.js clustering" section for the
+  full table of trade-offs vs PM2 cluster mode.
+
+- **`zpinit --doctor` pre-flight environment audit.** New flag runs
+  a read-only superset of `--check-config`: confirms the config dir
+  layout, parses and validates every service, checks each
+  `command[0]` resolves on PATH (or via absolute path), warns when a
+  declared node service has `replicas > 1` and the node binary on
+  PATH is below 22.12.0 (the reusePort floor), surfaces Bun/Deno
+  versions when those runtimes are referenced, and reports whether a
+  zpinit instance is already attached to the control socket. Exit
+  code 0 on green (warnings allowed), 1 on any FAIL, 2 on WARN-only;
+  `--doctor-quiet` suppresses OK rows.
+
 ## v0.1.2
 
 ### Features

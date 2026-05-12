@@ -164,12 +164,13 @@ func (s *ControlServer) dispatchBudget(req *ctlproto.Request) time.Duration {
 	default:
 		targets = make([]*Runner, 0, len(req.Args))
 		for _, n := range req.Args {
-			for _, r := range snap {
-				if r.Cfg().Name == n {
-					targets = append(targets, r)
-					break
-				}
+			// Budget should reflect the actual targets; ignore
+			// resolution errors here and let dispatch surface them.
+			rs, err := resolveTarget(snap, n)
+			if err != nil {
+				continue
 			}
+			targets = append(targets, rs...)
 		}
 	}
 
@@ -236,38 +237,38 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 		switch action {
 		case "start":
 			if err := r.StartCtx(ctx); err != nil {
-				anyErr = fmt.Errorf("%s: start: %w", r.Cfg().Name, err)
-				resp.Body = append(resp.Body, fmt.Sprintf("%s: start failed: %v", r.Cfg().Name, err))
+				anyErr = fmt.Errorf("%s: start: %w", r.DisplayName(), err)
+				resp.Body = append(resp.Body, fmt.Sprintf("%s: start failed: %v", r.DisplayName(), err))
 				continue
 			}
 		case "stop":
 			if err := r.StopCtx(ctx); err != nil {
-				anyErr = fmt.Errorf("%s: stop: %w", r.Cfg().Name, err)
-				resp.Body = append(resp.Body, fmt.Sprintf("%s: stop failed: %v", r.Cfg().Name, err))
+				anyErr = fmt.Errorf("%s: stop: %w", r.DisplayName(), err)
+				resp.Body = append(resp.Body, fmt.Sprintf("%s: stop failed: %v", r.DisplayName(), err))
 				continue
 			}
 		case "restart":
 			if err := r.StopCtx(ctx); err != nil {
-				anyErr = fmt.Errorf("%s: restart-stop: %w", r.Cfg().Name, err)
-				resp.Body = append(resp.Body, fmt.Sprintf("%s: stop failed: %v", r.Cfg().Name, err))
+				anyErr = fmt.Errorf("%s: restart-stop: %w", r.DisplayName(), err)
+				resp.Body = append(resp.Body, fmt.Sprintf("%s: stop failed: %v", r.DisplayName(), err))
 				continue
 			}
 			waitCtx, cancel := context.WithTimeout(ctx, r.Cfg().StopTimeout.Std()+5*time.Second)
 			state, werr := r.WaitTerminal(waitCtx)
 			cancel()
 			if werr != nil {
-				anyErr = fmt.Errorf("%s: restart-wait: %w", r.Cfg().Name, werr)
+				anyErr = fmt.Errorf("%s: restart-wait: %w", r.DisplayName(), werr)
 				resp.Body = append(resp.Body,
-					fmt.Sprintf("%s: did not stop within timeout (state=%s); restart aborted", r.Cfg().Name, state))
+					fmt.Sprintf("%s: did not stop within timeout (state=%s); restart aborted", r.DisplayName(), state))
 				continue
 			}
 			if err := r.StartCtx(ctx); err != nil {
-				anyErr = fmt.Errorf("%s: restart-start: %w", r.Cfg().Name, err)
-				resp.Body = append(resp.Body, fmt.Sprintf("%s: start failed: %v", r.Cfg().Name, err))
+				anyErr = fmt.Errorf("%s: restart-start: %w", r.DisplayName(), err)
+				resp.Body = append(resp.Body, fmt.Sprintf("%s: start failed: %v", r.DisplayName(), err))
 				continue
 			}
 		}
-		resp.Body = append(resp.Body, fmt.Sprintf("%s: %s", r.Cfg().Name, action))
+		resp.Body = append(resp.Body, fmt.Sprintf("%s: %s", r.DisplayName(), action))
 	}
 	if anyErr != nil {
 		resp.Code = 1
@@ -280,11 +281,14 @@ func (s *ControlServer) cmdPID(args []string) *ctlproto.Response {
 	if len(args) == 0 {
 		return okBody("ok", []string{strconv.Itoa(os.Getpid())})
 	}
-	r := s.orch.findRunner(args[0])
-	if r == nil {
-		return errResp("unknown service: " + args[0])
+	rs, err := resolveTarget(s.orch.snapshotRunners(), args[0])
+	if err != nil {
+		return errResp(err.Error())
 	}
-	return okBody("ok", []string{strconv.Itoa(r.PID())})
+	if len(rs) > 1 {
+		return errResp(fmt.Sprintf("%s has %d replicas; specify which one: pid %s/N", args[0], len(rs), args[0]))
+	}
+	return okBody("ok", []string{strconv.Itoa(rs[0].PID())})
 }
 
 func (s *ControlServer) cmdUpdate(ctx context.Context) *ctlproto.Response {
@@ -315,17 +319,20 @@ func (s *ControlServer) cmdReread() *ctlproto.Response {
 
 // diffResp renders a reload diff into a response body using
 // caller-supplied verb phrases. cmdReread uses future tense
-// ("will stop"), cmdUpdate uses past tense ("stopped").
+// ("will stop"), cmdUpdate uses past tense ("stopped"). Replicated
+// services list each replica on its own remove line but collapse
+// add/restart into a single line per service (with a "(N replicas)"
+// suffix) so the operator sees the spec-level shape of the change.
 func diffResp(diff reloadDiff, stopVerb, restartVerb, startVerb, emptyMsg string) *ctlproto.Response {
 	resp := okResp("ok")
 	for _, r := range diff.remove {
-		resp.Body = append(resp.Body, fmt.Sprintf("- %s (%s)", r.Cfg().Name, stopVerb))
+		resp.Body = append(resp.Body, fmt.Sprintf("- %s (%s)", r.DisplayName(), stopVerb))
 	}
 	for _, p := range diff.restart {
-		resp.Body = append(resp.Body, fmt.Sprintf("~ %s (%s)", p.new.Name, restartVerb))
+		resp.Body = append(resp.Body, fmt.Sprintf("~ %s (%s)", p.new.Name, restartVerb)+replicaSuffix(p.new.Replicas))
 	}
 	for _, svc := range diff.add {
-		resp.Body = append(resp.Body, fmt.Sprintf("+ %s (%s)", svc.Name, startVerb))
+		resp.Body = append(resp.Body, fmt.Sprintf("+ %s (%s)", svc.Name, startVerb)+replicaSuffix(svc.Replicas))
 	}
 	if len(resp.Body) == 0 {
 		resp.Body = []string{emptyMsg}
@@ -333,18 +340,29 @@ func diffResp(diff reloadDiff, stopVerb, restartVerb, startVerb, emptyMsg string
 	return resp
 }
 
+func replicaSuffix(n int) string {
+	if n <= 1 {
+		return ""
+	}
+	return fmt.Sprintf(" [%d replicas]", n)
+}
+
 func (s *ControlServer) cmdTail(args []string) *ctlproto.Response {
 	if len(args) != 1 {
-		return errResp("usage: tail NAME")
+		return errResp("usage: tail NAME[/N]")
 	}
 	name := args[0]
-	r := s.orch.findRunner(name)
-	if r == nil {
-		return errResp("unknown service: " + name)
+	rs, err := resolveTarget(s.orch.snapshotRunners(), name)
+	if err != nil {
+		return errResp(err.Error())
 	}
+	if len(rs) > 1 {
+		return errResp(fmt.Sprintf("%s has %d replicas; specify which one: tail %s/N", name, len(rs), name))
+	}
+	r := rs[0]
 	cfg := r.Cfg()
 	if cfg.Log.Stdout == "" || cfg.Log.Stdout == "inherit" {
-		return errResp(fmt.Sprintf("%s logs to stdout (no file to tail)", name))
+		return errResp(fmt.Sprintf("%s logs to stdout (no file to tail)", r.DisplayName()))
 	}
 	body, err := readLastBytes(cfg.Log.Stdout, 8192)
 	if err != nil {
@@ -366,39 +384,68 @@ func (s *ControlServer) cmdShutdown() *ctlproto.Response {
 
 func (s *ControlServer) cmdSignal(args []string) *ctlproto.Response {
 	if len(args) != 2 {
-		return errResp("usage: signal NAME SIG")
+		return errResp("usage: signal NAME[/N] SIG")
 	}
-	r := s.orch.findRunner(args[0])
-	if r == nil {
-		return errResp("unknown service: " + args[0])
+	rs, err := resolveTarget(s.orch.snapshotRunners(), args[0])
+	if err != nil {
+		return errResp(err.Error())
 	}
 	sig, ok := config.ParseSignal(args[1])
 	if !ok {
 		return errResp("unknown signal: " + args[1])
 	}
-	if err := r.SignalGroup(sig); err != nil {
-		return errResp(err.Error())
+	resp := okResp("ok")
+	var anyErr error
+	for _, r := range rs {
+		if err := r.SignalGroup(sig); err != nil {
+			anyErr = fmt.Errorf("%s: %w", r.DisplayName(), err)
+			resp.Body = append(resp.Body, fmt.Sprintf("%s: %v", r.DisplayName(), err))
+			continue
+		}
+		// Only surface per-replica lines when fanning out; the
+		// single-target case keeps the historical "ok" with no body.
+		if len(rs) > 1 {
+			resp.Body = append(resp.Body, fmt.Sprintf("%s: signaled", r.DisplayName()))
+		}
 	}
-	return okResp("ok")
+	if anyErr != nil {
+		resp.Code = 1
+		resp.Msg = anyErr.Error()
+	}
+	return resp
 }
 
 func (s *ControlServer) cmdHelp() *ctlproto.Response {
 	return okBody("ok", []string{
-		"status [NAME...]    list service states (no args = all)",
-		"start NAME...       start service(s); 'all' for everything",
-		"stop NAME...        stop service(s); 'all' for everything",
-		"restart NAME...     stop then start; 'all' for everything",
-		"pid [NAME]          PID of zpinit (no arg) or service",
-		"update              reload config and apply (= SIGHUP)",
-		"reload              alias for update (note: differs from supervisord's reload)",
-		"reread              dry-run config diff",
-		"tail NAME           dump last 8KB of file-logged stdout (snapshot only)",
-		"signal NAME SIG     send arbitrary signal to service's process group",
-		"shutdown            stop supervisor and exit",
-		"help                this list",
+		"status [NAME...]      list service states (no args = all)",
+		"start NAME[/N]...     start service(s); 'all' for everything",
+		"stop NAME[/N]...      stop service(s); 'all' for everything",
+		"restart NAME[/N]...   stop then start; 'all' for everything",
+		"pid [NAME[/N]]        PID of zpinit (no arg) or service replica",
+		"update                reload config and apply (= SIGHUP)",
+		"reload                alias for update (note: differs from supervisord's reload)",
+		"reread                dry-run config diff",
+		"tail NAME[/N]         dump last 8KB of file-logged stdout (snapshot only)",
+		"signal NAME[/N] SIG   send arbitrary signal to service's process group",
+		"shutdown              stop supervisor and exit",
+		"help                  this list",
+		"",
+		"NAME refers to a service; for services declared with replicas > 1,",
+		"NAME selects every replica and NAME/N selects replica N (0..replicas-1).",
 	})
 }
 
+// expandTargets resolves a list of zpctl args into the runners they
+// refer to. Args may be:
+//
+//	"all"   - every runner (only valid as the sole arg)
+//	"svc"   - every replica of svc (one runner if svc.Replicas <= 1)
+//	"svc/N" - exactly replica N of svc; rejected if svc has only one
+//	          replica or N is out of range
+//
+// Order is preserved across args; within a "svc" expansion, replicas
+// appear in 0..N-1 order (the orchestrator already sorts runners that
+// way).
 func (s *ControlServer) expandTargets(args []string, allOnEmpty bool) ([]*Runner, error) {
 	snap := s.orch.snapshotRunners()
 	if len(args) == 0 {
@@ -412,26 +459,59 @@ func (s *ControlServer) expandTargets(args []string, allOnEmpty bool) ([]*Runner
 	}
 	out := make([]*Runner, 0, len(args))
 	for _, n := range args {
-		var found *Runner
+		rs, err := resolveTarget(snap, n)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rs...)
+	}
+	return out, nil
+}
+
+// resolveTarget interprets a single zpctl arg ("svc" or "svc/N")
+// against the runner snapshot and returns the matching runners.
+// Returns an error on unknown names or out-of-range replica indices.
+func resolveTarget(snap []*Runner, arg string) ([]*Runner, error) {
+	name, replicaArg, hasSlash := strings.Cut(arg, "/")
+	if hasSlash {
+		idx, err := strconv.Atoi(replicaArg)
+		if err != nil {
+			return nil, fmt.Errorf("invalid replica index %q in %q", replicaArg, arg)
+		}
 		for _, r := range snap {
-			if r.Cfg().Name == n {
-				found = r
-				break
+			if r.Cfg().Name == name && r.ReplicaIndex() == idx {
+				return []*Runner{r}, nil
 			}
 		}
-		if found == nil {
-			return nil, fmt.Errorf("unknown service: %s", n)
+		// Distinguish "unknown service name" from "name found but
+		// index out of range" so operators get a useful error.
+		var total int
+		for _, r := range snap {
+			if r.Cfg().Name == name {
+				total++
+			}
 		}
-		out = append(out, found)
+		if total == 0 {
+			return nil, fmt.Errorf("unknown service: %s", name)
+		}
+		return nil, fmt.Errorf("replica %d out of range for %s (has %d replica(s), valid 0..%d)", idx, name, total, total-1)
+	}
+	var out []*Runner
+	for _, r := range snap {
+		if r.Cfg().Name == name {
+			out = append(out, r)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("unknown service: %s", arg)
 	}
 	return out, nil
 }
 
 func formatStatusLine(r *Runner) string {
-	cfg := r.Cfg()
 	state := mapToSupervisordState(r.State(), r.StoppedManually())
 	detail := stateDetail(r)
-	return fmt.Sprintf("%-32s %-9s %s", cfg.Name, state, detail)
+	return fmt.Sprintf("%-32s %-9s %s", r.DisplayName(), state, detail)
 }
 
 func mapToSupervisordState(s State, manualStop bool) string {

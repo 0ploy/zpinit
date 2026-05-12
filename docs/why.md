@@ -15,9 +15,6 @@ supervisord drags ~30-50 MB of Python into every image and isn't even
 real PID 1 (it still wants tini in front). The entrypoint script is
 bespoke per image and grows organically until nobody trusts it.
 
-Updating any of them across our fleet of 130+ shop images is days of
-work and zero confidence.
-
 zpinit folds all three into one Go binary. Same supervisor in every
 image, same config shape, same operator commands, ~3 MB.
 
