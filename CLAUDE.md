@@ -22,8 +22,13 @@ decisions). Per-phase implementation rationale lives in commit history;
 
 **CMD wins over services.** When a CMD is supplied (i.e. `flag.Args()`
 non-empty after zpinit parses its own flags), zpinit `syscall.Exec`s it as
-PID 1 and ignores `services/` entirely. Same image gets three modes from
-this rule alone: production (no CMD → supervise), debug
+PID 1 and ignores `services/` entirely. No CMD → supervise mode, even
+when `services/` is empty: the orchestrator boots zero runners, the
+control socket comes up, and an operator can add services live via
+`zpctl reread` or SIGHUP. This is what makes the published image a
+playground (`docker run -it ghcr.io/0ploy/zpinit`) and is why
+`detectMode` has only two outcomes. Same image gets three modes from
+this rule: production (no CMD → supervise), debug
 (`docker run image bash` → wrap), one-off task
 (`docker run image php cli …` → wrap). Never re-add a "supervise + main
 task" combined mode; express foreground workers as a service with

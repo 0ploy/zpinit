@@ -9,6 +9,35 @@ The same binary covers all three use cases:
 
 ![zpinit: run containers the way you want. Three Docker use cases, one binary.](docs/modes.png)
 
+## Try it out in Manage Service Mode
+
+```sh
+docker run -tid --name zpinit ghcr.io/0ploy/zpinit
+```
+
+The published image runs zpinit as PID 1 with no services. The control
+socket is up, `zpctl` works, and the container stays alive. Now install 
+and configure nginx:
+```sh
+docker exec -it zpinit bash
+
+apk add --no-cache nginx
+
+cat > /etc/zpinit/services/10_nginx.toml <<'EOF'
+command = ["/usr/sbin/nginx", "-g", "daemon off;"]
+restart = "always"
+EOF
+
+zpctl reread       # diff preview
+zpctl update       # apply
+zpctl status
+
+curl -I http://localhost
+```
+
+Same workflow for every other mode below: bake the config into your own
+image once you've got the service files you want.
+
 ## 1. Single Process Mode
 
 **When to use it.** Your image runs one well-behaved workload (a Go

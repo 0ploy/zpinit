@@ -292,10 +292,16 @@ func (s *ControlServer) cmdUpdate(ctx context.Context) *ctlproto.Response {
 	if err != nil {
 		return errResp("load: " + err.Error())
 	}
+	// Snapshot the diff before Reload applies it so the client sees
+	// exactly what was acted on. The window between this computeDiff
+	// and Reload's internal computeDiffLocked is the same window
+	// cmdReread already has against any subsequent Reload — i.e.
+	// vanishingly small and benign.
+	diff := s.orch.computeDiff(newCfg)
 	if err := s.orch.Reload(ctx, newCfg); err != nil {
 		return errResp("reload: " + err.Error())
 	}
-	return okResp("ok")
+	return diffResp(diff, "stopped", "restarted", "started", "no changes")
 }
 
 func (s *ControlServer) cmdReread() *ctlproto.Response {
@@ -304,18 +310,25 @@ func (s *ControlServer) cmdReread() *ctlproto.Response {
 		return errResp("load: " + err.Error())
 	}
 	diff := s.orch.computeDiff(newCfg)
+	return diffResp(diff, "will stop", "will restart", "will start", "no changes")
+}
+
+// diffResp renders a reload diff into a response body using
+// caller-supplied verb phrases. cmdReread uses future tense
+// ("will stop"), cmdUpdate uses past tense ("stopped").
+func diffResp(diff reloadDiff, stopVerb, restartVerb, startVerb, emptyMsg string) *ctlproto.Response {
 	resp := okResp("ok")
 	for _, r := range diff.remove {
-		resp.Body = append(resp.Body, fmt.Sprintf("- %s (will stop)", r.Cfg().Name))
+		resp.Body = append(resp.Body, fmt.Sprintf("- %s (%s)", r.Cfg().Name, stopVerb))
 	}
 	for _, p := range diff.restart {
-		resp.Body = append(resp.Body, fmt.Sprintf("~ %s (will restart)", p.new.Name))
+		resp.Body = append(resp.Body, fmt.Sprintf("~ %s (%s)", p.new.Name, restartVerb))
 	}
 	for _, svc := range diff.add {
-		resp.Body = append(resp.Body, fmt.Sprintf("+ %s (will start)", svc.Name))
+		resp.Body = append(resp.Body, fmt.Sprintf("+ %s (%s)", svc.Name, startVerb))
 	}
 	if len(resp.Body) == 0 {
-		resp.Body = []string{"no changes"}
+		resp.Body = []string{emptyMsg}
 	}
 	return resp
 }

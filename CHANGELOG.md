@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.1.2
+
+### Features
+
+- **Empty config + no CMD now stays alive in supervise mode.** zpinit
+  previously bailed with `nothing to do — provide a CMD or populate
+  /etc/zpinit/services` when both were absent. It now enters supervise
+  mode with zero runners: the control socket comes up, and an operator
+  can drop service files into `/etc/zpinit/services/` and bring them up
+  with `zpctl reread` / `zpctl update` (or `SIGHUP`). Boot log says
+  `no services configured; control socket up, waiting for reload` so
+  the "did I misconfigure?" question is answered from `docker logs`.
+
+- **Published image is now a playground.** `docker run -it
+  ghcr.io/0ploy/zpinit` starts zpinit as PID 1 with no services so you
+  can `docker exec` in, install software, write service files, and try
+  the supervisor live. The Dockerfile drops `CMD ["sh"]` and sets
+  `ENTRYPOINT ["zpinit"]`. `bash` and `curl` are pre-installed for
+  ergonomics. The image is still usable as a binary-delivery layer
+  (`COPY --from=ghcr.io/0ploy/zpinit /usr/local/bin/zpinit …`):
+  `COPY --from` ignores both the ENTRYPOINT directive and the extra
+  apk packages.
+
+- **`zpctl update` now prints what it actually did.** Previously it
+  responded with a bare `ok`, leaving the operator to compare `zpctl
+  reread` (preview) against silence (apply). It now emits the same
+  per-service lines as `reread`, in past tense: `+ nginx (started)`,
+  `~ php-fpm (restarted)`, `- old-worker (stopped)`, or `no changes`.
+
+- **zpinit auto-creates `/etc/zpinit/services/` and
+  `/etc/zpinit/entrypoint.d/` on boot.** A freshly-pulled image (or a
+  fresh install on a host) no longer needs an operator to mkdir the
+  layout before writing the first service file. Skipped when `--config`
+  is passed explicitly so a typo'd path still fails loud rather than
+  being silently created.
+
 ## v0.1.1
 
 ### Bug Fixes

@@ -281,17 +281,53 @@ func TestModeWrap(t *testing.T) {
 	}
 }
 
-// #21: empty services + no CMD → clear error message and non-zero exit.
-func TestModeError(t *testing.T) {
+// #21: empty services + no CMD stays alive in supervise mode with zero
+// runners. The control socket comes up; an operator can drop in service
+// files and `zpctl reread` (or SIGHUP) to add them later. Exit only on
+// SIGTERM.
+func TestEmptyConfigStaysAlive(t *testing.T) {
 	cfg := t.TempDir()
-	res := runZpinit(t, map[string]string{
-		"ZPINIT_ENV_FILE": filepath.Join(t.TempDir(), "env"),
-	}, "--config", cfg)
-	if res.exitCode == 0 {
-		t.Fatal("expected non-zero exit")
+	socket := filepath.Join(t.TempDir(), "zpinit.sock")
+	writeFile(t, filepath.Join(cfg, "zpinit.toml"), fmt.Sprintf(`
+control_socket = "%s"
+`, socket))
+
+	envFile := filepath.Join(t.TempDir(), "env")
+	cmd := exec.Command(zpinitBin, "--config", cfg)
+	cmd.Env = append(os.Environ(), "ZPINIT_ENV_FILE="+envFile)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(res.stderr, "nothing to do") {
-		t.Errorf("expected 'nothing to do' in stderr, got %q", res.stderr)
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(syscall.SIGKILL)
+		_ = cmd.Wait()
+	})
+
+	// Wait for the control socket to appear: that's the proof zpinit
+	// reached the supervise loop with zero services and didn't bail.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(socket); err == nil {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if _, err := os.Stat(socket); err != nil {
+		t.Fatalf("control socket never appeared; stderr:\n%s", stderr.String())
+	}
+
+	// Process must still be alive; zero-service supervise mode does not
+	// self-exit. Probe with signal 0.
+	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("zpinit exited prematurely: %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	// Clean shutdown on SIGTERM.
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("zpinit exit error: %v\nstderr:\n%s", err, stderr.String())
 	}
 }
 

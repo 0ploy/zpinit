@@ -82,14 +82,28 @@ func runCheckConfig(dir string) int {
 }
 
 func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []string, skipEntrypoint bool) int {
+	// Self-bootstrap the default config dir so a freshly-pulled image
+	// (or fresh install) just works: an operator can drop service files
+	// into /etc/zpinit/services/ and zpctl-reread them in without first
+	// having to mkdir the layout. Skipped when --config was passed
+	// explicitly so an operator typo or missing mount still fails loud
+	// instead of silently creating an empty directory at the wrong path.
+	if !configExplicit {
+		if err := os.MkdirAll(filepath.Join(configDir, "services"), 0o755); err != nil {
+			log.Warn("could not create services dir", "dir", configDir, "err", err)
+		}
+		if err := os.MkdirAll(filepath.Join(configDir, "entrypoint.d"), 0o755); err != nil {
+			log.Warn("could not create entrypoint.d dir", "dir", configDir, "err", err)
+		}
+	}
+
 	cfg, err := config.Load(configDir)
 	if err != nil {
-		// Lenient case: no --config flag was passed and the default
-		// dir simply doesn't exist. Fall back to an empty config with
-		// defaults applied; mode dispatch will then either wrap the
-		// CMD (mode 1) or fail with the existing "nothing to do"
-		// message if no CMD was supplied either. An explicit
-		// --config to a missing path is still a hard error.
+		// Defense in depth: the auto-mkdir above almost always means
+		// the default dir exists by the time we get here, but a
+		// readonly rootfs or a failed mkdir can still leave it
+		// missing. An explicit --config to a missing path is always a
+		// hard error.
 		if errors.Is(err, fs.ErrNotExist) && !configExplicit {
 			log.Info("no config dir; running with built-in defaults", "dir", configDir)
 			cfg = config.NewEmpty(configDir)
@@ -122,7 +136,7 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 	// clean slate to the exec'd CMD.
 	r.Reap()
 
-	switch detectMode(cmdline, cfg.Services) {
+	switch detectMode(cmdline) {
 	case modeWrap:
 		return execCmd(log, cmdline, finalEnv)
 	case modeSupervise:
@@ -133,11 +147,6 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 		// scripts: newBaseEnv = newGlobals.Env + containerEnv + scriptEnv.
 		scriptEnv := envDelta(initialEnv, finalEnv)
 		return runSupervise(log, configDir, cfg, finalEnv, containerEnv, scriptEnv, r)
-	case modeError:
-		fmt.Fprintf(os.Stderr,
-			"zpinit: nothing to do — provide a CMD or populate %s\n",
-			filepath.Join(configDir, "services"))
-		return 1
 	}
 	return 1 // unreachable
 }
@@ -174,17 +183,17 @@ type mode int
 const (
 	modeWrap mode = iota
 	modeSupervise
-	modeError
 )
 
-func detectMode(cmdline []string, services []config.Service) mode {
+// detectMode picks the dispatch path from the CMD alone: any CMD wins
+// (wrap), no CMD means supervise — even with zero services, in which
+// case the orchestrator boots nothing, the control socket comes up,
+// and an operator can add services via zpctl reread or SIGHUP.
+func detectMode(cmdline []string) mode {
 	if len(cmdline) > 0 {
 		return modeWrap
 	}
-	if len(services) > 0 {
-		return modeSupervise
-	}
-	return modeError
+	return modeSupervise
 }
 
 func runEntrypoint(log *slog.Logger, configDir string, cfg *config.Config, skipFlag bool, initialEnv map[string]string) (map[string]string, error) {
@@ -335,6 +344,9 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 	go func() { exitCh <- orch.Run(ctx) }()
 
 	log.Info("zpinit started", "version", version, "pid", os.Getpid(), "services", len(cfg.Services))
+	if len(cfg.Services) == 0 {
+		log.Info("no services configured; control socket up, waiting for reload (zpctl reread / SIGHUP)")
+	}
 
 	for {
 		select {
