@@ -127,13 +127,14 @@ test-only changes worth advertising). Internal refactors, doc fixes,
 and CI tweaks usually don't appear; they live in `git log`. If
 unsure, ask whether the user would care.
 
-**How to write entries.** Lead with **bold headline**, then a short
-prose paragraph that includes *what changed* and *why it matters to
-the user* (or *what was broken*, for fixes). Match the voice in
-existing entries: no marketing language, no "this commit", no
-mention of phase numbers or internal package paths unless they're
-load-bearing for users. Reference external behavior, not
-implementation. Example shape:
+**How to write entries.** Lead with a **bold headline** stating
+what changed (or what was broken, for fixes), then 2-4 lines of
+prose covering *what it does now* and *why the user cares*. Drop
+the long "previously..." backstory unless the failure mode is
+essential context. Skip implementation details (file/lock/function
+names) unless load-bearing for an operator. No marketing language,
+no "this commit", no phase numbers. Reference external behavior,
+not internals. Example shape:
 
 ```markdown
 - **`zpctl reread` no longer hangs on huge configs.** The diff
