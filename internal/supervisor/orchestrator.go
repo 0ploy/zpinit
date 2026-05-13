@@ -47,6 +47,7 @@ type Orchestrator struct {
 	// having to thread them through. Production wires real
 	// service.Spawn / defaultProber / RealClock.
 	spawner Spawner
+	oneShot OneShotSpawner
 	prober  Prober
 	clock   Clock
 
@@ -119,6 +120,7 @@ func NewOrchestrator(cfg *config.Config, baseEnv []string, r *reaper.Reaper, log
 		baseEnv: baseEnv,
 		log:     log,
 		spawner: serviceSpawner(r, log),
+		oneShot: serviceOneShotSpawner(r, log),
 		prober:  defaultProber(r, log),
 		clock:   RealClock(),
 	}
@@ -131,6 +133,13 @@ func serviceSpawner(r *reaper.Reaper, log *slog.Logger) Spawner {
 			return nil, err
 		}
 		return WrapServiceProcess(p), nil
+	}
+}
+
+func serviceOneShotSpawner(r *reaper.Reaper, log *slog.Logger) OneShotSpawner {
+	return func(name string, command, env []string) (<-chan reaper.ExitInfo, error) {
+		_, ch, err := service.SpawnOneShot(name, command, env, r, log)
+		return ch, err
 	}
 }
 

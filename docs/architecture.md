@@ -72,6 +72,25 @@ relies on.
 `exit_code_from` is rebound on every reload, so the watched service
 can be added, removed, or retargeted.
 
+### Per-service reload action
+
+`zpctl reload <name>` (and the future watcher-driven reload trigger)
+runs through `Orchestrator.ReloadService`, which dispatches per
+runner:
+
+- `reload_signal` set → `SignalGroup`. In-place; the running process
+  re-reads its config (or whatever it's wired to do on the signal).
+- `reload_command` set → one-shot spawned via the centralized
+  reaper. Inherits the service's env so it sees `ZPINIT_CPU_COUNT`
+  and friends. Capped at 30 s before we stop waiting on it; non-zero
+  exit is logged, not surfaced as an error from `zpctl`.
+- Neither → full stop+start (same as `zpctl restart`).
+
+Parallelism mirrors `stopRunnerGroup`: parallel within a replica
+group, serial between filename groups. `zpctl reload` with no
+arguments stays a backwards-compatible alias for `update`
+(config reread + apply).
+
 ## Shutdown
 
 `SIGTERM` or `SIGINT` to PID 1 triggers `stopAll`. Services are

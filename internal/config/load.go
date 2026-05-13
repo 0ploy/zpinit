@@ -326,6 +326,14 @@ func validate(cfg *Config) error {
 		if s.Replicas > MaxReplicas {
 			errs = append(errs, fmt.Sprintf("%s: replicas must be <= %d (got %d)", s.Filename, MaxReplicas, s.Replicas))
 		}
+		if s.ReloadSignal != "" && len(s.ReloadCommand) > 0 {
+			errs = append(errs, fmt.Sprintf("%s: reload_signal and reload_command are mutually exclusive", s.Filename))
+		}
+		if s.ReloadSignal != "" {
+			if _, ok := ParseSignal(s.ReloadSignal); !ok {
+				errs = append(errs, fmt.Sprintf("%s: reload_signal %q is not a recognised signal name", s.Filename, s.ReloadSignal))
+			}
+		}
 		for k := range s.Env {
 			if !envKeyPattern.MatchString(k) {
 				errs = append(errs, fmt.Sprintf("%s: env key %q must match %s", s.Filename, k, envKeyPattern))

@@ -101,6 +101,21 @@ type Service struct {
 	// conflict on EADDRINUSE; see the README's "Node.js clustering"
 	// section. `zpinit doctor` catches the common cases pre-boot.
 	Replicas int `toml:"replicas"`
+
+	// ReloadSignal, if set, replaces the default stop+start cycle of
+	// `zpctl reload <name>` with an in-place signal to the service's
+	// process group. Use for apps that re-read their config on a
+	// known signal (nginx HUP, php-fpm USR2). Mutually exclusive with
+	// ReloadCommand.
+	ReloadSignal string `toml:"reload_signal"`
+
+	// ReloadCommand, if set, replaces the default stop+start cycle of
+	// `zpctl reload <name>` with a one-shot command that talks to the
+	// live process via its own IPC (e.g. `nginx -s reload`). The
+	// command inherits the service's env; stdout/stderr land in the
+	// service log; non-zero exit is logged but does not kill the
+	// service. Mutually exclusive with ReloadSignal.
+	ReloadCommand []string `toml:"reload_command"`
 }
 
 // IsReloadable returns true unless the service explicitly set

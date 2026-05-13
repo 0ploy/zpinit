@@ -222,7 +222,8 @@ match supervisorctl exactly.
 ```sh
 zpctl status [NAME[/N]...]    # list states; NAME/N for one replica
 zpctl start | stop | restart NAME[/N] | all
-zpctl signal NAME[/N] HUP     # arbitrary signal (e.g. nginx reload)
+zpctl reload NAME[/N] | all   # in-place: reload_signal/_command or stop+start
+zpctl signal NAME[/N] HUP     # arbitrary signal (lower-level than reload)
 zpctl pid [NAME[/N]]          # zpinit's PID, or a service replica's
 zpctl tail NAME[/N]           # last 8KB of file-logged stdout
 zpctl update                  # apply config changes (= SIGHUP)

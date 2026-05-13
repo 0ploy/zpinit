@@ -196,6 +196,25 @@ reloadable = true
 # the PM2 comparison.
 replicas = 1
 
+# In-place reload action for `zpctl reload <name>`. At most one of the
+# two may be set; both unset means `zpctl reload` falls back to a full
+# stop+start cycle (so operators can always say "reload" and have it
+# do the right thing per service).
+#
+#   reload_signal  — send a signal to the service's process group. The
+#                    process keeps running; whatever it does on the
+#                    signal is its own concern (nginx re-reads its
+#                    config on HUP, php-fpm reloads on USR2, …).
+#   reload_command — exec a one-shot command that talks to the live
+#                    process via its own IPC (`nginx -s reload` over
+#                    the daemon's Unix socket, for example). Inherits
+#                    the service's env; stdout/stderr go to zpinit's
+#                    log. Non-zero exit is logged but does not kill
+#                    the service.
+#
+reload_signal  = "HUP"
+# reload_command = ["/usr/sbin/nginx", "-s", "reload"]
+
 # Per-service environment variables. Merged on top of inherited env.
 [env]
 LOG_LEVEL = "info"

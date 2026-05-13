@@ -89,6 +89,8 @@ Common commands:
   pid [NAME[/N]]          PID of zpinit or a service replica
   tail NAME[/N]           dump last 8KB of file-logged stdout
   update                  apply config changes (= SIGHUP)
+  reload [NAME[/N]...]    in-place reload (reload_signal/_command or full restart);
+                          no args is equivalent to update
   reread                  dry-run config diff
   signal NAME[/N] SIG     send arbitrary signal
   shutdown                stop supervisor

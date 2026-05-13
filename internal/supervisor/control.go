@@ -154,8 +154,11 @@ func (s *ControlServer) dispatchBudget(req *ctlproto.Request) time.Duration {
 	snap := s.orch.snapshotRunners()
 	var targets []*Runner
 	switch {
-	case req.Verb == "shutdown" || req.Verb == "update" || req.Verb == "reload":
+	case req.Verb == "shutdown" || req.Verb == "update":
 		// These touch every running service in the worst case.
+		targets = snap
+	case req.Verb == "reload" && len(req.Args) == 0:
+		// No-arg reload is the alias for update.
 		targets = snap
 	case len(req.Args) == 0:
 		// dispatch will reject with usage error; floor budget is enough.
@@ -195,8 +198,18 @@ func (s *ControlServer) dispatch(ctx context.Context, req *ctlproto.Request) *ct
 		return s.cmdStartStopRestart(ctx, req.Args, "restart")
 	case "pid":
 		return s.cmdPID(req.Args)
-	case "update", "reload":
+	case "update":
 		return s.cmdUpdate(ctx)
+	case "reload":
+		// Dual-purpose for backwards compatibility: `reload` with no
+		// args remains an alias for `update` (config re-read), the
+		// historical behavior. With args it performs a per-service
+		// reload — the supervisord-aligned semantic — dispatching
+		// reload_signal / reload_command / full restart as configured.
+		if len(req.Args) == 0 {
+			return s.cmdUpdate(ctx)
+		}
+		return s.cmdReloadService(ctx, req.Args)
 	case "reread":
 		return s.cmdReread()
 	case "tail":
@@ -275,6 +288,33 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 	if anyErr != nil {
 		resp.Code = 1
 		resp.Msg = anyErr.Error()
+	}
+	return resp
+}
+
+// cmdReloadService implements the per-service form of `zpctl reload`.
+// Targets are resolved like start/stop/restart; the orchestrator
+// dispatches per-runner based on each service's reload config.
+// Output mirrors cmdStartStopRestart so operators get a consistent
+// "<name>: reloaded" body line per affected runner.
+func (s *ControlServer) cmdReloadService(ctx context.Context, args []string) *ctlproto.Response {
+	targets, err := s.expandTargets(args, false)
+	if err != nil {
+		return errResp(err.Error())
+	}
+	if err := s.orch.reloadAcrossGroups(ctx, targets); err != nil {
+		resp := okResp("ok")
+		for _, r := range targets {
+			resp.Body = append(resp.Body, fmt.Sprintf("%s: reloaded", r.DisplayName()))
+		}
+		resp.Code = 1
+		resp.Msg = err.Error()
+		return resp
+	}
+	resp := okResp("ok")
+	resp.Body = make([]string, 0, len(targets))
+	for _, r := range targets {
+		resp.Body = append(resp.Body, fmt.Sprintf("%s: reloaded", r.DisplayName()))
 	}
 	return resp
 }
@@ -425,7 +465,8 @@ func (s *ControlServer) cmdHelp() *ctlproto.Response {
 		"restart NAME[/N]...   stop then start; 'all' for everything",
 		"pid [NAME[/N]]        PID of zpinit (no arg) or service replica",
 		"update                reload config and apply (= SIGHUP)",
-		"reload                alias for update (note: differs from supervisord's reload)",
+		"reload                with no args: alias for update",
+		"reload NAME[/N]...    in-place reload (reload_signal/_command or full restart)",
 		"reread                dry-run config diff",
 		"tail NAME[/N]         dump last 8KB of file-logged stdout (snapshot only)",
 		"signal NAME[/N] SIG   send arbitrary signal to service's process group",

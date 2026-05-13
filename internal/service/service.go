@@ -112,6 +112,39 @@ func (p *Process) SignalGroup(sig syscall.Signal) error {
 	return syscall.Kill(-p.PID, sig)
 }
 
+// SpawnOneShot runs a transient command (a service's reload_command,
+// say) under the centralized reaper and returns a channel that fires
+// with the ExitInfo once the kernel reaps the child. The caller is
+// expected to read from the channel exactly once. Stdout/stderr
+// inherit zpinit's own; the operator sees the output in the
+// supervisor log.
+//
+// Unlike Spawn this does not create a long-lived Process record
+// because there is no per-service state machine to drive; the
+// caller drives it directly.
+func SpawnOneShot(name string, command, env []string, r *reaper.Reaper, log *slog.Logger) (int, <-chan reaper.ExitInfo, error) {
+	if len(command) == 0 {
+		return 0, nil, errors.New("empty command")
+	}
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Env = env
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = baseSysProcAttr()
+
+	proc, exitCh, err := r.SpawnTracked(func() (*os.Process, error) {
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		return cmd.Process, nil
+	})
+	if err != nil {
+		return 0, nil, fmt.Errorf("start: %w", err)
+	}
+	log.Info("one-shot spawned", "service", name, "pid", proc.Pid, "cmd", command)
+	return proc.Pid, exitCh, nil
+}
+
 func resolveCredentials(userStr, groupStr string) (*syscall.Credential, error) {
 	if userStr == "" && groupStr == "" {
 		return nil, nil

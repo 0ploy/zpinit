@@ -609,6 +609,67 @@ func TestByteSize_UnmarshalText(t *testing.T) {
 	}
 }
 
+func TestLoad_ReloadSignalValid(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_nginx.toml"), `
+command = ["/usr/sbin/nginx", "-g", "daemon off;"]
+reload_signal = "HUP"
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Services[0].ReloadSignal != "HUP" {
+		t.Errorf("ReloadSignal = %q", cfg.Services[0].ReloadSignal)
+	}
+}
+
+func TestLoad_ReloadSignalUnknown(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `
+command = ["x"]
+reload_signal = "NOPE"
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for unknown reload signal")
+	}
+	if !strings.Contains(err.Error(), "reload_signal") {
+		t.Errorf("error should mention reload_signal: %v", err)
+	}
+}
+
+func TestLoad_ReloadSignalAndCommandMutuallyExclusive(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `
+command = ["x"]
+reload_signal = "HUP"
+reload_command = ["/bin/true"]
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for both reload_signal and reload_command")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error should mention mutually exclusive: %v", err)
+	}
+}
+
+func TestLoad_ReloadCommandOnly(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `
+command = ["nginx"]
+reload_command = ["/usr/sbin/nginx", "-s", "reload"]
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Services[0].ReloadCommand) != 3 {
+		t.Errorf("ReloadCommand = %v", cfg.Services[0].ReloadCommand)
+	}
+}
+
 func TestByteSize_UnknownUnit(t *testing.T) {
 	var b ByteSize
 	if err := b.UnmarshalText([]byte("1xb")); err == nil {

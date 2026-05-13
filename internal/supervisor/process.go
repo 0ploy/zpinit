@@ -22,6 +22,14 @@ type Process interface {
 // inject their own to feed synthetic Exit events.
 type Spawner func(cfg config.Service, env []string) (Process, error)
 
+// OneShotSpawner runs a transient command outside the per-service
+// state machine: a reload_command, mostly. Returns a channel that
+// fires once with the ExitInfo when the kernel reaps the child.
+// Production wires this to service.SpawnOneShot via the
+// centralized reaper; tests inject a fake that drives Exit
+// synthetically.
+type OneShotSpawner func(name string, command, env []string) (<-chan reaper.ExitInfo, error)
+
 // WrapServiceProcess adapts a *service.Process to the Process interface.
 // service.Process exposes PID/Exit as fields rather than methods, so
 // this adapter bridges the two.

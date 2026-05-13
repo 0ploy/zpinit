@@ -4,6 +4,17 @@
 
 ### Features
 
+- **`zpctl reload <service>` performs in-place reload.** A new
+  per-service `reload_signal` (e.g. `"HUP"`) sends the configured
+  signal to the running process group; `reload_command` (e.g.
+  `["/usr/sbin/nginx", "-s", "reload"]`) runs a one-shot that talks
+  to the live process via its own IPC. Neither set means `zpctl
+  reload` falls back to a stop+start cycle, so operators get one
+  verb that does the right thing per service. Mutually exclusive;
+  `--check-config` rejects both at once. `zpctl reload` with no
+  arguments stays a backwards-compatible alias for `update` (config
+  reread + apply).
+
 - **Detected CPU and memory budget now exposed to every service.**
   At boot, zpinit reads cgroup v2 / v1 and `/proc` (taking the min
   of all sources) and injects `ZPINIT_CPU_COUNT`, `ZPINIT_CPU_QUOTA`,
