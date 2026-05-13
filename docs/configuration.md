@@ -105,6 +105,51 @@ new env retroactively; restart is the only mechanism. Services with
 suppresses the `entrypoint.d/` phase; the toml layer is always
 evaluated.
 
+### Resources
+
+Optional `[resources]` block in `zpinit.toml`. zpinit detects the
+container's CPU and memory budget at boot and injects three env
+variables into every child (the wrapped CMD or every supervised
+service):
+
+- `ZPINIT_CPU_COUNT` — integer floor of available CPUs, minimum 1.
+- `ZPINIT_CPU_QUOTA` — fractional CPU budget, e.g. `1.5`.
+- `ZPINIT_MEMORY_BYTES` — memory budget in bytes, `0` for unlimited
+  or undetected.
+
+Detection takes the min of every source it can read: cgroup v2
+(`cpu.max`, `memory.max`), cgroup v1 (`cpu.cfs_quota_us` /
+`cpu.cfs_period_us`, `memory.limit_in_bytes`), and `/proc/cpuinfo` /
+`/proc/meminfo`. A container inside a VM is covered: cgroup limits
+and the VM's kernel view both apply, whichever is smaller wins. On
+bare metal or a microVM without cgroups, `/proc` is authoritative.
+
+Apps decide whether to read the vars. nginx wrappers can map
+`ZPINIT_CPU_COUNT` onto `worker_processes`; the JVM onto `-Xmx`; a
+Node clustering shim onto `cluster.fork()` count. zpinit only
+exposes the numbers.
+
+Operator `[env]` tables (globals or per-service) may not set these
+keys; `--check-config` rejects the override.
+
+```toml
+[resources]
+# Subtracted from the detected budget before children see the env
+# vars. Useful when a master process, sidecar, or zpinit itself
+# needs headroom that workers should not assume is theirs.
+reserve_cpu     = 0.5
+reserve_memory  = "256MiB"
+```
+
+Byte sizes accept `K`/`KB`/`Ki`/`KiB` (and `M`, `G`) suffixes:
+unsuffixed digits and `B`/`KB`/`MB`/`GB` use 1000-base; `Ki`/`Mi`/`Gi`
+and the `iB` forms use 1024-base. `reserve_cpu` is a non-negative
+float; `reserve_memory` is a non-negative byte count.
+
+The boot-time detection is fixed for this commit; live updates land
+in a later release. Watching `cpu.max` / `memory.max` for runtime
+limit changes is on the roadmap.
+
 ## `services/*.toml` (one per service)
 
 ```toml

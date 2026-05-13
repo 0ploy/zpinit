@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/0ploy/zpinit/internal/resources"
 )
 
 const (
@@ -176,6 +178,28 @@ const MaxReplicas = 64
 // per-replica value via the env-merge precedence chain.
 const reservedReplicaIndexKey = "ZPINIT_REPLICA_INDEX"
 
+// reservedEnvKeys collects every env key zpinit injects into a
+// child's environment. Operator [env] tables (globals or per-service)
+// may not set these: the supervisor's value would lose the merge race
+// in some code paths and win in others, depending on layer order, so
+// allowing user overrides makes behavior position-dependent and
+// confusing. Validation rejects them outright.
+var reservedEnvKeys = []string{
+	reservedReplicaIndexKey,
+	resources.EnvCPUCount,
+	resources.EnvCPUQuota,
+	resources.EnvMemoryBytes,
+}
+
+func isReservedEnvKey(k string) bool {
+	for _, r := range reservedEnvKeys {
+		if k == r {
+			return true
+		}
+	}
+	return false
+}
+
 func applyServiceDefaults(s *Service, g *Globals) {
 	if s.Replicas == 0 {
 		s.Replicas = 1
@@ -266,9 +290,12 @@ func validate(cfg *Config) error {
 		if !envKeyPattern.MatchString(k) {
 			errs = append(errs, fmt.Sprintf("env key %q must match %s", k, envKeyPattern))
 		}
-		if k == reservedReplicaIndexKey {
-			errs = append(errs, fmt.Sprintf("env key %q is reserved (set per-replica by the supervisor)", k))
+		if isReservedEnvKey(k) {
+			errs = append(errs, fmt.Sprintf("env key %q is reserved (managed by the supervisor)", k))
 		}
+	}
+	if cfg.Globals.Resources.ReserveCPU < 0 {
+		errs = append(errs, fmt.Sprintf("[resources].reserve_cpu must be >= 0, got %v", cfg.Globals.Resources.ReserveCPU))
 	}
 
 	nameToFile := map[string]string{}
@@ -303,8 +330,8 @@ func validate(cfg *Config) error {
 			if !envKeyPattern.MatchString(k) {
 				errs = append(errs, fmt.Sprintf("%s: env key %q must match %s", s.Filename, k, envKeyPattern))
 			}
-			if k == reservedReplicaIndexKey {
-				errs = append(errs, fmt.Sprintf("%s: env key %q is reserved (set per-replica by the supervisor)", s.Filename, k))
+			if isReservedEnvKey(k) {
+				errs = append(errs, fmt.Sprintf("%s: env key %q is reserved (managed by the supervisor)", s.Filename, k))
 			}
 		}
 		if s.Ready != nil {

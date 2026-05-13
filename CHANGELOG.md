@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Detected CPU and memory budget now exposed to every service.**
+  At boot, zpinit reads cgroup v2 / v1 and `/proc` (taking the min
+  of all sources) and injects `ZPINIT_CPU_COUNT`, `ZPINIT_CPU_QUOTA`,
+  and `ZPINIT_MEMORY_BYTES` into the wrapped CMD's env or every
+  supervised service's env. nginx wrappers can map onto
+  `worker_processes`, the JVM onto `-Xmx`, a clustering shim onto
+  fork count. The optional `[resources]` block in `zpinit.toml`
+  subtracts a reservation (`reserve_cpu`, `reserve_memory`) before
+  children see the numbers, so master processes or sidecars keep
+  their headroom. Detection is one-shot at boot for this release;
+  live updates land in a follow-up.
+
+### Security
+
+- **`ZPINIT_CPU_COUNT`, `ZPINIT_CPU_QUOTA`, and `ZPINIT_MEMORY_BYTES`
+  are reserved.** Setting any of them in a globals or per-service
+  `[env]` table is now a config-load error so an operator override
+  cannot shadow the detected values.
+
 ## v0.2.0
 
 ### Features

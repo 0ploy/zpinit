@@ -266,6 +266,71 @@ func TestEnvPropagation(t *testing.T) {
 	}
 }
 
+// Resource env vars (ZPINIT_CPU_COUNT/QUOTA, ZPINIT_MEMORY_BYTES) are
+// injected into the wrapped CMD's environment. Uses tempdir cgroup
+// fixtures via the ZPINIT_CGROUP_ROOT / ZPINIT_PROC_ROOT overrides
+// so the test result is deterministic regardless of the host's real
+// cgroup state.
+func TestResourceEnvInWrap(t *testing.T) {
+	cfg := t.TempDir()
+	cg := t.TempDir()
+	proc := t.TempDir()
+	// 2 CPUs, 1 GiB memory.
+	writeFile(t, filepath.Join(cg, "cpu.max"), "200000 100000\n")
+	writeFile(t, filepath.Join(cg, "memory.max"), "1073741824\n")
+	writeFile(t, filepath.Join(proc, "cpuinfo"),
+		"processor\t: 0\nprocessor\t: 1\nprocessor\t: 2\nprocessor\t: 3\n")
+	writeFile(t, filepath.Join(proc, "meminfo"), "MemTotal:       16777216 kB\n")
+
+	res := runZpinit(t, map[string]string{
+		"ZPINIT_ENV_FILE":    filepath.Join(t.TempDir(), "env"),
+		"ZPINIT_CGROUP_ROOT": cg,
+		"ZPINIT_PROC_ROOT":   proc,
+	}, "--config", cfg, "--", "/bin/sh", "-c",
+		"echo cpu=$ZPINIT_CPU_COUNT quota=$ZPINIT_CPU_QUOTA mem=$ZPINIT_MEMORY_BYTES")
+	if res.exitCode != 0 {
+		t.Fatalf("exit=%d stderr=%s", res.exitCode, res.stderr)
+	}
+	want := "cpu=2 quota=2 mem=1073741824"
+	if !strings.Contains(res.stdout, want) {
+		t.Errorf("expected %q in stdout, got %q", want, res.stdout)
+	}
+}
+
+// Reservations are subtracted from the detected budget before children
+// see the env vars.
+func TestResourceEnvWithReserves(t *testing.T) {
+	cfg := t.TempDir()
+	cg := t.TempDir()
+	proc := t.TempDir()
+	writeFile(t, filepath.Join(cg, "cpu.max"), "400000 100000\n")
+	writeFile(t, filepath.Join(cg, "memory.max"), "1073741824\n") // 1 GiB
+	writeFile(t, filepath.Join(proc, "cpuinfo"),
+		"processor\t: 0\nprocessor\t: 1\nprocessor\t: 2\nprocessor\t: 3\n")
+	writeFile(t, filepath.Join(proc, "meminfo"), "MemTotal:       16777216 kB\n")
+	writeFile(t, filepath.Join(cfg, "zpinit.toml"), `
+[resources]
+reserve_cpu = 1
+reserve_memory = "256MiB"
+`)
+
+	res := runZpinit(t, map[string]string{
+		"ZPINIT_ENV_FILE":    filepath.Join(t.TempDir(), "env"),
+		"ZPINIT_CGROUP_ROOT": cg,
+		"ZPINIT_PROC_ROOT":   proc,
+	}, "--config", cfg, "--", "/bin/sh", "-c",
+		"echo cpu=$ZPINIT_CPU_COUNT mem=$ZPINIT_MEMORY_BYTES")
+	if res.exitCode != 0 {
+		t.Fatalf("exit=%d stderr=%s", res.exitCode, res.stderr)
+	}
+	// 4 CPU detected, reserve 1 → 3.
+	// 1 GiB mem, reserve 256 MiB → 805306368 bytes.
+	want := "cpu=3 mem=805306368"
+	if !strings.Contains(res.stdout, want) {
+		t.Errorf("expected %q in stdout, got %q", want, res.stdout)
+	}
+}
+
 // #19 (host approximation): wrap mode exec'd CMD's stdout reaches us.
 // True PID 1 verification belongs in smoke tests inside Docker.
 func TestModeWrap(t *testing.T) {

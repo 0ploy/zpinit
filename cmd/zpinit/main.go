@@ -17,6 +17,7 @@ import (
 	"github.com/0ploy/zpinit/internal/config"
 	"github.com/0ploy/zpinit/internal/entrypoint"
 	"github.com/0ploy/zpinit/internal/reaper"
+	"github.com/0ploy/zpinit/internal/resources"
 	"github.com/0ploy/zpinit/internal/supervisor"
 )
 
@@ -144,17 +145,35 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 	// clean slate to the exec'd CMD.
 	r.Reap()
 
+	// Detect the container's CPU/memory budget once and inject
+	// ZPINIT_CPU_COUNT, ZPINIT_CPU_QUOTA, ZPINIT_MEMORY_BYTES into the
+	// env that the wrapped CMD or supervised services see. Highest
+	// precedence so a stale container/script value can't shadow the
+	// detected truth; [env] validation rejects the keys upfront anyway.
+	snap := resources.Detect().WithReserves(
+		cfg.Globals.Resources.ReserveCPU,
+		cfg.Globals.Resources.ReserveMemory.Bytes(),
+	)
+	resourceEnv := snap.EnvVars()
+	log.Info("resources detected",
+		"cpu_count", snap.CPUCount,
+		"cpu_quota", resourceEnv[resources.EnvCPUQuota],
+		"memory_bytes", snap.MemoryBytes,
+	)
+	bootEnv := layeredMerge(finalEnv, resourceEnv)
+
 	switch detectMode(cmdline) {
 	case modeWrap:
-		return execCmd(log, cmdline, finalEnv)
+		return execCmd(log, cmdline, bootEnv)
 	case modeSupervise:
 		// scriptEnv is the delta entrypoint.d wrote to /run/zpinit/env
 		// (or set on its own children that bubbled up via the env
 		// file). Captured here so SIGHUP reloads can recompute the
 		// per-service env from the *new* globals.Env without re-running
-		// scripts: newBaseEnv = newGlobals.Env + containerEnv + scriptEnv.
+		// scripts: newBaseEnv = newGlobals.Env + containerEnv +
+		// scriptEnv + resourceEnv.
 		scriptEnv := envDelta(initialEnv, finalEnv)
-		return runSupervise(log, configDir, cfg, finalEnv, containerEnv, scriptEnv, r)
+		return runSupervise(log, configDir, cfg, bootEnv, containerEnv, scriptEnv, resourceEnv, r)
 	}
 	return 1 // unreachable
 }
@@ -262,7 +281,7 @@ func execCmd(log *slog.Logger, cmdline []string, env map[string]string) int {
 //
 // SIGHUP triggers a reload via orchestrator.Reload (Phase 7): re-load
 // config from disk, diff against the running set, apply add/remove/restart.
-func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env map[string]string, containerEnv, scriptEnv map[string]string, r *reaper.Reaper) int {
+func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env map[string]string, containerEnv, scriptEnv, resourceEnv map[string]string, r *reaper.Reaper) int {
 	chldCh := make(chan os.Signal, 16)
 	signal.Notify(chldCh, syscall.SIGCHLD)
 	userCh := make(chan os.Signal, 8)
@@ -305,12 +324,13 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 	envSlice := entrypoint.SliceFromEnviron(env)
 	orch := supervisor.NewOrchestrator(cfg, envSlice, r, log)
 	// On reload, recompose the per-service base env from the *new*
-	// globals.Env layered with the boot-time container env and the
-	// boot-time script-set deltas. Scripts only run once at boot, so
-	// reload can't re-derive their additions; capturing scriptEnv here
-	// preserves those additions across reloads.
+	// globals.Env layered with the boot-time container env, boot-time
+	// script deltas, and the boot-time resource snapshot. Scripts only
+	// run once at boot, so reload can't re-derive their additions;
+	// capturing scriptEnv preserves them. resourceEnv is fixed at boot
+	// here too: live updates land in a later commit.
 	orch.SetBaseEnvBuilder(func(globalsEnv map[string]string) []string {
-		merged := layeredMerge(globalsEnv, containerEnv, scriptEnv)
+		merged := layeredMerge(globalsEnv, containerEnv, scriptEnv, resourceEnv)
 		return entrypoint.SliceFromEnviron(merged)
 	})
 

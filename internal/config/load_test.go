@@ -524,6 +524,98 @@ func TestLoad_MissingDirIsErrNotExist(t *testing.T) {
 	}
 }
 
+func TestLoad_ResourcesBlock(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "zpinit.toml"), `
+[resources]
+reserve_cpu = 0.5
+reserve_memory = "256MiB"
+`)
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `command = ["x"]`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Globals.Resources.ReserveCPU != 0.5 {
+		t.Errorf("ReserveCPU = %v, want 0.5", cfg.Globals.Resources.ReserveCPU)
+	}
+	if cfg.Globals.Resources.ReserveMemory.Bytes() != 256*1024*1024 {
+		t.Errorf("ReserveMemory = %d bytes, want %d", cfg.Globals.Resources.ReserveMemory.Bytes(), 256*1024*1024)
+	}
+}
+
+func TestLoad_ResourcesNegativeReserveRejected(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "zpinit.toml"), `
+[resources]
+reserve_cpu = -1
+`)
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `command = ["x"]`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for negative reserve_cpu")
+	}
+	if !strings.Contains(err.Error(), "reserve_cpu") {
+		t.Errorf("error should mention reserve_cpu: %v", err)
+	}
+}
+
+func TestLoad_ReservedResourceEnvKeys(t *testing.T) {
+	reserved := []string{"ZPINIT_CPU_COUNT", "ZPINIT_CPU_QUOTA", "ZPINIT_MEMORY_BYTES"}
+	for _, k := range reserved {
+		t.Run(k, func(t *testing.T) {
+			dir := t.TempDir()
+			write(t, filepath.Join(dir, "services", "10_a.toml"), `
+command = ["x"]
+[env]
+`+k+` = "override"
+`)
+			_, err := Load(dir)
+			if err == nil {
+				t.Fatalf("expected error for reserved key %s", k)
+			}
+			if !strings.Contains(err.Error(), "reserved") || !strings.Contains(err.Error(), k) {
+				t.Errorf("error should mention reserved + %s: %v", k, err)
+			}
+		})
+	}
+}
+
+func TestByteSize_UnmarshalText(t *testing.T) {
+	cases := []struct {
+		in   string
+		want uint64
+	}{
+		{"", 0},
+		{"0", 0},
+		{"1024", 1024},
+		{"1k", 1000},
+		{"1KB", 1000},
+		{"1Ki", 1024},
+		{"1KiB", 1024},
+		{"256MiB", 256 * 1024 * 1024},
+		{"1GB", 1000 * 1000 * 1000},
+		{"1.5GiB", 1610612736}, // 1.5 * 2^30
+	}
+	for _, c := range cases {
+		var b ByteSize
+		if err := b.UnmarshalText([]byte(c.in)); err != nil {
+			t.Errorf("%q: %v", c.in, err)
+			continue
+		}
+		if uint64(b) != c.want {
+			t.Errorf("%q: got %d, want %d", c.in, uint64(b), c.want)
+		}
+	}
+}
+
+func TestByteSize_UnknownUnit(t *testing.T) {
+	var b ByteSize
+	if err := b.UnmarshalText([]byte("1xb")); err == nil {
+		t.Error("expected error for unknown unit")
+	}
+}
+
 // NewEmpty produces a Config that supervise mode would refuse (zero
 // services) but wrap mode runs fine on. Defaults must be populated
 // because runEntrypoint and the orchestrator both read them.

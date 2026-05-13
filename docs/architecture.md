@@ -16,6 +16,7 @@ dev compiles via build tags but doesn't exercise PID-1 paths.
 | `internal/service`     | Process spawn with SysProcAttr, credentials, log destinations.                                 |
 | `internal/supervisor`  | Per-service state machine, orchestrator (boot, readiness, reload, shutdown), control server.  |
 | `internal/ctlproto`    | Wire protocol between zpinit and zpctl.                                                        |
+| `internal/resources`   | cgroup v1/v2 + /proc CPU/memory detection. Produces the `ZPINIT_CPU_*`/`ZPINIT_MEMORY_BYTES` env vars. |
 
 ## Per-service state machine
 
@@ -39,7 +40,15 @@ consecutive crashes (FATAL). The retry budget is hardcoded
 2. **Mode detection.** If `flag.Args()` is non-empty after zpinit
    parses its own flags, a CMD was provided: zpinit `syscall.Exec`s
    it as PID 1 and ignores `services/`.
-3. **Service boot.** In supervise mode, services start in filename
+3. **Resource detection.** `internal/resources` reads cgroup v2 / v1
+   and `/proc` (taking the min of all sources). Reservations from
+   `[resources]` are subtracted; the result is exported as
+   `ZPINIT_CPU_COUNT`, `ZPINIT_CPU_QUOTA`, and `ZPINIT_MEMORY_BYTES`
+   at the top of the env precedence chain so neither container env
+   nor entrypoint scripts can shadow the detected values. Validation
+   rejects the keys in any operator `[env]` table. Detection is
+   one-shot at boot; live updates land in a later release.
+4. **Service boot.** In supervise mode, services start in filename
    order. Each readiness probe blocks the next service's start. The
    `boot_timeout` budget covers the whole phase, starting when this
    step begins (not at zpinit launch).

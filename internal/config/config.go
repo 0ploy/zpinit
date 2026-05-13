@@ -42,6 +42,20 @@ type Globals struct {
 	// it travels via the syscall.Exec / spawn env path rather than the
 	// container's stored config.
 	Env map[string]string `toml:"env"`
+	// Resources holds operator-configured reservations and (later)
+	// autoscaler tuning. All fields default to zero; an absent
+	// [resources] block is identical to all defaults.
+	Resources Resources `toml:"resources"`
+}
+
+// Resources is the [resources] section of zpinit.toml. ReserveCPU is
+// subtracted from the detected CPU budget before children see
+// ZPINIT_CPU_COUNT / ZPINIT_CPU_QUOTA; ReserveMemory is subtracted
+// from ZPINIT_MEMORY_BYTES. Future commits add autoscaler tunables
+// (scale_up_after, scale_down_after).
+type Resources struct {
+	ReserveCPU    float64  `toml:"reserve_cpu"`
+	ReserveMemory ByteSize `toml:"reserve_memory"`
 }
 
 type Logging struct {
