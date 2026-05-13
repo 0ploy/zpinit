@@ -233,9 +233,11 @@ extras on shrink.
 
 ```toml
 command = ["/usr/bin/sidekiq"]
-replicas      = "auto"     # natural target = detected CPU count
-replicas_min  = 2          # floor (optional)
-replicas_max  = 16         # ceiling (optional)
+replicas         = "auto"        # natural target = detected CPU count
+replicas_min     = 2             # floor (optional)
+replicas_max     = 16            # ceiling (optional)
+reload_on_change = ["cpu"]       # restart kept replicas on cpu change
+                                 # (defaults to ["cpu","memory"] when omitted)
 ```
 
 `replicas_min` doubles as a way to push the count *above* the CPU

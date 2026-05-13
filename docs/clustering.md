@@ -44,9 +44,11 @@ Set `replicas = "auto"` to let zpinit track the detected CPU count:
 
 ```toml
 command = ["node", "/app/server.js"]
-replicas = "auto"           # natural target = available CPUs
-replicas_min = 2            # optional; floor above CPU count
-replicas_max = 16           # optional; ceiling
+replicas = "auto"               # natural target = available CPUs
+replicas_min = 2                # optional; floor above CPU count
+replicas_max = 16               # optional; ceiling
+reload_on_change = ["cpu"]      # restart kept replicas on cpu change
+                                # (defaults to ["cpu","memory"] when omitted)
 restart = "always"
 ```
 
