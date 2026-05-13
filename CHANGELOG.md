@@ -4,6 +4,19 @@
 
 ### Features
 
+- **Resource limit changes now trigger live reload.** A background
+  watcher polls cgroup state once a second and commits a delta
+  (after `scale_up_after` / `scale_down_after` debounce, defaults
+  5 s / 30 s) when the exposed `ZPINIT_CPU_COUNT` or
+  `ZPINIT_MEMORY_BYTES` value moves. New per-service
+  `reload_on_change = ["cpu", "memory"]` opts in: zpinit fans out
+  the configured reload action (signal, command, or full restart)
+  to every subscriber whose dimensions intersect the change. Lets
+  `docker update --cpus N` (or Kubernetes in-place pod resize)
+  propagate to live workloads without operator intervention.
+  Sub-integer quota wobble that doesn't move the integer floor is
+  intentionally invisible.
+
 - **`zpctl reload <service>` performs in-place reload.** A new
   per-service `reload_signal` (e.g. `"HUP"`) sends the configured
   signal to the running process group; `reload_command` (e.g.

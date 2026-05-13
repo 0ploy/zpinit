@@ -325,14 +325,42 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 	orch := supervisor.NewOrchestrator(cfg, envSlice, r, log)
 	// On reload, recompose the per-service base env from the *new*
 	// globals.Env layered with the boot-time container env, boot-time
-	// script deltas, and the boot-time resource snapshot. Scripts only
+	// script deltas, and the *current* resource snapshot. Scripts only
 	// run once at boot, so reload can't re-derive their additions;
-	// capturing scriptEnv preserves them. resourceEnv is fixed at boot
-	// here too: live updates land in a later commit.
-	orch.SetBaseEnvBuilder(func(globalsEnv map[string]string) []string {
-		merged := layeredMerge(globalsEnv, containerEnv, scriptEnv, resourceEnv)
+	// capturing scriptEnv preserves them. resourceEnv flows through
+	// the orchestrator's SetResourceEnv path, called once at boot here
+	// and again from the watcher on every committed delta.
+	orch.SetBaseEnvBuilder(func(globalsEnv, currentResourceEnv map[string]string) []string {
+		merged := layeredMerge(globalsEnv, containerEnv, scriptEnv, currentResourceEnv)
 		return entrypoint.SliceFromEnviron(merged)
 	})
+	orch.SetResourceEnv(resourceEnv)
+
+	// Resource watcher: re-detects on a poll loop, debounces per
+	// dimension, and forwards each committed delta to the
+	// orchestrator. Lifetime tied to the supervise loop; cancel of
+	// watcherCtx stops the polling goroutine.
+	watcherCtx, watcherCancel := context.WithCancel(context.Background())
+	defer watcherCancel()
+	watcher := resources.NewWatcher(
+		cfg.Globals.Resources.ReserveCPU,
+		cfg.Globals.Resources.ReserveMemory.Bytes(),
+		cfg.Globals.Resources.ScaleUpAfter.Std(),
+		cfg.Globals.Resources.ScaleDownAfter.Std(),
+		log,
+	)
+	sub := watcher.Subscribe()
+	watcher.Start(watcherCtx)
+	go func() {
+		for {
+			select {
+			case <-watcherCtx.Done():
+				return
+			case change := <-sub:
+				orch.OnResourceChange(change)
+			}
+		}
+	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

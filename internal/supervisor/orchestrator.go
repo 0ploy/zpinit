@@ -34,13 +34,19 @@ const shutdownHeadroom = 30 * time.Second
 // orchestration on top.
 type Orchestrator struct {
 	baseEnv []string
-	// baseEnvBuilder, if set, is invoked by Reload with the new
-	// globals.Env to recompute baseEnv. main.go installs this so
-	// SIGHUP can propagate globals.Env changes to restarted services
-	// without re-running entrypoint.d. nil means baseEnv is fixed at
-	// construction (the default for tests).
-	baseEnvBuilder func(globalsEnv map[string]string) []string
-	log            *slog.Logger
+	// baseEnvBuilder, if set, is invoked to recompute baseEnv. main.go
+	// installs this so SIGHUP can propagate globals.Env changes to
+	// restarted services without re-running entrypoint.d, and so the
+	// watcher-driven resource updates can refresh ZPINIT_CPU_COUNT
+	// and friends without rerunning scripts either. nil means
+	// baseEnv is fixed at construction (the default for tests).
+	baseEnvBuilder func(globalsEnv, resourceEnv map[string]string) []string
+	// resourceEnv is the latest set of detected resource env vars
+	// (ZPINIT_CPU_COUNT/CPU_QUOTA/MEMORY_BYTES). Updated by
+	// OnResourceChange when the watcher commits a delta; passed
+	// into baseEnvBuilder on every recompose.
+	resourceEnv map[string]string
+	log         *slog.Logger
 
 	// Dependency hooks — fields rather than constructor args so tests
 	// in the same package can swap them after NewOrchestrator without
@@ -100,13 +106,35 @@ type Orchestrator struct {
 	watcherGen uint64
 }
 
-// SetBaseEnvBuilder installs a function that Reload uses to recompute
-// the per-service base env from the new globals.Env. Optional; if
-// unset, Reload leaves baseEnv unchanged.
-func (o *Orchestrator) SetBaseEnvBuilder(fn func(globalsEnv map[string]string) []string) {
+// SetBaseEnvBuilder installs a function that recomposes the
+// per-service base env. Called by Reload (passes new globals.Env)
+// and by OnResourceChange (passes new resourceEnv). Optional; if
+// unset, both paths leave baseEnv unchanged.
+func (o *Orchestrator) SetBaseEnvBuilder(fn func(globalsEnv, resourceEnv map[string]string) []string) {
 	o.mu.Lock()
 	o.baseEnvBuilder = fn
 	o.mu.Unlock()
+}
+
+// SetResourceEnv records the current detected resource env vars,
+// recomputes the orchestrator's baseEnv, and pushes the new slice
+// into every live Runner. Each runner caches its own baseEnv at
+// construction time and reads it on respawn; without the push, a
+// fallback-restart triggered by a resource change would spawn the
+// new child with stale env. Called once at boot from main.go and
+// again from OnResourceChange.
+func (o *Orchestrator) SetResourceEnv(env map[string]string) {
+	o.mu.Lock()
+	o.resourceEnv = env
+	if o.baseEnvBuilder != nil && o.cfg != nil {
+		o.baseEnv = o.baseEnvBuilder(o.cfg.Globals.Env, env)
+	}
+	newBaseEnv := o.baseEnv
+	runners := append([]*Runner(nil), o.runners...)
+	o.mu.Unlock()
+	for _, r := range runners {
+		r.SetBaseEnv(newBaseEnv)
+	}
 }
 
 // NewOrchestrator builds an Orchestrator wired to the production
@@ -461,10 +489,15 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) error 
 	o.mu.RUnlock()
 	// Recompute baseEnv from the new globals.Env if main.go installed
 	// a builder. Without one, fall back to the existing baseEnv (tests
-	// that don't care about env propagation rely on this).
+	// that don't care about env propagation rely on this). The current
+	// resource env is captured under the same lock so a watcher-driven
+	// update concurrent with reload doesn't race with the rebuild.
+	o.mu.RLock()
+	resourceEnv := o.resourceEnv
+	o.mu.RUnlock()
 	newBaseEnv := o.baseEnv
 	if builder != nil {
-		newBaseEnv = builder(newCfg.Globals.Env)
+		newBaseEnv = builder(newCfg.Globals.Env, resourceEnv)
 	}
 	o.log.Info("reload", "add", len(diff.add), "remove", len(diff.remove), "restart", len(diff.restart))
 

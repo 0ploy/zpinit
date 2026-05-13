@@ -855,7 +855,7 @@ func TestReload_GlobalsEnvPropagatesToRestartedServices(t *testing.T) {
 	// Install a builder that maps globals.Env directly to the slice.
 	// Production wires layeredMerge here; for the test we want the
 	// new globals to show up verbatim so we can assert on it.
-	f.orch.SetBaseEnvBuilder(func(g map[string]string) []string {
+	f.orch.SetBaseEnvBuilder(func(g, _ map[string]string) []string {
 		out := make([]string, 0, len(g))
 		for k, v := range g {
 			out = append(out, k+"="+v)

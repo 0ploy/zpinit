@@ -72,6 +72,32 @@ relies on.
 `exit_code_from` is rebound on every reload, so the watched service
 can be added, removed, or retargeted.
 
+### Live resource watcher
+
+A polling goroutine in `internal/resources.Watcher` re-runs
+`Detect` once a second. When the exposed integer (`ZPINIT_CPU_COUNT`)
+or uint64 (`ZPINIT_MEMORY_BYTES`) value differs from the last
+committed Snapshot, a per-direction debounce timer starts
+(`scale_up_after` for any upward move, `scale_down_after`
+otherwise). If the new value still holds when the timer fires, the
+watcher commits and emits a `Change` carrying the new Snapshot and
+the list of dimensions (`"cpu"`, `"memory"`) that moved. A
+transient flip that returns to baseline within the debounce window
+emits nothing.
+
+The orchestrator's `OnResourceChange` consumes the channel:
+it updates the internal `resourceEnv` (so the next reload-driven
+recompose of baseEnv sees the new values), recomposes baseEnv via
+the installed builder so freshly-spawned children pick up the new
+env, then fans out a reload action to every runner whose
+`reload_on_change` list intersects the changed dimensions.
+Sub-integer quota wobble that doesn't move the floor is invisible
+by construction.
+
+Polling is intentionally simple; inotify on cgroupfs would cut the
+median detection latency but is left as an optimization since one
+file-read per second is essentially free.
+
 ### Per-service reload action
 
 `zpctl reload <name>` (and the future watcher-driven reload trigger)

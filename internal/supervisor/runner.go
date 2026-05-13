@@ -429,6 +429,18 @@ func (r *Runner) StoppedManually() bool {
 	return r.stoppedManually
 }
 
+// SetBaseEnv replaces the runner's captured baseEnv. Subsequent
+// spawns (after a Stop or a crash-driven restart) will see the new
+// slice. The currently-running child keeps its boot-time env: env
+// is set at exec, not retroactively. Safe to call from outside
+// goroutines — the field is mutated under r.mu so spawnNext's
+// read pairs cleanly.
+func (r *Runner) SetBaseEnv(env []string) {
+	r.mu.Lock()
+	r.baseEnv = env
+	r.mu.Unlock()
+}
+
 // SignalGroup forwards an arbitrary signal to the running process'
 // process group. Returns an error if the runner has no live process.
 // Used by the control server's `signal NAME SIG` command.
@@ -507,7 +519,10 @@ func (r *Runner) handleStart(timers *runnerTimers) {
 // On spawn failure, increments crashes and schedules backoff (or fatal).
 func (r *Runner) spawnNext(timers *runnerTimers) {
 	r.setState(StateStarting)
-	proc, err := r.spawn(r.cfg, r.baseEnv)
+	r.mu.Lock()
+	env := r.baseEnv
+	r.mu.Unlock()
+	proc, err := r.spawn(r.cfg, env)
 	if err != nil {
 		r.log.Error("spawn failed", "service", r.DisplayName(), "err", err)
 		r.recordFailure(timers)

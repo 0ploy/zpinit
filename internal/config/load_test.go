@@ -655,6 +655,70 @@ reload_command = ["/bin/true"]
 	}
 }
 
+func TestLoad_ReloadOnChange(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_app.toml"), `
+command = ["x"]
+reload_on_change = ["cpu", "memory"]
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.Services[0].ReloadOnChange
+	if len(got) != 2 || got[0] != "cpu" || got[1] != "memory" {
+		t.Errorf("ReloadOnChange = %v", got)
+	}
+}
+
+func TestLoad_ReloadOnChangeUnknownDim(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_app.toml"), `
+command = ["x"]
+reload_on_change = ["cpu", "disk"]
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for unknown dimension")
+	}
+	if !strings.Contains(err.Error(), "reload_on_change") {
+		t.Errorf("error should mention reload_on_change: %v", err)
+	}
+}
+
+func TestLoad_ScaleDelaysDefault(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Globals.Resources.ScaleUpAfter.Std() != 5*time.Second {
+		t.Errorf("ScaleUpAfter default = %v", cfg.Globals.Resources.ScaleUpAfter.Std())
+	}
+	if cfg.Globals.Resources.ScaleDownAfter.Std() != 30*time.Second {
+		t.Errorf("ScaleDownAfter default = %v", cfg.Globals.Resources.ScaleDownAfter.Std())
+	}
+}
+
+func TestLoad_ScaleDelaysCustom(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "zpinit.toml"), `
+[resources]
+scale_up_after = "2s"
+scale_down_after = "1m"
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Globals.Resources.ScaleUpAfter.Std() != 2*time.Second {
+		t.Errorf("ScaleUpAfter = %v", cfg.Globals.Resources.ScaleUpAfter.Std())
+	}
+	if cfg.Globals.Resources.ScaleDownAfter.Std() != time.Minute {
+		t.Errorf("ScaleDownAfter = %v", cfg.Globals.Resources.ScaleDownAfter.Std())
+	}
+}
+
 func TestLoad_ReloadCommandOnly(t *testing.T) {
 	dir := t.TempDir()
 	write(t, filepath.Join(dir, "services", "10_a.toml"), `

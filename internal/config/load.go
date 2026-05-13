@@ -115,6 +115,12 @@ func applyGlobalDefaults(g *Globals) {
 	if g.ControlSocket == "" {
 		g.ControlSocket = "/run/zpinit.sock"
 	}
+	if g.Resources.ScaleUpAfter == 0 {
+		g.Resources.ScaleUpAfter = Duration(5 * time.Second)
+	}
+	if g.Resources.ScaleDownAfter == 0 {
+		g.Resources.ScaleDownAfter = Duration(30 * time.Second)
+	}
 }
 
 func loadServices(dir string, cfg *Config) error {
@@ -297,6 +303,12 @@ func validate(cfg *Config) error {
 	if cfg.Globals.Resources.ReserveCPU < 0 {
 		errs = append(errs, fmt.Sprintf("[resources].reserve_cpu must be >= 0, got %v", cfg.Globals.Resources.ReserveCPU))
 	}
+	if cfg.Globals.Resources.ScaleUpAfter < 0 {
+		errs = append(errs, fmt.Sprintf("[resources].scale_up_after must be >= 0"))
+	}
+	if cfg.Globals.Resources.ScaleDownAfter < 0 {
+		errs = append(errs, fmt.Sprintf("[resources].scale_down_after must be >= 0"))
+	}
 
 	nameToFile := map[string]string{}
 	for i := range cfg.Services {
@@ -332,6 +344,11 @@ func validate(cfg *Config) error {
 		if s.ReloadSignal != "" {
 			if _, ok := ParseSignal(s.ReloadSignal); !ok {
 				errs = append(errs, fmt.Sprintf("%s: reload_signal %q is not a recognised signal name", s.Filename, s.ReloadSignal))
+			}
+		}
+		for _, dim := range s.ReloadOnChange {
+			if dim != resources.DimCPU && dim != resources.DimMemory {
+				errs = append(errs, fmt.Sprintf("%s: reload_on_change entry %q must be %q or %q", s.Filename, dim, resources.DimCPU, resources.DimMemory))
 			}
 		}
 		for k := range s.Env {

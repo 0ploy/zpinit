@@ -51,11 +51,16 @@ type Globals struct {
 // Resources is the [resources] section of zpinit.toml. ReserveCPU is
 // subtracted from the detected CPU budget before children see
 // ZPINIT_CPU_COUNT / ZPINIT_CPU_QUOTA; ReserveMemory is subtracted
-// from ZPINIT_MEMORY_BYTES. Future commits add autoscaler tunables
-// (scale_up_after, scale_down_after).
+// from ZPINIT_MEMORY_BYTES. ScaleUpAfter / ScaleDownAfter set the
+// per-direction debounce for the live resource watcher: a change has
+// to hold for the configured duration before it is committed (and
+// reload_on_change services are reloaded). Defaults: 5 s up, 30 s
+// down — eager scale-up, patient scale-down.
 type Resources struct {
-	ReserveCPU    float64  `toml:"reserve_cpu"`
-	ReserveMemory ByteSize `toml:"reserve_memory"`
+	ReserveCPU     float64  `toml:"reserve_cpu"`
+	ReserveMemory  ByteSize `toml:"reserve_memory"`
+	ScaleUpAfter   Duration `toml:"scale_up_after"`
+	ScaleDownAfter Duration `toml:"scale_down_after"`
 }
 
 type Logging struct {
@@ -116,6 +121,14 @@ type Service struct {
 	// service log; non-zero exit is logged but does not kill the
 	// service. Mutually exclusive with ReloadSignal.
 	ReloadCommand []string `toml:"reload_command"`
+
+	// ReloadOnChange lists the resource dimensions that, when their
+	// exposed value moves (ZPINIT_CPU_COUNT for "cpu",
+	// ZPINIT_MEMORY_BYTES for "memory"), cause zpinit to perform a
+	// reload action on this service. The action is whatever
+	// ReloadSignal/ReloadCommand declares, falling back to full
+	// restart if neither is set. Empty or nil disables the trigger.
+	ReloadOnChange []string `toml:"reload_on_change"`
 }
 
 // IsReloadable returns true unless the service explicitly set

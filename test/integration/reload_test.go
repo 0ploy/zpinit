@@ -167,6 +167,110 @@ stop_timeout = "1s"
 	}
 }
 
+// TestReloadOnCPU: zpinit watches the cgroup fixture for CPU
+// changes; when the operator rewrites cpu.max the service with
+// reload_on_change = ["cpu"] gets reloaded (here: full restart, so
+// the PID changes). Uses very short scale_up_after so the test
+// doesn't drag in wall-clock time.
+func TestReloadOnCPU(t *testing.T) {
+	cfg := t.TempDir()
+	socket := filepath.Join(t.TempDir(), "zpinit.sock")
+	cg := t.TempDir()
+	proc := t.TempDir()
+	// 2 CPUs initially.
+	writeFile(t, filepath.Join(cg, "cpu.max"), "200000 100000\n")
+	writeFile(t, filepath.Join(cg, "memory.max"), "1073741824\n")
+	writeFile(t, filepath.Join(proc, "cpuinfo"),
+		"processor\t: 0\nprocessor\t: 1\nprocessor\t: 2\nprocessor\t: 3\n")
+	writeFile(t, filepath.Join(proc, "meminfo"), "MemTotal:       16777216 kB\n")
+
+	writeFile(t, filepath.Join(cfg, "zpinit.toml"), fmt.Sprintf(`
+control_socket = "%s"
+[resources]
+scale_up_after   = "200ms"
+scale_down_after = "200ms"
+`, socket))
+	writeFile(t, filepath.Join(cfg, "services", "10_app.toml"), `
+command = ["/bin/sh", "-c", "while true; do sleep 1; done"]
+restart = "always"
+stop_timeout = "1s"
+reload_on_change = ["cpu"]
+`)
+
+	zp, zpStderr := startZpinitWithEnv(t, cfg, socket, map[string]string{
+		"ZPINIT_CGROUP_ROOT": cg,
+		"ZPINIT_PROC_ROOT":   proc,
+	})
+	defer stopZpinit(t, zp)
+	zpctl := zpctlRunner(t, socket)
+
+	if !waitForRunning(zpctl, "app", 3*time.Second) {
+		t.Fatalf("app not RUNNING; stderr:\n%s", zpStderr.String())
+	}
+	pidBefore, _ := zpctl("pid", "app")
+	pidBefore = strings.TrimSpace(pidBefore)
+
+	// Bump cgroup to 4 CPUs.
+	writeFile(t, filepath.Join(cg, "cpu.max"), "400000 100000\n")
+
+	if !waitForRunningPIDChange(zpctl, "app", pidBefore, 3*time.Second) {
+		t.Errorf("app PID did not change after cpu-change reload trigger; stderr tail:\n%s", zpStderr.String())
+	}
+}
+
+// TestReloadOnMemoryFiltered: a service with reload_on_change =
+// ["memory"] is NOT triggered by a cpu change. Same scaffolding as
+// TestReloadOnCPU; just verifies the dimension filter.
+func TestReloadOnMemoryFiltered(t *testing.T) {
+	cfg := t.TempDir()
+	socket := filepath.Join(t.TempDir(), "zpinit.sock")
+	cg := t.TempDir()
+	proc := t.TempDir()
+	writeFile(t, filepath.Join(cg, "cpu.max"), "200000 100000\n")
+	writeFile(t, filepath.Join(cg, "memory.max"), "1073741824\n")
+	writeFile(t, filepath.Join(proc, "cpuinfo"),
+		"processor\t: 0\nprocessor\t: 1\nprocessor\t: 2\nprocessor\t: 3\n")
+	writeFile(t, filepath.Join(proc, "meminfo"), "MemTotal:       16777216 kB\n")
+
+	writeFile(t, filepath.Join(cfg, "zpinit.toml"), fmt.Sprintf(`
+control_socket = "%s"
+[resources]
+scale_up_after   = "100ms"
+scale_down_after = "100ms"
+`, socket))
+	writeFile(t, filepath.Join(cfg, "services", "10_app.toml"), `
+command = ["/bin/sh", "-c", "while true; do sleep 1; done"]
+restart = "always"
+stop_timeout = "1s"
+reload_on_change = ["memory"]
+`)
+
+	zp, _ := startZpinitWithEnv(t, cfg, socket, map[string]string{
+		"ZPINIT_CGROUP_ROOT": cg,
+		"ZPINIT_PROC_ROOT":   proc,
+	})
+	defer stopZpinit(t, zp)
+	zpctl := zpctlRunner(t, socket)
+
+	if !waitForRunning(zpctl, "app", 3*time.Second) {
+		t.Fatal("app not RUNNING")
+	}
+	pidBefore, _ := zpctl("pid", "app")
+	pidBefore = strings.TrimSpace(pidBefore)
+
+	// Cpu change only — memory-only listener must NOT restart.
+	writeFile(t, filepath.Join(cg, "cpu.max"), "400000 100000\n")
+
+	// Allow enough time for the watcher to commit (100 ms scale_up_after
+	// + poll interval ~1 s). If the filter is broken the runner would
+	// restart in that window.
+	time.Sleep(1500 * time.Millisecond)
+	pidAfter, _ := zpctl("pid", "app")
+	if strings.TrimSpace(pidAfter) != pidBefore {
+		t.Errorf("PID changed despite reload_on_change=[memory]; before=%s after=%s", pidBefore, strings.TrimSpace(pidAfter))
+	}
+}
+
 // startZpinit, stopZpinit, zpctlRunner, waitForRunning, and
 // waitForRunningPIDChange are local helpers reused across the three
 // reload tests above. Kept beside the tests rather than in the
@@ -174,10 +278,18 @@ stop_timeout = "1s"
 // part of the broader contract.
 
 func startZpinit(t *testing.T, cfg, socket string) (*exec.Cmd, *bytes.Buffer) {
+	return startZpinitWithEnv(t, cfg, socket, nil)
+}
+
+func startZpinitWithEnv(t *testing.T, cfg, socket string, extra map[string]string) (*exec.Cmd, *bytes.Buffer) {
 	t.Helper()
 	envFile := filepath.Join(t.TempDir(), "env")
 	zp := exec.Command(zpinitBin, "--config", cfg)
-	zp.Env = append(os.Environ(), "ZPINIT_ENV_FILE="+envFile)
+	env := append(os.Environ(), "ZPINIT_ENV_FILE="+envFile)
+	for k, v := range extra {
+		env = append(env, k+"="+v)
+	}
+	zp.Env = env
 	var stderr bytes.Buffer
 	zp.Stderr = &stderr
 	if err := zp.Start(); err != nil {

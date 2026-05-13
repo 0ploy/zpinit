@@ -139,6 +139,14 @@ keys; `--check-config` rejects the override.
 # needs headroom that workers should not assume is theirs.
 reserve_cpu     = 0.5
 reserve_memory  = "256MiB"
+
+# Per-direction debounce for the live resource watcher. A change
+# must hold for the configured duration before zpinit commits it
+# (and reload_on_change services are reloaded). Eager scale-up,
+# patient scale-down — operators rarely want a transient memory
+# dip to restart their workers.
+scale_up_after   = "5s"
+scale_down_after = "30s"
 ```
 
 Byte sizes accept `K`/`KB`/`Ki`/`KiB` (and `M`, `G`) suffixes:
@@ -146,9 +154,11 @@ unsuffixed digits and `B`/`KB`/`MB`/`GB` use 1000-base; `Ki`/`Mi`/`Gi`
 and the `iB` forms use 1024-base. `reserve_cpu` is a non-negative
 float; `reserve_memory` is a non-negative byte count.
 
-The boot-time detection is fixed for this commit; live updates land
-in a later release. Watching `cpu.max` / `memory.max` for runtime
-limit changes is on the roadmap.
+The watcher polls cgroup state once a second and emits a change
+only when the *exposed* integer / uint64 values move and stay
+moved past the configured debounce. Sub-integer quota wobble that
+doesn't change `ZPINIT_CPU_COUNT` is invisible. Use
+`reload_on_change` on a service to subscribe to either dimension.
 
 ## `services/*.toml` (one per service)
 
@@ -214,6 +224,15 @@ replicas = 1
 #
 reload_signal  = "HUP"
 # reload_command = ["/usr/sbin/nginx", "-s", "reload"]
+
+# When set, the live resource watcher automatically reloads this
+# service whenever the listed dimension's exposed value moves
+# (after the configured scale_up_after / scale_down_after
+# debounce). The action is whatever reload_signal / reload_command
+# declares, falling back to full restart. Empty / unset means the
+# operator must run `zpctl reload` manually to apply changes.
+# Allowed values: "cpu", "memory".
+reload_on_change = ["cpu", "memory"]
 
 # Per-service environment variables. Merged on top of inherited env.
 [env]

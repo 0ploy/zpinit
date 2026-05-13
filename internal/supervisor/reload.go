@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/0ploy/zpinit/internal/config"
+	"github.com/0ploy/zpinit/internal/resources"
 	"github.com/0ploy/zpinit/internal/service"
 )
 
@@ -137,6 +138,59 @@ func (o *Orchestrator) reloadByRestart(ctx context.Context, r *Runner) error {
 		return fmt.Errorf("%s: start: %w", name, err)
 	}
 	return nil
+}
+
+// OnResourceChange is the orchestrator's hook for the resource
+// watcher: invoked from a goroutine in main.go every time the
+// watcher commits a debounced delta. Updates the live resourceEnv
+// (so future spawns see the new values) and fans out per-service
+// reload actions for any runner whose reload_on_change list
+// intersects the dimensions that moved.
+//
+// Reload runs detached on the orchestrator's runner-lifetime ctx,
+// not the watcher's ctx, so a shutting-down watcher doesn't yank
+// the reload mid-flight. Errors are logged; we never propagate
+// them back to the watcher because there's no client to send them
+// to.
+func (o *Orchestrator) OnResourceChange(change resources.Change) {
+	newEnv := change.Snapshot.EnvVars()
+	o.SetResourceEnv(newEnv)
+
+	dimset := map[string]struct{}{}
+	for _, d := range change.Dimensions {
+		dimset[d] = struct{}{}
+	}
+
+	o.mu.RLock()
+	var affected []*Runner
+	for _, r := range o.runners {
+		cfg := r.Cfg()
+		if len(cfg.ReloadOnChange) == 0 {
+			continue
+		}
+		for _, want := range cfg.ReloadOnChange {
+			if _, ok := dimset[want]; ok {
+				affected = append(affected, r)
+				break
+			}
+		}
+	}
+	parent := o.runnerCtx
+	o.mu.RUnlock()
+
+	if len(affected) == 0 {
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	o.log.Info("resource change: reloading subscribed services",
+		"count", len(affected), "dimensions", change.Dimensions)
+	go func() {
+		if err := o.reloadAcrossGroups(parent, affected); err != nil {
+			o.log.Warn("reload-on-change failed", "err", err)
+		}
+	}()
 }
 
 // reloadAcrossGroups dispatches a reload across every filename group
