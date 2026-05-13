@@ -221,6 +221,36 @@ See [docs/clustering.md](docs/clustering.md) for the full PM2
 comparison table, per-runtime examples (Node, Bun, Deno, Python, Go),
 migration guide, and the rolling-reload caveat.
 
+#### 3.2 Auto-scaling replicas
+
+Set `replicas = "auto"` and zpinit picks the count from the
+detected CPU budget. `docker update --cpus N` (or Kubernetes
+in-place pod resize) rescales the live workload — zpinit spawns
+new replicas in filename order and stops the highest-indexed
+extras on shrink.
+
+*Example `services/30_worker.toml`:*
+
+```toml
+command = ["/usr/bin/sidekiq"]
+replicas      = "auto"     # natural target = detected CPU count
+replicas_min  = 2          # floor (optional)
+replicas_max  = 16         # ceiling (optional)
+```
+
+`replicas_min` doubles as a way to push the count *above* the CPU
+number when you want it (I/O-bound queue workers: 16 sidekiqs on a
+2-CPU box). zpinit also injects `ZPINIT_CPU_COUNT`,
+`ZPINIT_CPU_QUOTA`, and `ZPINIT_MEMORY_BYTES` into every service's
+env — nginx workers, JVM `-Xmx`, Node cluster fork counts can read
+them. `replicas = "auto"` implies the running replicas restart on
+each rescale to pick up the new env; opt out for stateless workers
+with `reload_on_change = []`.
+
+See [docs/clustering.md § Auto-scaled replicas](docs/clustering.md)
+and the `[resources]` block in
+[docs/configuration.md](docs/configuration.md).
+
 ## Operator commands (zpctl)
 
 `zpctl` talks to zpinit over `/run/zpinit.sock` (bound `0600`, gated by
