@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+- **Watcher-driven autoscale no longer races with `Reload`.** A
+  resource-watcher commit could overlap a SIGHUP or `zpctl update`,
+  letting `Reload` overwrite the scaler's freshly-computed
+  `Replicas.N` with the stale disk-loaded value (and vice versa
+  depending on which goroutine won the lock race). `OnResourceChange`
+  now holds `reloadMu` across the `SetResourceEnv →
+  SetCurrentSnapshot → scaleAutoServices` triad so the two paths
+  serialize cleanly.
+
+- **Readiness-probe env no longer races the resource watcher.** The
+  orchestrator's boot paths (initial boot and reload-boot) used to
+  read a runner's `baseEnv` slice directly while
+  `SetResourceEnv` could be writing it from the watcher fan-out — a
+  data race in the strict Go memory-model sense that `go test -race`
+  would flag. A new `Runner.BaseEnv()` accessor takes the runner's
+  mutex; the two boot paths now go through it.
+
+- **`boot_timeout` is now per-service at initial boot.** Previously
+  the initial boot phase shared one `context.WithTimeout` across
+  every service, so a service that legitimately took 50 s of a 60 s
+  budget left the remaining services with 10 s combined to finish
+  their readiness probes. Each service now gets its own fresh
+  `boot_timeout`, matching reload-boot and the contract documented
+  in CLAUDE.md.
+
+- **Manual `zpctl start` during backoff resets the crash budget.**
+  Previously the crash counter survived a manual override, so
+  repeatedly running `start` on a flapping service could fast-track
+  it to FATAL even when the operator's intent was "fresh attempt."
+
+### Features
+
+- **`zpctl restart all` and friends parallelize within filename
+  groups.** Stop / start / restart now process consecutive
+  same-filename targets in parallel (matching `stopAll`'s
+  parallel-within-group / serial-between-groups schedule), so
+  `zpctl restart all` on a service with `replicas = 64` finishes
+  in one `stop_timeout` instead of 64. Cross-service ordering is
+  preserved.
+
+- **Control-socket dispatch budget no longer over-counts replicas.**
+  The deadline `handleConn` puts on a `restart all` / `stop all`
+  connection used to grow linearly with each replica; with
+  `replicas = 64` the daemon-side handler kept the socket open for
+  tens of minutes after the client gave up. Budget is now per
+  filename group, matching the actual parallel-within-group
+  execution shape.
+
 ## v0.3.0
 
 ### Features

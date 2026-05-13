@@ -441,6 +441,18 @@ func (r *Runner) SetBaseEnv(env []string) {
 	r.mu.Unlock()
 }
 
+// BaseEnv returns the runner's current baseEnv slice. External
+// callers (the orchestrator's boot paths, which build the readiness
+// probe env) must go through this rather than reading r.baseEnv
+// directly: SetBaseEnv fires from the resource watcher's
+// SetResourceEnv fan-out while initial boot or reload-boot is still
+// running, so a bare field read would race the slice header.
+func (r *Runner) BaseEnv() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.baseEnv
+}
+
 // SignalGroup forwards an arbitrary signal to the running process'
 // process group. Returns an error if the runner has no live process.
 // Used by the control server's `signal NAME SIG` command.
@@ -505,8 +517,16 @@ func (r *Runner) handleStart(timers *runnerTimers) {
 		r.mu.Unlock()
 		r.spawnNext(timers)
 	case StateBackoff:
-		// Caller wants the service NOW; cancel the pending backoff.
+		// Caller wants the service NOW; cancel the pending backoff and
+		// reset the crash counter so a manual override gives the
+		// service a fresh retry budget. Without this, repeatedly
+		// running `zpctl start` during backoff inherits the prior
+		// crash count and can fast-track the service to fatal.
 		timers.cancelBackoff()
+		r.mu.Lock()
+		r.crashes = 0
+		r.nextDelay = r.cfg.BackoffInitial.Std()
+		r.mu.Unlock()
 		r.spawnNext(timers)
 	default:
 		// Already starting/running/stopping — Start is a no-op.

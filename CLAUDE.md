@@ -176,9 +176,13 @@ release page with nothing useful in it.
   Production always reads `/run/zpinit/env`. Don't expose it in `--help` or
   document it publicly.
 
-- `boot_timeout` starts when service-boot begins, not at zpinit launch.
-  Per-script timeouts cover the entrypoint.d phase separately, so a slow
-  `composer install` doesn't eat the service-boot budget.
+- `boot_timeout` is a per-service budget at both initial boot and
+  reload: each service gets its own fresh `context.WithTimeout`. A
+  legitimately slow first service therefore cannot starve later
+  services of their probe window. Don't refactor `boot` to share one
+  ctx across services. Per-script timeouts cover the entrypoint.d
+  phase separately, so a slow `composer install` doesn't eat the
+  service-boot budget either.
 
 - Reload-removing the `exit_code_from`-watched service shuts the whole
   supervisor down: its terminal-state watcher fires and triggers shutdown.
@@ -192,11 +196,23 @@ release page with nothing useful in it.
 - `Orchestrator.runners`, `.cfg`, `.baseEnv`, `.runnerCtx`, `.wg`,
   `.earlyShutdownCh`, `.shutdownOnce`, `.watcherCancel`, and
   `.watcherGen` are all protected by `o.mu` (RWMutex). Reload-vs-Reload
-  is serialized by `o.reloadMu`. External readers (control server) must
-  use `snapshotRunners()`: iterating the live slice while Reload
-  mutates it is a data race confirmed by `go test -race`.
+  AND Reload-vs-watcher-driven autoscale are both serialized by
+  `o.reloadMu`: `OnResourceChange` takes it around the
+  `SetResourceEnv → SetCurrentSnapshot → scaleAutoServices` triad so a
+  SIGHUP/`zpctl update` racing with a watcher commit can't observe a
+  half-updated `o.cfg` or overwrite the scaler's `Replicas.N`
+  mutation with a stale disk-loaded value. Don't drop that lock; the
+  fanout reload after the triad runs outside it because per-runner
+  reloads only touch that runner's state. External readers (control
+  server) must use `snapshotRunners()`: iterating the live slice
+  while Reload mutates it is a data race confirmed by `go test -race`.
   `spawnRunnerGoroutine` snapshots `runnerCtx`/`wg` under RLock so it
   is safe to call from outside the cfg-write critical section.
+  Boot paths that need the runner's current baseEnv (the readiness
+  probe env in `bootOne` / `bootReloadJob`) MUST go through
+  `r.BaseEnv()`, not a bare `r.baseEnv` read: `Runner.SetBaseEnv`
+  fires from `SetResourceEnv` while initial boot or reload-boot is
+  still running, so the bare read races the slice header.
 
 - `Reload` registers added/restart-new runners synchronously but boots
   them in a single detached goroutine (`runReloadBoots`), one at a time
@@ -236,7 +252,11 @@ release page with nothing useful in it.
   per-replica teardown would multiply shutdown time by N). The shared
   helper `stopRunnerGroup` is reused by `removeServiceGroup` so the
   reload path gets the same parallel-within-group benefit. Per-runner
-  SIGKILL escalation bounds any stuck replica.
+  SIGKILL escalation bounds any stuck replica. The control-socket
+  verbs `start` / `stop` / `restart` follow the same rule (parallel
+  within consecutive same-filename targets, serial between groups) so
+  `zpctl restart all` on `replicas = 64` finishes in one stop_timeout
+  instead of 64.
 
 - Shutdown wait budget is recomputed at signal time via
   `Orchestrator.ShutdownBudget()`, not snapshotted at boot. It counts

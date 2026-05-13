@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -178,9 +179,23 @@ func (s *ControlServer) dispatchBudget(req *ctlproto.Request) time.Duration {
 		}
 	}
 
-	const perTargetGrace = 10 * time.Second
+	// Budget per filename group, not per runner. dispatch processes
+	// replicas of one logical service in parallel (matching stopAll
+	// / removeServiceGroup), so a `replicas = 64` service contributes
+	// one unit of stop_timeout+grace to the budget, not 64. The
+	// previous per-runner accumulation produced multi-hour deadlines
+	// for `stop all` / `restart all` on heavily-replicated services,
+	// which kept the daemon-side handler goroutine and socket open
+	// for that long even after a client disconnect.
+	const perTargetGrace = reapGrace + 5*time.Second
 	budget := minDispatchBudget
+	seenFiles := make(map[string]struct{}, len(targets))
 	for _, r := range targets {
+		fn := r.Cfg().Filename
+		if _, ok := seenFiles[fn]; ok {
+			continue
+		}
+		seenFiles[fn] = struct{}{}
 		budget += r.Cfg().StopTimeout.Std() + perTargetGrace
 	}
 	return budget
@@ -248,43 +263,77 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 	resp := okResp("ok")
 	resp.Body = make([]string, 0, len(targets))
 	var anyErr error
-	for _, r := range targets {
-		switch action {
-		case "start":
-			if err := r.StartCtx(ctx); err != nil {
-				anyErr = fmt.Errorf("%s: start: %w", r.DisplayName(), err)
-				resp.Body = append(resp.Body, fmt.Sprintf("%s: start failed: %v", r.DisplayName(), err))
-				continue
-			}
-		case "stop":
-			if err := r.StopCtx(ctx); err != nil {
-				anyErr = fmt.Errorf("%s: stop: %w", r.DisplayName(), err)
-				resp.Body = append(resp.Body, fmt.Sprintf("%s: stop failed: %v", r.DisplayName(), err))
-				continue
-			}
-		case "restart":
-			if err := r.StopCtx(ctx); err != nil {
-				anyErr = fmt.Errorf("%s: restart-stop: %w", r.DisplayName(), err)
-				resp.Body = append(resp.Body, fmt.Sprintf("%s: stop failed: %v", r.DisplayName(), err))
-				continue
-			}
-			waitCtx, cancel := context.WithTimeout(ctx, r.Cfg().StopTimeout.Std()+5*time.Second)
-			state, werr := r.WaitTerminal(waitCtx)
-			cancel()
-			if werr != nil {
-				anyErr = fmt.Errorf("%s: restart-wait: %w", r.DisplayName(), werr)
-				resp.Body = append(resp.Body,
-					fmt.Sprintf("%s: did not stop within timeout (state=%s); restart aborted", r.DisplayName(), state))
-				continue
-			}
-			if err := r.StartCtx(ctx); err != nil {
-				anyErr = fmt.Errorf("%s: restart-start: %w", r.DisplayName(), err)
-				resp.Body = append(resp.Body, fmt.Sprintf("%s: start failed: %v", r.DisplayName(), err))
-				continue
+
+	// Group consecutive same-filename targets and dispatch each group
+	// in parallel, mirroring stopAll's parallel-within-group / serial-
+	// between-groups schedule. expandTargets returns replicas of one
+	// service consecutively (resolveTarget walks them in 0..N-1 order),
+	// so simple linear grouping suffices. Without this, `zpctl restart
+	// all` on a service with replicas = 64 took ≈ 64 × stop_timeout
+	// sequentially even though SIGTERM-driven shutdown finishes in one
+	// stop_timeout.
+	for i := 0; i < len(targets); {
+		fn := targets[i].Cfg().Filename
+		j := i
+		for j < len(targets) && targets[j].Cfg().Filename == fn {
+			j++
+		}
+		group := targets[i:j]
+		i = j
+
+		bodies := make([]string, len(group))
+		errs := make([]error, len(group))
+		var wg sync.WaitGroup
+		for k, r := range group {
+			wg.Add(1)
+			go func(k int, r *Runner) {
+				defer wg.Done()
+				name := r.DisplayName()
+				switch action {
+				case "start":
+					if err := r.StartCtx(ctx); err != nil {
+						errs[k] = fmt.Errorf("%s: start: %w", name, err)
+						bodies[k] = fmt.Sprintf("%s: start failed: %v", name, err)
+						return
+					}
+				case "stop":
+					if err := r.StopCtx(ctx); err != nil {
+						errs[k] = fmt.Errorf("%s: stop: %w", name, err)
+						bodies[k] = fmt.Sprintf("%s: stop failed: %v", name, err)
+						return
+					}
+				case "restart":
+					if err := r.StopCtx(ctx); err != nil {
+						errs[k] = fmt.Errorf("%s: restart-stop: %w", name, err)
+						bodies[k] = fmt.Sprintf("%s: stop failed: %v", name, err)
+						return
+					}
+					waitCtx, cancel := context.WithTimeout(ctx, r.Cfg().StopTimeout.Std()+reapGrace)
+					state, werr := r.WaitTerminal(waitCtx)
+					cancel()
+					if werr != nil {
+						errs[k] = fmt.Errorf("%s: restart-wait: %w", name, werr)
+						bodies[k] = fmt.Sprintf("%s: did not stop within timeout (state=%s); restart aborted", name, state)
+						return
+					}
+					if err := r.StartCtx(ctx); err != nil {
+						errs[k] = fmt.Errorf("%s: restart-start: %w", name, err)
+						bodies[k] = fmt.Sprintf("%s: start failed: %v", name, err)
+						return
+					}
+				}
+				bodies[k] = fmt.Sprintf("%s: %s", name, action)
+			}(k, r)
+		}
+		wg.Wait()
+		for k := range group {
+			resp.Body = append(resp.Body, bodies[k])
+			if errs[k] != nil {
+				anyErr = errs[k]
 			}
 		}
-		resp.Body = append(resp.Body, fmt.Sprintf("%s: %s", r.DisplayName(), action))
 	}
+
 	if anyErr != nil {
 		resp.Code = 1
 		resp.Msg = anyErr.Error()
@@ -355,6 +404,10 @@ func (s *ControlServer) cmdReread() *ctlproto.Response {
 	if err != nil {
 		return errResp("load: " + err.Error())
 	}
+	// Advisory dry-run: computeDiff takes o.mu but not reloadMu, so a
+	// Reload arriving between the diff and the operator's reaction
+	// can change the answer. That is acceptable — `reread` is a
+	// snapshot, not a transaction; the next `update` recomputes.
 	diff := s.orch.computeDiff(newCfg)
 	return diffResp(diff, "will stop", "will restart", "will start", "no changes")
 }

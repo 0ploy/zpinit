@@ -153,6 +153,16 @@ func (o *Orchestrator) reloadByRestart(ctx context.Context, r *Runner) error {
 // them back to the watcher because there's no client to send them
 // to.
 func (o *Orchestrator) OnResourceChange(change resources.Change) {
+	// reloadMu serializes the SetResourceEnv → SetCurrentSnapshot →
+	// scaleAutoServices triad against any concurrent Reload. Without
+	// this, a SIGHUP or `zpctl update` racing with a watcher commit
+	// could observe a half-updated o.cfg (snapshot already advanced,
+	// per-service Replicas.N still being written) or overwrite the
+	// scaler's Replicas.N mutation with a stale disk-loaded value.
+	// Held only across the cfg-mutating triad; the reload-on-change
+	// fanout below runs outside the lock because each per-runner
+	// reload only touches that runner's state.
+	o.reloadMu.Lock()
 	newEnv := change.Snapshot.EnvVars()
 	o.SetResourceEnv(newEnv)
 	o.SetCurrentSnapshot(change.Snapshot)
@@ -165,6 +175,7 @@ func (o *Orchestrator) OnResourceChange(change resources.Change) {
 	// dispatch logic simple. v1 trade-off; we can teach the fanout
 	// to exempt fresh replicas later.
 	o.scaleAutoServices(context.Background(), change.Snapshot)
+	o.reloadMu.Unlock()
 
 	dimset := map[string]struct{}{}
 	for _, d := range change.Dimensions {

@@ -228,9 +228,7 @@ func (o *Orchestrator) Run(ctx context.Context) int {
 		o.spawnRunnerGoroutine(r)
 	}
 
-	bootCtx, bootCancel := context.WithTimeout(ctx, o.cfg.Globals.BootTimeout.Std())
-	bootErr := o.boot(bootCtx)
-	bootCancel()
+	bootErr := o.boot(ctx)
 	if bootErr != nil {
 		o.log.Error("boot failed", "err", bootErr)
 		o.stopAll()
@@ -257,12 +255,19 @@ func (o *Orchestrator) boot(ctx context.Context) error {
 	// Boot reads o.runners; held under read lock while we iterate so
 	// concurrent Reload sees a consistent slice. Per-service work
 	// (Start, WaitBootResult, probe) does not hold the lock — only the
-	// iteration capture does.
+	// iteration capture does. boot_timeout is applied per-service so a
+	// slow first service can't eat the entire boot budget and starve
+	// later services of their probe window. This matches reload-boot's
+	// per-job timeout and the contract documented in CLAUDE.md.
 	o.mu.RLock()
 	snap := append([]*Runner(nil), o.runners...)
+	bootTimeout := o.cfg.Globals.BootTimeout.Std()
 	o.mu.RUnlock()
 	for _, r := range snap {
-		if err := o.bootOne(ctx, r); err != nil {
+		bctx, bcancel := context.WithTimeout(ctx, bootTimeout)
+		err := o.bootOne(bctx, r)
+		bcancel()
+		if err != nil {
 			return fmt.Errorf("%s: %w", r.DisplayName(), err)
 		}
 	}
@@ -282,7 +287,7 @@ func (o *Orchestrator) bootOne(ctx context.Context, r *Runner) error {
 	}
 
 	if cfg.Ready != nil {
-		env := service.MergeEnv(r.baseEnv, cfg.Env)
+		env := service.MergeEnv(r.BaseEnv(), cfg.Env)
 		if err := waitReady(ctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
 			if cfg.Ready.OnTimeout == config.ReadyContinue {
 				o.log.Warn("readiness failed; continuing per on_timeout", "service", name, "err", err)
@@ -321,7 +326,14 @@ func (o *Orchestrator) installExitCodeWatcher() {
 		o.mu.Unlock()
 		return
 	}
-	wctx, wcancel := context.WithCancel(o.runnerCtx)
+	// runnerCtx is populated by Run before any reload can fire in
+	// production, but defend against tests that call this directly so
+	// a nil parent doesn't panic context.WithCancel.
+	parent := o.runnerCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	wctx, wcancel := context.WithCancel(parent)
 	o.watcherCancel = wcancel
 	o.watcherGen++
 	gen := o.watcherGen
@@ -674,7 +686,7 @@ func (o *Orchestrator) bootReloadJob(ctx context.Context, j reloadBootJob) {
 		return
 	}
 	if cfg.Ready != nil {
-		env := service.MergeEnv(r.baseEnv, cfg.Env)
+		env := service.MergeEnv(r.BaseEnv(), cfg.Env)
 		if err := waitReady(ctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
 			if cfg.Ready.OnTimeout == config.ReadyContinue {
 				o.log.Warn("reload: readiness failed; continuing per on_timeout",
