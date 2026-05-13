@@ -271,6 +271,133 @@ reload_on_change = ["memory"]
 	}
 }
 
+// TestAutoUp: a service declared replicas="auto" boots with N
+// equal to the detected CPU count and scales up when the cgroup
+// limit rises. Verifies that new replicas are spawned with
+// monotonically-increasing indices and that `zpctl status` lists
+// them.
+func TestAutoUp(t *testing.T) {
+	cfg := t.TempDir()
+	socket := filepath.Join(t.TempDir(), "zpinit.sock")
+	cg := t.TempDir()
+	proc := t.TempDir()
+	// 2 CPUs initially.
+	writeFile(t, filepath.Join(cg, "cpu.max"), "200000 100000\n")
+	writeFile(t, filepath.Join(cg, "memory.max"), "1073741824\n")
+	writeFile(t, filepath.Join(proc, "cpuinfo"),
+		"processor\t: 0\nprocessor\t: 1\nprocessor\t: 2\nprocessor\t: 3\n")
+	writeFile(t, filepath.Join(proc, "meminfo"), "MemTotal:       16777216 kB\n")
+
+	writeFile(t, filepath.Join(cfg, "zpinit.toml"), fmt.Sprintf(`
+control_socket = "%s"
+[resources]
+scale_up_after   = "200ms"
+scale_down_after = "200ms"
+`, socket))
+	writeFile(t, filepath.Join(cfg, "services", "10_w.toml"), `
+command = ["/bin/sh", "-c", "while true; do sleep 1; done"]
+replicas = "auto"
+restart = "always"
+stop_timeout = "1s"
+`)
+
+	zp, _ := startZpinitWithEnv(t, cfg, socket, map[string]string{
+		"ZPINIT_CGROUP_ROOT": cg,
+		"ZPINIT_PROC_ROOT":   proc,
+	})
+	defer stopZpinit(t, zp)
+	zpctl := zpctlRunner(t, socket)
+
+	if !waitForCount(zpctl, "w", 2, 3*time.Second) {
+		out, _ := zpctl("status")
+		t.Fatalf("expected 2 replicas; status:\n%s", out)
+	}
+
+	// Bump cgroup to 4 CPUs; watcher commits, scaler spawns two more.
+	writeFile(t, filepath.Join(cg, "cpu.max"), "400000 100000\n")
+
+	if !waitForCount(zpctl, "w", 4, 3*time.Second) {
+		out, _ := zpctl("status")
+		t.Fatalf("expected 4 replicas after scale-up; status:\n%s", out)
+	}
+}
+
+// TestAutoDown: same setup, but cgroup shrinks. Highest-indexed
+// replicas are removed.
+func TestAutoDown(t *testing.T) {
+	cfg := t.TempDir()
+	socket := filepath.Join(t.TempDir(), "zpinit.sock")
+	cg := t.TempDir()
+	proc := t.TempDir()
+	writeFile(t, filepath.Join(cg, "cpu.max"), "400000 100000\n")
+	writeFile(t, filepath.Join(cg, "memory.max"), "1073741824\n")
+	writeFile(t, filepath.Join(proc, "cpuinfo"),
+		"processor\t: 0\nprocessor\t: 1\nprocessor\t: 2\nprocessor\t: 3\n")
+	writeFile(t, filepath.Join(proc, "meminfo"), "MemTotal:       16777216 kB\n")
+
+	writeFile(t, filepath.Join(cfg, "zpinit.toml"), fmt.Sprintf(`
+control_socket = "%s"
+[resources]
+scale_up_after   = "200ms"
+scale_down_after = "200ms"
+`, socket))
+	writeFile(t, filepath.Join(cfg, "services", "10_w.toml"), `
+command = ["/bin/sh", "-c", "while true; do sleep 1; done"]
+replicas = "auto"
+restart = "always"
+stop_timeout = "1s"
+reload_on_change = []
+`)
+
+	zp, _ := startZpinitWithEnv(t, cfg, socket, map[string]string{
+		"ZPINIT_CGROUP_ROOT": cg,
+		"ZPINIT_PROC_ROOT":   proc,
+	})
+	defer stopZpinit(t, zp)
+	zpctl := zpctlRunner(t, socket)
+
+	if !waitForCount(zpctl, "w", 4, 3*time.Second) {
+		out, _ := zpctl("status")
+		t.Fatalf("expected 4 replicas at boot; status:\n%s", out)
+	}
+
+	// Shrink to 2 CPUs.
+	writeFile(t, filepath.Join(cg, "cpu.max"), "200000 100000\n")
+
+	if !waitForCount(zpctl, "w", 2, 3*time.Second) {
+		out, _ := zpctl("status")
+		t.Fatalf("expected 2 replicas after scale-down; status:\n%s", out)
+	}
+}
+
+// waitForCount polls `zpctl status` until exactly n RUNNING rows
+// exist for the named service. Returns false on timeout.
+func waitForCount(zpctl func(args ...string) (string, int), name string, n int, timeout time.Duration) bool {
+	prefix := name + "/"
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, _ := zpctl("status")
+		running := 0
+		for _, line := range strings.Split(out, "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			if !strings.HasPrefix(fields[0], prefix) && fields[0] != name {
+				continue
+			}
+			if fields[1] == "RUNNING" {
+				running++
+			}
+		}
+		if running == n {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
 // startZpinit, stopZpinit, zpctlRunner, waitForRunning, and
 // waitForRunningPIDChange are local helpers reused across the three
 // reload tests above. Kept beside the tests rather than in the

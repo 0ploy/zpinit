@@ -496,16 +496,16 @@ func TestRunner_DisplayName(t *testing.T) {
 	if got := rDefault.DisplayName(); got != "api" {
 		t.Errorf("DisplayName(default) = %q, want api", got)
 	}
-	r1 := NewRunner(config.Service{Name: "api", Replicas: 1}, nil, 0, nil, nil, log)
+	r1 := NewRunner(config.Service{Name: "api", Replicas: config.Replicas{N: 1}}, nil, 0, nil, nil, log)
 	if got := r1.DisplayName(); got != "api" {
 		t.Errorf("DisplayName(replicas=1) = %q, want api", got)
 	}
 	// Multi-replica
-	r2a := NewRunner(config.Service{Name: "api", Replicas: 3}, nil, 0, nil, nil, log)
+	r2a := NewRunner(config.Service{Name: "api", Replicas: config.Replicas{N: 3}}, nil, 0, nil, nil, log)
 	if got := r2a.DisplayName(); got != "api/0" {
 		t.Errorf("DisplayName(replicas=3,idx=0) = %q, want api/0", got)
 	}
-	r2b := NewRunner(config.Service{Name: "api", Replicas: 3}, nil, 2, nil, nil, log)
+	r2b := NewRunner(config.Service{Name: "api", Replicas: config.Replicas{N: 3}}, nil, 2, nil, nil, log)
 	if got := r2b.DisplayName(); got != "api/2" {
 		t.Errorf("DisplayName(replicas=3,idx=2) = %q, want api/2", got)
 	}

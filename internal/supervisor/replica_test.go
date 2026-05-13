@@ -76,7 +76,7 @@ func TestExpandServiceToRunners_SingleReplica(t *testing.T) {
 	svc := config.Service{
 		Name:     "api",
 		Filename: "10_api.toml",
-		Replicas: 1,
+		Replicas: config.Replicas{N: 1},
 		Log:      config.Logging{Stdout: "/var/log/api.log", Stderr: "/var/log/api.err"},
 	}
 	rs := expandServiceToRunners(svc, []string{"FOO=bar"}, nil, nil, log)
@@ -105,7 +105,7 @@ func TestExpandServiceToRunners_MultiReplicaSpawnsN(t *testing.T) {
 	svc := config.Service{
 		Name:     "consumer",
 		Filename: "30_consumer.toml",
-		Replicas: 3,
+		Replicas: config.Replicas{N: 3},
 		Log:      config.Logging{Stdout: "/var/log/consumer.log", Stderr: "/var/log/consumer.err"},
 	}
 	rs := expandServiceToRunners(svc, []string{"FOO=bar"}, nil, nil, log)
@@ -142,7 +142,7 @@ func TestExpandServiceToRunners_PlaceholderHonored(t *testing.T) {
 	svc := config.Service{
 		Name:     "consumer",
 		Filename: "30_consumer.toml",
-		Replicas: 2,
+		Replicas: config.Replicas{N: 2},
 		Log:      config.Logging{Stdout: "/var/log/consumer-{index}.log", Stderr: "inherit"},
 	}
 	rs := expandServiceToRunners(svc, nil, nil, nil, log)

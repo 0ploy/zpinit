@@ -195,16 +195,33 @@ stop_timeout = "10s"
 # config reloads (a long-running batch job, for example).
 reloadable = true
 
-# Number of independent supervised copies of `command`. Default 1.
-# Each replica is a first-class child with its own PID, log file, and
-# crash budget; ZPINIT_REPLICA_INDEX=0..N-1 is injected into each
-# replica's env (only when replicas > 1). Replicas of an app that
-# binds a port without SO_REUSEPORT support will collide with
-# EADDRINUSE on all but the first; `zpinit --doctor` catches the
-# common cases. Maximum 64 (typo guard); promotes to a config knob
-# only if anyone asks. See clustering.md for the listener case and
-# the PM2 comparison.
+# Number of independent supervised copies of `command`. Accepts an
+# integer (default 1) or the string "auto", which lets zpinit track
+# the detected CPU count for you. Each replica is a first-class
+# child with its own PID, log file, and crash budget;
+# ZPINIT_REPLICA_INDEX=0..N-1 is injected into each replica's env
+# (when replicas > 1, or whenever replicas = "auto").
+#
+# replicas = "auto" implies reload_on_change = ["cpu", "memory"]
+# unless the operator sets it explicitly (use reload_on_change = []
+# to opt out). The scaler picks the new target after each
+# committed resource change and adds or removes replicas to match.
+# replicas_min / replicas_max bound the auto count (both optional):
+#   - replicas_min raises the floor above the natural CPU count;
+#     useful for I/O-bound queue workers ("16 sidekiqs even on a
+#     2-CPU box").
+#   - replicas_max caps the count from above.
+# Both are ignored for static replicas. min defaults to 1, max to
+# unbounded (subject to the 64 typo guard).
+#
+# Replicas of an app that binds a port without SO_REUSEPORT support
+# will collide with EADDRINUSE on all but the first; `zpinit
+# --doctor` catches the common cases. See clustering.md for the
+# listener case and the PM2 comparison.
 replicas = 1
+# replicas = "auto"
+# replicas_min = 1
+# replicas_max = 8
 
 # In-place reload action for `zpctl reload <name>`. At most one of the
 # two may be set; both unset means `zpctl reload` falls back to a full

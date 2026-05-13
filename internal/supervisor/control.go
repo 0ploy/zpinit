@@ -382,11 +382,20 @@ func diffResp(diff reloadDiff, stopVerb, restartVerb, startVerb, emptyMsg string
 	return resp
 }
 
-func replicaSuffix(n int) string {
-	if n <= 1 {
+// replicaSuffix renders the trailing "[N replicas]" / "[auto …]"
+// tag for the reload/update diff output. Returns "" for static
+// services with replicas <= 1 to keep the common case uncluttered.
+func replicaSuffix(r config.Replicas) string {
+	if r.Auto {
+		if r.N > 0 {
+			return fmt.Sprintf(" [auto, currently %d]", r.N)
+		}
+		return " [auto]"
+	}
+	if r.N <= 1 {
 		return ""
 	}
-	return fmt.Sprintf(" [%d replicas]", n)
+	return fmt.Sprintf(" [%d replicas]", r.N)
 }
 
 func (s *ControlServer) cmdTail(args []string) *ctlproto.Response {

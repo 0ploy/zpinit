@@ -12,6 +12,7 @@ import (
 
 	"github.com/0ploy/zpinit/internal/config"
 	"github.com/0ploy/zpinit/internal/reaper"
+	"github.com/0ploy/zpinit/internal/resources"
 	"github.com/0ploy/zpinit/internal/service"
 )
 
@@ -46,7 +47,12 @@ type Orchestrator struct {
 	// OnResourceChange when the watcher commits a delta; passed
 	// into baseEnvBuilder on every recompose.
 	resourceEnv map[string]string
-	log         *slog.Logger
+	// currentSnapshot mirrors the Watcher's last committed
+	// Snapshot. Reload uses it to resolve `replicas = "auto"` in
+	// freshly-loaded configs so the diff machinery sees the
+	// scaled count rather than the disk-loaded 0.
+	currentSnapshot resources.Snapshot
+	log             *slog.Logger
 
 	// Dependency hooks — fields rather than constructor args so tests
 	// in the same package can swap them after NewOrchestrator without
@@ -113,6 +119,16 @@ type Orchestrator struct {
 func (o *Orchestrator) SetBaseEnvBuilder(fn func(globalsEnv, resourceEnv map[string]string) []string) {
 	o.mu.Lock()
 	o.baseEnvBuilder = fn
+	o.mu.Unlock()
+}
+
+// SetCurrentSnapshot records the latest committed resource
+// Snapshot. main.go calls this at boot with the seed snapshot and
+// OnResourceChange updates it on every commit. Reload uses the
+// value to resolve `replicas = "auto"` in newly-loaded configs.
+func (o *Orchestrator) SetCurrentSnapshot(snap resources.Snapshot) {
+	o.mu.Lock()
+	o.currentSnapshot = snap
 	o.mu.Unlock()
 }
 
@@ -484,6 +500,16 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) error 
 	defer o.reloadMu.Unlock()
 
 	o.mu.RLock()
+	snap := o.currentSnapshot
+	o.mu.RUnlock()
+	// Resolve `replicas = "auto"` in the disk-loaded config so the
+	// diff machinery compares apples to apples — running auto
+	// services already have a live N, and a freshly-loaded copy
+	// with N=0 would otherwise look like a spec change and trigger
+	// a phantom restart.
+	newCfg.Services = ResolveAutoReplicasAtBoot(newCfg.Services, snap)
+
+	o.mu.RLock()
 	diff := o.computeDiffLocked(newCfg)
 	builder := o.baseEnvBuilder
 	o.mu.RUnlock()
@@ -806,11 +832,19 @@ func sortRunners(rs []*Runner) {
 	})
 }
 
-// servicesEqual compares two service configs ignoring Filename, which
-// is the diff key rather than a content field.
+// servicesEqual compares two service configs ignoring Filename
+// (the diff key, not a content field) and ignoring the dynamic
+// replica count for auto services (the scaler owns it; the file
+// reload from disk has N=0 by definition).
 func servicesEqual(a, b config.Service) bool {
 	a.Filename = ""
 	b.Filename = ""
+	if a.Replicas.Auto {
+		a.Replicas.N = 0
+	}
+	if b.Replicas.Auto {
+		b.Replicas.N = 0
+	}
 	return reflect.DeepEqual(a, b)
 }
 

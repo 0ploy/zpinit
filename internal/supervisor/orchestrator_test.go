@@ -931,7 +931,7 @@ func envContains(env []string, kv string) bool {
 // has reached terminal state.
 func TestStopAll_ParallelWithinFilenameGroup(t *testing.T) {
 	svc := mustService("consumer", "10_consumer.toml", func(s *config.Service) {
-		s.Replicas = 4
+		s.Replicas = config.Replicas{N: 4}
 		s.StopTimeout = config.Duration(time.Second)
 	})
 	f, captured := newCapturingFixture(t, []config.Service{svc}, "")
@@ -999,7 +999,7 @@ func TestShutdownBudget_ReplicasShareGroupTimeout(t *testing.T) {
 	// (stop_timeout + reapGrace) to the budget, not 64. This is the
 	// regression guard against the linear-scaling bug.
 	svc := mustService("worker", "10_worker.toml", func(s *config.Service) {
-		s.Replicas = 64
+		s.Replicas = config.Replicas{N: 64}
 		s.StopTimeout = config.Duration(10 * time.Second)
 	})
 	f, captured := newCapturingFixture(t, []config.Service{svc}, "")
@@ -1092,7 +1092,7 @@ func TestReload_AddsReplicatedService(t *testing.T) {
 		Services: []config.Service{
 			mustService("a", "10_a.toml", nil),
 			mustService("b", "20_b.toml", func(s *config.Service) {
-				s.Replicas = 3
+				s.Replicas = config.Replicas{N: 3}
 			}),
 		},
 		Globals: f.cfg.Globals,
@@ -1131,7 +1131,7 @@ func TestReload_RemovesReplicatedService(t *testing.T) {
 	initial := []config.Service{
 		mustService("a", "10_a.toml", nil),
 		mustService("b", "20_b.toml", func(s *config.Service) {
-			s.Replicas = 3
+			s.Replicas = config.Replicas{N: 3}
 		}),
 	}
 	f, captured := newCapturingFixture(t, initial, "")
@@ -1176,7 +1176,7 @@ func TestReload_RemovesReplicatedService(t *testing.T) {
 func TestReload_ReplicasCountChange(t *testing.T) {
 	initial := []config.Service{
 		mustService("consumer", "10_consumer.toml", func(s *config.Service) {
-			s.Replicas = 2
+			s.Replicas = config.Replicas{N: 2}
 		}),
 	}
 	f, captured := newCapturingFixture(t, initial, "")
@@ -1189,7 +1189,7 @@ func TestReload_ReplicasCountChange(t *testing.T) {
 	newCfg := &config.Config{
 		Services: []config.Service{
 			mustService("consumer", "10_consumer.toml", func(s *config.Service) {
-				s.Replicas = 4
+				s.Replicas = config.Replicas{N: 4}
 			}),
 		},
 		Globals: f.cfg.Globals,
@@ -1227,7 +1227,7 @@ func TestDiff_NoChangeForUnchangedReplicatedService(t *testing.T) {
 	// Regression guard: per-replica log rewriting on the Cfg must not
 	// produce a phantom diff when the spec is unchanged.
 	svc := mustService("consumer", "10_consumer.toml", func(s *config.Service) {
-		s.Replicas = 3
+		s.Replicas = config.Replicas{N: 3}
 		s.Log.Stdout = "/var/log/consumer.log"
 	})
 	o := diffFixture(t, []config.Service{svc})
@@ -1243,7 +1243,7 @@ func TestDiff_NoChangeForUnchangedReplicatedService(t *testing.T) {
 
 func TestOrchestrator_ReplicasSpawnsN(t *testing.T) {
 	svc := dummyService("consumer", false)
-	svc.Replicas = 3
+	svc.Replicas = config.Replicas{N: 3}
 	f, captured := newCapturingFixture(t, []config.Service{svc}, "")
 
 	ctx, cancel := context.WithCancel(context.Background())

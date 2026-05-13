@@ -98,14 +98,29 @@ type Service struct {
 	Log        Logging           `toml:"log"`
 	Ready      *Ready            `toml:"ready"`
 
-	// Replicas is the number of independent copies of Command to
-	// supervise. Default 1. Each replica is a first-class Runner with
-	// its own PID, log file, and crash budget. ZPINIT_REPLICA_INDEX is
-	// injected into each replica's env when Replicas > 1. Replicas of
-	// an app that binds a port without SO_REUSEPORT support will
-	// conflict on EADDRINUSE; see the README's "Node.js clustering"
-	// section. `zpinit doctor` catches the common cases pre-boot.
-	Replicas int `toml:"replicas"`
+	// Replicas declares the number of independent copies of Command
+	// to supervise. Accepts an integer (`replicas = 3`) or the
+	// string `"auto"` (`replicas = "auto"`). For static counts each
+	// replica is a first-class Runner with its own PID, log file,
+	// and crash budget; ZPINIT_REPLICA_INDEX is injected when N>1.
+	// For auto, zpinit computes the count from the detected CPU
+	// budget at boot and updates it on every watcher-driven resource
+	// change, clamped to [ReplicasMin, ReplicasMax] when set.
+	// Replicas of an app that binds a port without SO_REUSEPORT
+	// will conflict on EADDRINUSE; see the README's "Node.js
+	// clustering" section. `zpinit doctor` catches common cases
+	// pre-boot.
+	Replicas Replicas `toml:"replicas"`
+
+	// ReplicasMin / ReplicasMax bound the auto-computed replica
+	// count. Both optional. Default min = 1 (zpinit always runs at
+	// least one replica). Default max = unbounded — the natural
+	// CPU-derived count caps unless overridden. Setting min > the
+	// natural count is the way to express "more than CPU count for
+	// I/O-bound workloads" (a queue worker that should run 16 even
+	// on a 2-CPU host).
+	ReplicasMin int `toml:"replicas_min"`
+	ReplicasMax int `toml:"replicas_max"`
 
 	// ReloadSignal, if set, replaces the default stop+start cycle of
 	// `zpctl reload <name>` with an in-place signal to the service's

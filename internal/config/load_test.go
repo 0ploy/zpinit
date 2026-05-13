@@ -399,8 +399,8 @@ func TestLoad_ReplicasDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Services[0].Replicas; got != 1 {
-		t.Errorf("default Replicas = %d, want 1", got)
+	if got := cfg.Services[0].Replicas; got.N != 1 || got.Auto {
+		t.Errorf("default Replicas = %+v, want {N:1 Auto:false}", got)
 	}
 }
 
@@ -414,8 +414,8 @@ replicas = 4
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Services[0].Replicas; got != 4 {
-		t.Errorf("Replicas = %d, want 4", got)
+	if got := cfg.Services[0].Replicas; got.N != 4 || got.Auto {
+		t.Errorf("Replicas = %+v, want {N:4 Auto:false}", got)
 	}
 }
 
@@ -429,8 +429,8 @@ replicas = -1
 	if err == nil {
 		t.Fatal("expected error for negative replicas")
 	}
-	if !strings.Contains(err.Error(), "replicas must be >= 1") {
-		t.Errorf("error should mention replicas >= 1: %v", err)
+	if !strings.Contains(err.Error(), "replicas") || !strings.Contains(err.Error(), "non-negative") {
+		t.Errorf("error should mention replicas non-negative: %v", err)
 	}
 }
 
@@ -652,6 +652,117 @@ reload_command = ["/bin/true"]
 	}
 	if !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Errorf("error should mention mutually exclusive: %v", err)
+	}
+}
+
+func TestLoad_ReplicasAuto(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_w.toml"), `
+command = ["x"]
+replicas = "auto"
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Services[0].Replicas.Auto {
+		t.Error("Auto should be true")
+	}
+}
+
+func TestLoad_ReplicasAutoBounds(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_w.toml"), `
+command = ["x"]
+replicas = "auto"
+replicas_min = 2
+replicas_max = 8
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	s := cfg.Services[0]
+	if s.ReplicasMin != 2 || s.ReplicasMax != 8 {
+		t.Errorf("bounds = (%d, %d), want (2, 8)", s.ReplicasMin, s.ReplicasMax)
+	}
+}
+
+func TestLoad_ReplicasAutoMinGreaterThanMax(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_w.toml"), `
+command = ["x"]
+replicas = "auto"
+replicas_min = 8
+replicas_max = 4
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for min > max")
+	}
+	if !strings.Contains(err.Error(), "replicas_min") {
+		t.Errorf("error should mention replicas_min: %v", err)
+	}
+}
+
+func TestLoad_ReplicasMinWithoutAuto(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_w.toml"), `
+command = ["x"]
+replicas = 3
+replicas_min = 2
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for replicas_min without auto")
+	}
+	if !strings.Contains(err.Error(), "auto") {
+		t.Errorf("error should mention auto: %v", err)
+	}
+}
+
+func TestLoad_ReplicasAutoRejectsRestartNever(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_w.toml"), `
+command = ["x"]
+replicas = "auto"
+restart = "never"
+`)
+	_, err := Load(dir)
+	if err == nil {
+		t.Fatal("expected error for auto + restart=never")
+	}
+}
+
+func TestLoad_ReplicasAutoImpliesReloadOnChange(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_w.toml"), `
+command = ["x"]
+replicas = "auto"
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.Services[0].ReloadOnChange
+	if len(got) != 2 || got[0] != "cpu" || got[1] != "memory" {
+		t.Errorf("ReloadOnChange default = %v, want [cpu memory]", got)
+	}
+}
+
+func TestLoad_ReplicasAutoExplicitEmptyOptsOut(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_w.toml"), `
+command = ["x"]
+replicas = "auto"
+reload_on_change = []
+`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Services[0].ReloadOnChange) != 0 {
+		t.Errorf("explicit [] should disable; got %v", cfg.Services[0].ReloadOnChange)
 	}
 }
 

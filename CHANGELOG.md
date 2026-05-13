@@ -4,6 +4,20 @@
 
 ### Features
 
+- **`replicas = "auto"` lets zpinit track the detected CPU count.**
+  At boot the replica count is set to the natural CPU budget; every
+  debounced resource commit thereafter rebalances the runner set
+  (add replicas in filename order, drop highest-indexed on scale
+  down). Optional `replicas_min` and `replicas_max` clamp the
+  count, with `replicas_min` doubling as a floor that can push the
+  count *above* the natural CPU value for I/O-bound queue workers
+  ("16 sidekiqs on a 2-CPU box"). `replicas = "auto"` implies
+  `reload_on_change = ["cpu", "memory"]` so the surviving replicas
+  also pick up the new env on the next spawn; set
+  `reload_on_change = []` to opt out for stateless workers.
+  `docker update --cpus N` (or Kubernetes in-place pod resize) now
+  rescales the live workload without operator intervention.
+
 - **Resource limit changes now trigger live reload.** A background
   watcher polls cgroup state once a second and commits a delta
   (after `scale_up_after` / `scale_down_after` debounce, defaults

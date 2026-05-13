@@ -38,6 +38,35 @@ for line-sized writes, so they don't tear). Use `{index}` in the path
 for per-replica files when you need them, or have the app prefix each
 line with `ZPINIT_REPLICA_INDEX` for attribution in the shared file.
 
+### Auto-scaled replicas
+
+Set `replicas = "auto"` to let zpinit track the detected CPU count:
+
+```toml
+command = ["node", "/app/server.js"]
+replicas = "auto"           # natural target = available CPUs
+replicas_min = 2            # optional; floor above CPU count
+replicas_max = 16           # optional; ceiling
+restart = "always"
+```
+
+The boot-time count comes from `Detect()`; thereafter every
+debounced commit from the resource watcher rebalances the runner
+set. `docker update --cpus N` (or Kubernetes in-place pod resize)
+propagates to live workloads without operator intervention. Scale-up
+boots new replicas one at a time in filename order (same
+serialization the reload-boot path uses); scale-down stops the
+highest-indexed extras in parallel.
+
+`replicas = "auto"` implies `reload_on_change = ["cpu", "memory"]`,
+so the *kept* replicas also restart to pick up the new
+`ZPINIT_CPU_COUNT`/`ZPINIT_MEMORY_BYTES`. Set `reload_on_change = []`
+to opt out (stateless workers that don't read the env vars).
+
+Auto-replicated services are still bound by the same listener
+rules — without `reusePort` support every replica past the first
+will EADDRINUSE.
+
 ## Listener support by runtime
 
 Listener replicas need the runtime to expose `SO_REUSEPORT`. Non-listener

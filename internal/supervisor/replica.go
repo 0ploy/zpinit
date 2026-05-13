@@ -6,7 +6,52 @@ import (
 	"strings"
 
 	"github.com/0ploy/zpinit/internal/config"
+	"github.com/0ploy/zpinit/internal/resources"
 )
+
+// ComputeAutoTarget returns the target replica count for a service
+// declared as `replicas = "auto"`. Takes the floor of the detected
+// CPU budget (subtracting reservations has already happened by the
+// time the Snapshot reaches here) and clamps to
+// [ReplicasMin, ReplicasMax] when bounds are set. Replicas_min
+// acts as a floor that can drive the count *above* the natural CPU
+// count — useful for I/O-bound queue workers.
+//
+// Always returns at least 1: a service that exists must have at
+// least one runner.
+func ComputeAutoTarget(s config.Service, snap resources.Snapshot) int {
+	natural := snap.CPUCount
+	if natural < 1 {
+		natural = 1
+	}
+	target := natural
+	if s.ReplicasMin > 0 && target < s.ReplicasMin {
+		target = s.ReplicasMin
+	}
+	if s.ReplicasMax > 0 && target > s.ReplicasMax {
+		target = s.ReplicasMax
+	}
+	if target < 1 {
+		target = 1
+	}
+	return target
+}
+
+// ResolveAutoReplicasAtBoot sets the initial N for every auto
+// service in cfg.Services based on the boot-time Snapshot. Called
+// from main.go after Detect+reserves but before NewOrchestrator,
+// so that the orchestrator's expandServiceToRunners spawns the
+// right number of children. Static services are left untouched.
+func ResolveAutoReplicasAtBoot(services []config.Service, snap resources.Snapshot) []config.Service {
+	out := make([]config.Service, len(services))
+	for i, s := range services {
+		if s.Replicas.Auto {
+			s.Replicas.N = ComputeAutoTarget(s, snap)
+		}
+		out[i] = s
+	}
+	return out
+}
 
 // replicaLogPath delegates to config.ReplicaLogPath so the supervisor
 // and doctor share one expansion rule.
@@ -26,7 +71,7 @@ func replicaLogPath(spec string, idx, total int) string {
 // for diff purposes (servicesEqual compares specs, not per-replica
 // copies).
 func expandServiceToRunners(svc config.Service, baseEnv []string, spawner Spawner, clock Clock, log *slog.Logger) []*Runner {
-	n := svc.Replicas
+	n := svc.Replicas.N
 	if n < 1 {
 		n = 1
 	}

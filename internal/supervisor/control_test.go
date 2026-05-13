@@ -37,7 +37,7 @@ func resolveTargetFixture(t *testing.T) []*Runner {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	mkSvc := func(name string, replicas int) config.Service {
-		return config.Service{Name: name, Filename: "10_" + name + ".toml", Replicas: replicas}
+		return config.Service{Name: name, Filename: "10_" + name + ".toml", Replicas: config.Replicas{N: replicas}}
 	}
 	// Non-replicated api, three-replica consumer.
 	var snap []*Runner

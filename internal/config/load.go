@@ -154,7 +154,7 @@ func loadServices(dir string, cfg *Config) error {
 		if svc.Name == "" {
 			svc.Name = nameFromFilename(e.Name())
 		}
-		applyServiceDefaults(&svc, &cfg.Globals)
+		applyServiceDefaults(&svc, &cfg.Globals, md.IsDefined("reload_on_change"))
 		cfg.Services = append(cfg.Services, svc)
 	}
 	return nil
@@ -206,9 +206,20 @@ func isReservedEnvKey(k string) bool {
 	return false
 }
 
-func applyServiceDefaults(s *Service, g *Globals) {
-	if s.Replicas == 0 {
-		s.Replicas = 1
+func applyServiceDefaults(s *Service, g *Globals, reloadOnChangeSet bool) {
+	if !s.Replicas.Auto && s.Replicas.N == 0 {
+		// "replicas key absent" maps to a single static copy.
+		// Auto-mode services leave N == 0 here; the orchestrator's
+		// scaler resolves the initial target from the boot-time
+		// resource snapshot.
+		s.Replicas.N = 1
+	}
+	// `replicas = "auto"` implies the operator wants the workers to
+	// track resource changes. Default reload_on_change to both
+	// dimensions if the key was not set; explicit `[]` opts out.
+	// MetaData.IsDefined distinguishes the two cases at decode time.
+	if s.Replicas.Auto && !reloadOnChangeSet {
+		s.ReloadOnChange = []string{"cpu", "memory"}
 	}
 	if s.Restart == "" {
 		s.Restart = RestartAlways
@@ -332,11 +343,32 @@ func validate(cfg *Config) error {
 		if _, ok := ParseSignal(s.StopSignal); !ok {
 			errs = append(errs, fmt.Sprintf("%s: stop_signal %q is not a recognised signal name", s.Filename, s.StopSignal))
 		}
-		if s.Replicas < 1 {
-			errs = append(errs, fmt.Sprintf("%s: replicas must be >= 1", s.Filename))
-		}
-		if s.Replicas > MaxReplicas {
-			errs = append(errs, fmt.Sprintf("%s: replicas must be <= %d (got %d)", s.Filename, MaxReplicas, s.Replicas))
+		if s.Replicas.Auto {
+			if s.Restart == RestartNever {
+				errs = append(errs, fmt.Sprintf("%s: replicas = \"auto\" is incompatible with restart = \"never\"", s.Filename))
+			}
+			if s.ReplicasMin < 0 {
+				errs = append(errs, fmt.Sprintf("%s: replicas_min must be >= 0, got %d", s.Filename, s.ReplicasMin))
+			}
+			if s.ReplicasMax < 0 {
+				errs = append(errs, fmt.Sprintf("%s: replicas_max must be >= 0, got %d", s.Filename, s.ReplicasMax))
+			}
+			if s.ReplicasMin > 0 && s.ReplicasMax > 0 && s.ReplicasMin > s.ReplicasMax {
+				errs = append(errs, fmt.Sprintf("%s: replicas_min (%d) must be <= replicas_max (%d)", s.Filename, s.ReplicasMin, s.ReplicasMax))
+			}
+			if s.ReplicasMax > MaxReplicas {
+				errs = append(errs, fmt.Sprintf("%s: replicas_max must be <= %d, got %d", s.Filename, MaxReplicas, s.ReplicasMax))
+			}
+		} else {
+			if s.Replicas.N < 1 {
+				errs = append(errs, fmt.Sprintf("%s: replicas must be >= 1", s.Filename))
+			}
+			if s.Replicas.N > MaxReplicas {
+				errs = append(errs, fmt.Sprintf("%s: replicas must be <= %d (got %d)", s.Filename, MaxReplicas, s.Replicas.N))
+			}
+			if s.ReplicasMin != 0 || s.ReplicasMax != 0 {
+				errs = append(errs, fmt.Sprintf("%s: replicas_min / replicas_max only apply when replicas = \"auto\"", s.Filename))
+			}
 		}
 		if s.ReloadSignal != "" && len(s.ReloadCommand) > 0 {
 			errs = append(errs, fmt.Sprintf("%s: reload_signal and reload_command are mutually exclusive", s.Filename))
@@ -376,8 +408,15 @@ func validate(cfg *Config) error {
 			errs = append(errs, fmt.Sprintf("exit_code_from = %q references unknown service", cfg.Globals.ExitCodeFrom))
 		} else {
 			for _, s := range cfg.Services {
-				if s.Name == cfg.Globals.ExitCodeFrom && s.Replicas > 1 {
-					errs = append(errs, fmt.Sprintf("exit_code_from = %q references a replicated service (replicas=%d); the combination is ambiguous", cfg.Globals.ExitCodeFrom, s.Replicas))
+				if s.Name != cfg.Globals.ExitCodeFrom {
+					continue
+				}
+				if s.Replicas.Auto {
+					errs = append(errs, fmt.Sprintf("exit_code_from = %q references a service with replicas = \"auto\"; the combination is ambiguous", cfg.Globals.ExitCodeFrom))
+					break
+				}
+				if s.Replicas.N > 1 {
+					errs = append(errs, fmt.Sprintf("exit_code_from = %q references a replicated service (replicas=%d); the combination is ambiguous", cfg.Globals.ExitCodeFrom, s.Replicas.N))
 					break
 				}
 			}

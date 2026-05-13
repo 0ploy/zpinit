@@ -155,6 +155,9 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 		cfg.Globals.Resources.ReserveMemory.Bytes(),
 	)
 	resourceEnv := snap.EnvVars()
+	// Resolve `replicas = "auto"` to a concrete N for boot. The
+	// watcher's debounced commits will keep it in sync from here on.
+	cfg.Services = supervisor.ResolveAutoReplicasAtBoot(cfg.Services, snap)
 	log.Info("resources detected",
 		"cpu_count", snap.CPUCount,
 		"cpu_quota", resourceEnv[resources.EnvCPUQuota],
@@ -173,7 +176,7 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 		// scripts: newBaseEnv = newGlobals.Env + containerEnv +
 		// scriptEnv + resourceEnv.
 		scriptEnv := envDelta(initialEnv, finalEnv)
-		return runSupervise(log, configDir, cfg, bootEnv, containerEnv, scriptEnv, resourceEnv, r)
+		return runSupervise(log, configDir, cfg, bootEnv, containerEnv, scriptEnv, resourceEnv, snap, r)
 	}
 	return 1 // unreachable
 }
@@ -281,7 +284,7 @@ func execCmd(log *slog.Logger, cmdline []string, env map[string]string) int {
 //
 // SIGHUP triggers a reload via orchestrator.Reload (Phase 7): re-load
 // config from disk, diff against the running set, apply add/remove/restart.
-func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env map[string]string, containerEnv, scriptEnv, resourceEnv map[string]string, r *reaper.Reaper) int {
+func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env map[string]string, containerEnv, scriptEnv, resourceEnv map[string]string, snap resources.Snapshot, r *reaper.Reaper) int {
 	chldCh := make(chan os.Signal, 16)
 	signal.Notify(chldCh, syscall.SIGCHLD)
 	userCh := make(chan os.Signal, 8)
@@ -335,6 +338,7 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 		return entrypoint.SliceFromEnviron(merged)
 	})
 	orch.SetResourceEnv(resourceEnv)
+	orch.SetCurrentSnapshot(snap)
 
 	// Resource watcher: re-detects on a poll loop, debounces per
 	// dimension, and forwards each committed delta to the

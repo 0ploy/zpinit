@@ -147,17 +147,24 @@ func checkConfig(configDir string) (*config.Config, []Check) {
 		// Replicas: report the log layout (shared file vs per-replica
 		// via the {index} placeholder) so the operator can confirm
 		// what they get before boot.
-		if s.Replicas > 1 && s.Log.Stdout != "" && s.Log.Stdout != "inherit" {
+		n := s.Replicas.N
+		if (n > 1 || s.Replicas.Auto) && s.Log.Stdout != "" && s.Log.Stdout != "inherit" {
+			rep := replicasDisplay(s.Replicas)
 			if strings.Contains(s.Log.Stdout, "{index}") {
-				preview := make([]string, 0, s.Replicas)
-				for i := 0; i < s.Replicas; i++ {
-					preview = append(preview, config.ReplicaLogPath(s.Log.Stdout, i, s.Replicas))
+				if n > 0 {
+					preview := make([]string, 0, n)
+					for i := 0; i < n; i++ {
+						preview = append(preview, config.ReplicaLogPath(s.Log.Stdout, i, n))
+					}
+					out = append(out, Check{"config", s.Name + ": log paths", StatusOK,
+						fmt.Sprintf("replicas=%s, log.stdout expands to: %s", rep, strings.Join(preview, ", "))})
+				} else {
+					out = append(out, Check{"config", s.Name + ": log paths", StatusOK,
+						fmt.Sprintf("replicas=%s, log.stdout uses {index} per replica", rep)})
 				}
-				out = append(out, Check{"config", s.Name + ": log paths", StatusOK,
-					fmt.Sprintf("replicas=%d, log.stdout expands to: %s", s.Replicas, strings.Join(preview, ", "))})
 			} else {
 				out = append(out, Check{"config", s.Name + ": log paths", StatusOK,
-					fmt.Sprintf("replicas=%d, all replicas share %s (use {index} for per-replica files)", s.Replicas, s.Log.Stdout)})
+					fmt.Sprintf("replicas=%s, all replicas share %s (use {index} for per-replica files)", rep, s.Log.Stdout)})
 			}
 		}
 		if len(s.Command) == 0 {
@@ -227,7 +234,7 @@ func checkRuntimes(cfg *config.Config) []Check {
 				u = &nodeUsage{configured: cmd, resolved: resolved}
 				nodeUsages[key] = u
 			}
-			if s.Replicas > 1 {
+			if s.Replicas.N > 1 || s.Replicas.Auto {
 				u.replicaServices++
 			}
 		case "bun":
@@ -391,4 +398,17 @@ func checkState(cfg *config.Config) []Check {
 			fmt.Sprintf("no zpinit instance currently running (%s)", socket)})
 	}
 	return out
+}
+
+// replicasDisplay renders a Replicas value as the operator
+// would see it in their TOML: "3" for static counts, "auto"
+// (with bounds when set) for the auto form.
+func replicasDisplay(r config.Replicas) string {
+	if !r.Auto {
+		return fmt.Sprintf("%d", r.N)
+	}
+	if r.N > 0 {
+		return fmt.Sprintf("auto (currently %d)", r.N)
+	}
+	return "auto"
 }

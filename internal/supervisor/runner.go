@@ -169,7 +169,7 @@ func (r *Runner) ReplicaIndex() int { return r.replicaIndex }
 // TOML-level concepts like exit_code_from continue to use cfg.Name
 // (those reference the service spec, not a specific replica).
 func (r *Runner) DisplayName() string {
-	if r.cfg.Replicas <= 1 {
+	if r.cfg.Replicas.N <= 1 && !r.cfg.Replicas.Auto {
 		return r.cfg.Name
 	}
 	return r.cfg.Name + "/" + strconv.Itoa(r.replicaIndex)

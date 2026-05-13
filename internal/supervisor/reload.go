@@ -155,6 +155,16 @@ func (o *Orchestrator) reloadByRestart(ctx context.Context, r *Runner) error {
 func (o *Orchestrator) OnResourceChange(change resources.Change) {
 	newEnv := change.Snapshot.EnvVars()
 	o.SetResourceEnv(newEnv)
+	o.SetCurrentSnapshot(change.Snapshot)
+
+	// Auto-replicated services rebalance to the new target before
+	// reload-on-change fans out. Existing replicas that survive the
+	// rebalance still get reloaded by the fanout below so they pick
+	// up the new env on their next spawn; freshly-spawned replicas
+	// get reloaded again as well, which is wasteful but keeps the
+	// dispatch logic simple. v1 trade-off; we can teach the fanout
+	// to exempt fresh replicas later.
+	o.scaleAutoServices(context.Background(), change.Snapshot)
 
 	dimset := map[string]struct{}{}
 	for _, d := range change.Dimensions {
