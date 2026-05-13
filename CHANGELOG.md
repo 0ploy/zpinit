@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.1
 
 ### Bug Fixes
 
@@ -29,13 +29,6 @@
   `boot_timeout`, matching reload-boot and the contract documented
   in CLAUDE.md.
 
-- **Manual `zpctl start` during backoff resets the crash budget.**
-  Previously the crash counter survived a manual override, so
-  repeatedly running `start` on a flapping service could fast-track
-  it to FATAL even when the operator's intent was "fresh attempt."
-
-### Features
-
 - **`zpctl restart all` and friends parallelize within filename
   groups.** Stop / start / restart now process consecutive
   same-filename targets in parallel (matching `stopAll`'s
@@ -51,6 +44,11 @@
   tens of minutes after the client gave up. Budget is now per
   filename group, matching the actual parallel-within-group
   execution shape.
+
+- **Manual `zpctl start` during backoff resets the crash budget.**
+  Previously the crash counter survived a manual override, so
+  repeatedly running `start` on a flapping service could fast-track
+  it to FATAL even when the operator's intent was "fresh attempt."
 
 ## v0.3.0
 
