@@ -246,8 +246,10 @@ reload_signal  = "HUP"
 # service whenever the listed dimension's exposed value moves
 # (after the configured scale_up_after / scale_down_after
 # debounce). The action is whatever reload_signal / reload_command
-# declares, falling back to full restart. Empty / unset means the
-# operator must run `zpctl reload` manually to apply changes.
+# declares, falling back to full restart. Unset means the operator
+# must run `zpctl reload` manually to apply changes; an explicit
+# empty list (`reload_on_change = []`) opts out (relevant when
+# replicas = "auto", which otherwise defaults to ["cpu","memory"]).
 # Allowed values: "cpu", "memory".
 reload_on_change = ["cpu", "memory"]
 

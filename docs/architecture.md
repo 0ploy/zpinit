@@ -100,9 +100,9 @@ file-read per second is essentially free.
 
 ### Per-service reload action
 
-`zpctl reload <name>` (and the future watcher-driven reload trigger)
-runs through `Orchestrator.ReloadService`, which dispatches per
-runner:
+`zpctl reload <name>` and the watcher-driven `OnResourceChange`
+trigger both run through `Orchestrator.ReloadService`, which
+dispatches per runner:
 
 - `reload_signal` set → `SignalGroup`. In-place; the running process
   re-reads its config (or whatever it's wired to do on the signal).

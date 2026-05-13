@@ -153,8 +153,11 @@ was `CMD ["pm2-runtime", "start", "ecosystem.config.js"]` becomes
 ```sh
 zpctl status                # shows api/0, api/1, api/2, api/3
 zpctl restart api/2         # restart just replica 2
+zpctl reload api            # in-place reload of every replica
+                            # (reload_signal / reload_command, else stop+start)
+zpctl reload api/2          # reload just replica 2
 zpctl tail api/0            # snapshot replica 0's log
-zpctl signal api TERM       # signal all replicas
+zpctl signal api TERM       # signal all replicas (lower-level than reload)
 ```
 
 Commands that target exactly one process — `pid`, `tail` — error out

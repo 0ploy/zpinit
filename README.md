@@ -170,6 +170,15 @@ config dir, diffs against the running set, and applies adds, removes,
 and restarts (per-service `reloadable = false` opts out). `zpctl
 reread` previews the diff without applying.
 
+For runtime reloads (the running config on disk hasn't changed, but
+you want the service to re-read it), use `zpctl reload <service>`.
+Per-service `reload_signal` (e.g. `"HUP"` for nginx) or
+`reload_command` (e.g. `["/usr/sbin/nginx", "-s", "reload"]`) tells
+zpinit how to nudge the running process; absent both, the verb
+falls back to a full stop+start. Combine with `reload_on_change =
+["cpu", "memory"]` and zpinit fires the same reload action
+automatically whenever the cgroup limit moves.
+
 See [docs/configuration.md](docs/configuration.md) for the full TOML
 schema: env precedence, `cwd`, `user`/`group`, backoff tuning, stop
 signals, and per-service `[env]`.
