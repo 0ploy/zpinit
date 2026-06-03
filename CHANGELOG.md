@@ -1,5 +1,108 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **Backoff has ±10% per-replica jitter.** Replicas of a service
+  that crash together (e.g. their shared upstream went down) no
+  longer synchronize their retry pulses on the doubling backoff
+  schedule, which used to thunder-herd the recovering dependency
+  on every retry. Each replica's jitter sequence is deterministic
+  (seeded from its replica index), so logs and reproductions stay
+  predictable.
+
+### Bug Fixes
+
+- **`zpctl reload` surfaces non-zero `reload_command` exits.**
+  A `reload_command` exiting non-zero (bad nginx config, missing
+  file, etc.) was previously logged only, with `zpctl` reporting
+  success. CI pipelines running `zpctl reload svc &&
+  deploy_next_step` therefore advanced even on broken reloads.
+  The reload now returns a per-target error like `svc:
+  reload_command exited 1 (service still running)` and the wire
+  response sets a non-zero exit. The supervised service itself is
+  unaffected (it was never stopped); the error text says so.
+
+- **`zpctl reload` and `zpctl restart` body lines reflect actual
+  per-target outcome.** Multi-target restart no longer drops N-1
+  errors onto the floor when several services fail in the same
+  call; every per-target failure now appears in the status-line
+  message via `errors.Join`, and the per-target body line says
+  whether that runner reloaded cleanly or which step failed.
+
+- **Status output is tear-free.** `zpctl status` used to read each
+  runner's state, PID, uptime, and crash count under four separate
+  locks. Under load that could produce snapshots like `RUNNING
+  pid 0` for an instant during a crash-restart cycle. A single
+  `Runner.Snapshot()` accessor now collects every status field
+  under one critical section.
+
+- **Reload diff returned by `update`/SIGHUP matches what was
+  applied.** Previously `cmdUpdate` computed the diff once for the
+  response and `Reload` recomputed it internally; a concurrent
+  reload between those two walks could cause the displayed diff
+  and the applied diff to disagree. `Orchestrator.Reload` now
+  returns the diff it actually applied, and the response renders
+  from that.
+
+- **Reload-on-change goroutines join the supervisor wait group.**
+  A SIGTERM that arrived during a long-running `reload_command`
+  could return from `Orchestrator.Run` while a reload-on-change
+  goroutine was still spawning children. The detached goroutine
+  is now tracked in `o.wg`, so cleanup waits for it to bail out
+  (the goroutine respects the parent context cancellation, so
+  shutdown is still bounded).
+
+- **`servicesEqual` ignores nil-vs-empty noise.** Cosmetic TOML
+  edits (`env = {}` vs no `env` key, `reloadable = true` vs no
+  key, `reload_on_change = []` vs no key) used to trigger phantom
+  restarts on reload because `reflect.DeepEqual` treats nil and
+  empty as unequal. The diff now normalizes those shapes before
+  comparing, so only semantic changes restart services.
+
+- **`removeServiceGroup` is O(N+K) instead of O(N*K).** Removing
+  K runners from a registry of N used to walk the registry once
+  per victim. Single-pass filter with a removeSet now does the
+  job in one walk regardless of K. Negligible on small configs;
+  meaningful if `MaxReplicas` ever grows.
+
+- **`dispatchBudget` no longer over-budgets `reload`.** A
+  `reload` verb with `reload_signal` configured finishes in
+  microseconds (it's a `kill(2)`), but the control connection
+  used to stay open with a full `stop_timeout`-shaped deadline
+  per target. The budget now picks the right per-verb shape:
+  skip stop budget for `reload_signal`, use
+  `reload_command_timeout` for `reload_command`, full stop budget
+  for everything else.
+
+- **`Watcher.Subscribe` returns a cleanup function.** Repeated
+  subscriptions (e.g. tests, or future code paths that
+  re-subscribe per reload) used to leak channel entries because
+  `w.subs` was append-only. Mirrors the `Runner.Observe` pattern.
+
+- **`zpinit doctor` warns when `[ready].command` matches the
+  service's main command.** Common copy-paste mistake; the probe
+  then runs the entire service binary on every interval and
+  either "succeeds" trivially or fails for orthogonal reasons.
+  Flagged as a WARN so legitimate self-test invocations aren't
+  blocked.
+
+- **`Runner.NewRunnerForReplica` makes the spec/cfg distinction
+  explicit.** Per-replica runners need `cfg` (rewritten log path,
+  ZPINIT_REPLICA_INDEX env) for spawn and an unmodified `spec`
+  for diff equality. Callers used to assign `r.spec` by hand
+  after `NewRunner`; the new constructor takes both up front so
+  the relationship can't be set wrong.
+
+### Tests
+
+- **CI runs `go test -race`.** The v0.3.1 review surfaced two
+  data races and the fixes landed without a CI guard. Both
+  unit and integration jobs now run with `-race -count=1` so a
+  future regression in the watcher/reload/scale fan-out gets
+  caught before merge rather than after.
+
 ## v0.3.1
 
 ### Bug Fixes

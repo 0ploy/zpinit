@@ -67,6 +67,12 @@ func newFixture(t *testing.T, cfg config.Service) *testFixture {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	f.runner = NewRunner(cfg, nil, 0, spawn, f.clock, log)
+	// The fixture tests assert exact backoff delays; the production
+	// jitter would shift those by ±10% and break Advance() math.
+	// backoffStep treats nil jitterRand as "no jitter", which is the
+	// behavior we want here. Separate jitter-specific tests cover the
+	// jittered path explicitly.
+	f.runner.jitterRand = nil
 	ch, cancel := f.runner.Observe()
 	f.states = ch
 	t.Cleanup(cancel)

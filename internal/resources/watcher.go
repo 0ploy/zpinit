@@ -95,17 +95,39 @@ func (w *Watcher) Current() Snapshot {
 }
 
 // Subscribe returns a buffered (cap 1) channel that receives a
-// Change every time a debounced commit happens. A slow subscriber
+// Change every time a debounced commit happens, and a cleanup
+// function the caller must invoke when done. A slow subscriber
 // drops events: we keep the producer non-blocking so one wedged
 // consumer can't pin the watcher goroutine. Channels are not
 // closed on Start exit; ctx cancellation stops the producer and
 // the channels stay drainable.
-func (w *Watcher) Subscribe() <-chan Change {
+//
+// The cleanup function removes the subscription from w.subs.
+// Without it, every test that constructs a Watcher and subscribes
+// leaks an entry, and any production caller that re-subscribes per
+// reload would grow w.subs unbounded. Mirrors the Runner.Observe
+// pattern in internal/supervisor.
+func (w *Watcher) Subscribe() (<-chan Change, func()) {
 	ch := make(chan Change, 1)
 	w.mu.Lock()
 	w.subs = append(w.subs, ch)
 	w.mu.Unlock()
-	return ch
+	cleanup := func() {
+		w.mu.Lock()
+		for i, c := range w.subs {
+			if c == ch {
+				// copy+nil+truncate, not append-splice; otherwise the
+				// removed entry stays referenced from the backing
+				// array's tail and prevents GC.
+				copy(w.subs[i:], w.subs[i+1:])
+				w.subs[len(w.subs)-1] = nil
+				w.subs = w.subs[:len(w.subs)-1]
+				break
+			}
+		}
+		w.mu.Unlock()
+	}
+	return ch, cleanup
 }
 
 // Start primes the current Snapshot from a synchronous Detect and

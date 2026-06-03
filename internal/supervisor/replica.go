@@ -81,12 +81,12 @@ func expandServiceToRunners(svc config.Service, baseEnv []string, spawner Spawne
 		perReplica.Log.Stdout = replicaLogPath(svc.Log.Stdout, i, n)
 		perReplica.Log.Stderr = replicaLogPath(svc.Log.Stderr, i, n)
 		env := composeReplicaEnv(baseEnv, i, n)
-		r := NewRunner(perReplica, env, i, spawner, clock, log)
-		// Reset spec to the original (NewRunner defaults spec=cfg);
-		// servicesEqual compares specs, and the per-replica log
-		// rewriting must not show up as a phantom diff on reload.
-		r.spec = svc
-		out[i] = r
+		// NewRunnerForReplica keeps spec = svc (the unmodified
+		// service-level config) while cfg carries the per-replica
+		// log-path and env rewrites used at spawn time. servicesEqual
+		// compares specs, so this prevents per-replica rewrites from
+		// looking like a config change on every reload.
+		out[i] = NewRunnerForReplica(perReplica, svc, env, i, spawner, clock, log)
 	}
 	return out
 }

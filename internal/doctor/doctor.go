@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -173,6 +174,18 @@ func checkConfig(configDir string) (*config.Config, []Check) {
 		out = append(out, commandCheck(s.Name, "command", s.Command[0]))
 		if s.Ready != nil && len(s.Ready.Command) > 0 {
 			out = append(out, commandCheck(s.Name, "[ready].command", s.Ready.Command[0]))
+			// Common copy-paste mistake: operators set [ready].command
+			// to the same argv as the service's main command. The
+			// probe then runs the entire service binary on every
+			// interval (frequently failing in unexpected ways, or
+			// "succeeding" trivially) instead of testing readiness.
+			// Cheap to flag at doctor time; not a runtime fail
+			// because some apps legitimately re-exec themselves in a
+			// short-circuit probe mode.
+			if reflect.DeepEqual(s.Ready.Command, s.Command) {
+				out = append(out, Check{"config", s.Name + ": [ready].command", StatusWarn,
+					"[ready].command is identical to command; the probe runs the main process on every interval, which usually isn't what was intended"})
+			}
 		}
 	}
 	return cfg, out

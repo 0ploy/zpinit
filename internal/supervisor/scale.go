@@ -84,9 +84,10 @@ func (o *Orchestrator) scaleUp(bootRoot context.Context, spec config.Service, fr
 		perReplica.Log.Stdout = replicaLogPath(spec.Log.Stdout, i, to)
 		perReplica.Log.Stderr = replicaLogPath(spec.Log.Stderr, i, to)
 		env := composeReplicaEnv(baseEnv, i, to)
-		r := NewRunner(perReplica, env, i, o.spawner, o.clock, o.log)
-		// Keep the unmodified spec for reload-diff equality.
-		r.spec = spec
+		// NewRunnerForReplica keeps spec = the unmodified service-
+		// level config for reload-diff equality; cfg carries the
+		// per-replica log/env rewrites used at spawn time.
+		r := NewRunnerForReplica(perReplica, spec, env, i, o.spawner, o.clock, o.log)
 		jobs = append(jobs, reloadBootJob{cfg: r.Cfg(), runner: r})
 	}
 

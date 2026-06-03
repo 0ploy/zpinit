@@ -22,10 +22,11 @@ const reloadCommandTimeout = 30 * time.Second
 
 // ReloadService reloads every runner in `group` in parallel, the
 // same parallelism rule that stopRunnerGroup uses for replica
-// shutdowns. Returns the joined errors. Caller is expected to pass
-// a group that is the result of resolveTarget (i.e. every replica
-// of one service name) or a single runner; cross-service grouping
-// is the orchestrator's job, not this helper's.
+// shutdowns. Returns a per-runner error slice in input order (nil
+// entry on success). Caller is expected to pass a group that is the
+// result of resolveTarget (i.e. every replica of one service name)
+// or a single runner; cross-service grouping is the orchestrator's
+// job, not this helper's.
 //
 // Dispatch is per-runner:
 //
@@ -38,7 +39,7 @@ const reloadCommandTimeout = 30 * time.Second
 //   - neither → full stop+start cycle, identical to `zpctl restart`.
 //     Lets operators say "reload" everywhere and have it do the
 //     right thing for each service.
-func (o *Orchestrator) ReloadService(ctx context.Context, group []*Runner) error {
+func (o *Orchestrator) ReloadService(ctx context.Context, group []*Runner) []error {
 	if len(group) == 0 {
 		return nil
 	}
@@ -52,13 +53,7 @@ func (o *Orchestrator) ReloadService(ctx context.Context, group []*Runner) error
 		}(i, r)
 	}
 	wg.Wait()
-	var nonNil []error
-	for _, e := range errs {
-		if e != nil {
-			nonNil = append(nonNil, e)
-		}
-	}
-	return errors.Join(nonNil...)
+	return errs
 }
 
 func (o *Orchestrator) reloadOne(ctx context.Context, r *Runner) error {
@@ -102,11 +97,17 @@ func (o *Orchestrator) reloadOne(ctx context.Context, r *Runner) error {
 			}
 			if info.ExitCode != 0 {
 				o.log.Warn("reload: command non-zero", "service", name, "code", info.ExitCode)
-				// Non-zero exit is logged but not returned as an error
-				// from ReloadService: the live service is unaffected
-				// and operators can read the log. Returning would
-				// promote a benign reload-script warning into a
-				// scary-looking zpctl error.
+				// Surface non-zero exit to the caller. The supervised
+				// service is unaffected (we did not stop it), but the
+				// operator needs to know the reload didn't take
+				// effect, especially when zpctl is called from CI:
+				// `zpctl reload nginx && deploy_next_step` should fail
+				// closed if `nginx -s reload` exited 1. The error text
+				// makes the "service still running" distinction
+				// explicit so panic-mode rollbacks don't trigger on
+				// what is fundamentally a config-syntax problem in
+				// the reload payload.
+				return fmt.Errorf("%s: reload_command exited %d (service still running)", name, info.ExitCode)
 			}
 			return nil
 		case <-wctx.Done():
@@ -197,6 +198,7 @@ func (o *Orchestrator) OnResourceChange(change resources.Change) {
 		}
 	}
 	parent := o.runnerCtx
+	wg := o.wg
 	o.mu.RUnlock()
 
 	if len(affected) == 0 {
@@ -207,8 +209,24 @@ func (o *Orchestrator) OnResourceChange(change resources.Change) {
 	}
 	o.log.Info("resource change: reloading subscribed services",
 		"count", len(affected), "dimensions", change.Dimensions)
+
+	// Track the reload-on-change goroutine in o.wg so a SIGTERM
+	// during a long-running reload_command doesn't return from
+	// Orchestrator.Run while the reload is still spawning children.
+	// parent is the same runnerCtx Run is parked on, so cancel-on-
+	// shutdown still bails the goroutine out; we just also wait for
+	// the bail-out. o.wg is nil when OnResourceChange is invoked
+	// outside a real Run (tests construct an Orchestrator directly
+	// and drive reloadOne / OnResourceChange without Run), so guard
+	// the Add accordingly.
+	if wg != nil {
+		wg.Add(1)
+	}
 	go func() {
-		if err := o.reloadAcrossGroups(parent, affected); err != nil {
+		if wg != nil {
+			defer wg.Done()
+		}
+		if _, err := o.reloadAcrossGroups(parent, affected); err != nil {
 			o.log.Warn("reload-on-change failed", "err", err)
 		}
 	}()
@@ -218,26 +236,50 @@ func (o *Orchestrator) OnResourceChange(change resources.Change) {
 // represented in `runners`, parallel within group and serial between
 // groups (filename order). Same shape stopAll uses, applied to
 // reload semantics. Used when `zpctl reload all` runs.
-func (o *Orchestrator) reloadAcrossGroups(ctx context.Context, runners []*Runner) error {
+//
+// Returns a per-input-runner error slice in the same order as
+// `runners` (nil entry on success), so callers that want to render
+// per-target wire lines can do so without re-resolving names. A
+// scalar errors.Join of the non-nil entries is also returned for
+// callers that only care about the aggregate.
+func (o *Orchestrator) reloadAcrossGroups(ctx context.Context, runners []*Runner) ([]error, error) {
 	if len(runners) == 0 {
-		return nil
+		return nil, nil
 	}
-	// Group by filename preserving filename-sorted order.
-	groups := map[string][]*Runner{}
+	// Group by filename preserving filename-sorted order. Track each
+	// runner's original index so per-runner errors can be reassembled
+	// in input order on the way out.
+	type indexed struct {
+		idx int
+		r   *Runner
+	}
+	groups := map[string][]indexed{}
 	var order []string
-	for _, r := range runners {
+	for i, r := range runners {
 		fn := r.Cfg().Filename
 		if _, ok := groups[fn]; !ok {
 			order = append(order, fn)
 		}
-		groups[fn] = append(groups[fn], r)
+		groups[fn] = append(groups[fn], indexed{idx: i, r: r})
 	}
 	sort.Strings(order)
-	var errs []error
+	perInput := make([]error, len(runners))
 	for _, fn := range order {
-		if err := o.ReloadService(ctx, groups[fn]); err != nil {
-			errs = append(errs, err)
+		g := groups[fn]
+		rs := make([]*Runner, len(g))
+		for i := range g {
+			rs[i] = g[i].r
+		}
+		groupErrs := o.ReloadService(ctx, rs)
+		for i, e := range groupErrs {
+			perInput[g[i].idx] = e
 		}
 	}
-	return errors.Join(errs...)
+	var nonNil []error
+	for _, e := range perInput {
+		if e != nil {
+			nonNil = append(nonNil, e)
+		}
+	}
+	return perInput, errors.Join(nonNil...)
 }

@@ -549,7 +549,7 @@ func TestReload_AddsService(t *testing.T) {
 		},
 		Globals: f.cfg.Globals,
 	}
-	if err := f.orch.Reload(ctx, newCfg); err != nil {
+	if _, err := f.orch.Reload(ctx, newCfg); err != nil {
 		t.Fatal(err)
 	}
 	waitForSpawnCount(t, captured, 2, 2*time.Second)
@@ -588,7 +588,7 @@ func TestReload_RemovesService(t *testing.T) {
 		bProc.pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
 	}()
 
-	if err := f.orch.Reload(ctx, newCfg); err != nil {
+	if _, err := f.orch.Reload(ctx, newCfg); err != nil {
 		t.Fatal(err)
 	}
 
@@ -647,7 +647,7 @@ func TestReload_RemoveStopFailureKeepsRunner(t *testing.T) {
 	reloadCtx, reloadCancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer reloadCancel()
 
-	err := f.orch.Reload(reloadCtx, newCfg)
+	_, err := f.orch.Reload(reloadCtx, newCfg)
 	if err == nil {
 		t.Fatal("expected reload to return an error when stop fails")
 	}
@@ -704,7 +704,7 @@ func TestReload_AddsBootSerialInFilenameOrder(t *testing.T) {
 		},
 		Globals: f.cfg.Globals,
 	}
-	if err := f.orch.Reload(ctx, newCfg); err != nil {
+	if _, err := f.orch.Reload(ctx, newCfg); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 
@@ -890,7 +890,7 @@ func TestReload_GlobalsEnvPropagatesToRestartedServices(t *testing.T) {
 		Services: initial,
 		Globals:  config.Globals{Env: map[string]string{"FOO": "new"}, BootTimeout: f.cfg.Globals.BootTimeout, ExitCodeFrom: f.cfg.Globals.ExitCodeFrom},
 	}
-	if err := f.orch.Reload(ctx, newCfg); err != nil {
+	if _, err := f.orch.Reload(ctx, newCfg); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 
@@ -1050,7 +1050,7 @@ func TestShutdownBudget_RecomputedFromCurrentRunners(t *testing.T) {
 		},
 		Globals: f.cfg.Globals,
 	}
-	if err := f.orch.Reload(ctx, newCfg); err != nil {
+	if _, err := f.orch.Reload(ctx, newCfg); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	waitForSpawnCount(t, captured, 2, 2*time.Second)
@@ -1097,7 +1097,7 @@ func TestReload_AddsReplicatedService(t *testing.T) {
 		},
 		Globals: f.cfg.Globals,
 	}
-	if err := f.orch.Reload(ctx, newCfg); err != nil {
+	if _, err := f.orch.Reload(ctx, newCfg); err != nil {
 		t.Fatal(err)
 	}
 	// 1 initial + 3 replicas of b.
@@ -1157,7 +1157,7 @@ func TestReload_RemovesReplicatedService(t *testing.T) {
 		}
 	}()
 
-	if err := f.orch.Reload(ctx, newCfg); err != nil {
+	if _, err := f.orch.Reload(ctx, newCfg); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1202,7 +1202,7 @@ func TestReload_ReplicasCountChange(t *testing.T) {
 		procs[1].pushExit(reaper.ExitInfo{Signaled: true, Signal: 15})
 	}()
 
-	if err := f.orch.Reload(ctx, newCfg); err != nil {
+	if _, err := f.orch.Reload(ctx, newCfg); err != nil {
 		t.Fatal(err)
 	}
 	// 2 old + 4 new = 6 total spawns.

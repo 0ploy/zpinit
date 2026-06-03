@@ -66,7 +66,7 @@ func TestWatcher_NoChangeNoEmit(t *testing.T) {
 	w := NewWatcher(0, 0, 20*time.Millisecond, 20*time.Millisecond,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	w.SetPollInterval(10 * time.Millisecond)
-	sub := w.Subscribe()
+	sub, _ := w.Subscribe()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -88,7 +88,7 @@ func TestWatcher_ScaleUpCommitsAfterDebounce(t *testing.T) {
 	w := NewWatcher(0, 0, 50*time.Millisecond, 1*time.Second,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	w.SetPollInterval(10 * time.Millisecond)
-	sub := w.Subscribe()
+	sub, _ := w.Subscribe()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -118,7 +118,7 @@ func TestWatcher_ScaleDownUsesLongerDebounce(t *testing.T) {
 	w := NewWatcher(0, 0, 10*time.Millisecond, 200*time.Millisecond,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	w.SetPollInterval(10 * time.Millisecond)
-	sub := w.Subscribe()
+	sub, _ := w.Subscribe()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -152,7 +152,7 @@ func TestWatcher_TransientFlipDoesNotEmit(t *testing.T) {
 	w := NewWatcher(0, 0, 100*time.Millisecond, 100*time.Millisecond,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	w.SetPollInterval(10 * time.Millisecond)
-	sub := w.Subscribe()
+	sub, _ := w.Subscribe()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -179,7 +179,7 @@ func TestWatcher_SubIntegerWobbleDoesNotEmit(t *testing.T) {
 	w := NewWatcher(0, 0, 30*time.Millisecond, 30*time.Millisecond,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	w.SetPollInterval(10 * time.Millisecond)
-	sub := w.Subscribe()
+	sub, _ := w.Subscribe()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -203,7 +203,7 @@ func TestWatcher_MemoryChange(t *testing.T) {
 	w := NewWatcher(0, 0, 30*time.Millisecond, 200*time.Millisecond,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	w.SetPollInterval(10 * time.Millisecond)
-	sub := w.Subscribe()
+	sub, _ := w.Subscribe()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

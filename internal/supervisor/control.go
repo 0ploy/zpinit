@@ -187,16 +187,32 @@ func (s *ControlServer) dispatchBudget(req *ctlproto.Request) time.Duration {
 	// for `stop all` / `restart all` on heavily-replicated services,
 	// which kept the daemon-side handler goroutine and socket open
 	// for that long even after a client disconnect.
+	//
+	// Per-verb shape: `reload` with reload_signal configured is a
+	// kill(2) and finishes in microseconds; no stop budget needed.
+	// `reload` with reload_command waits at most reloadCommandTimeout.
+	// Everything else (stop, restart, reload-as-restart, update,
+	// shutdown) needs stop_timeout + grace per filename group.
 	const perTargetGrace = reapGrace + 5*time.Second
 	budget := minDispatchBudget
 	seenFiles := make(map[string]struct{}, len(targets))
 	for _, r := range targets {
-		fn := r.Cfg().Filename
+		cfg := r.Cfg()
+		fn := cfg.Filename
 		if _, ok := seenFiles[fn]; ok {
 			continue
 		}
 		seenFiles[fn] = struct{}{}
-		budget += r.Cfg().StopTimeout.Std() + perTargetGrace
+		if req.Verb == "reload" {
+			if cfg.ReloadSignal != "" {
+				continue
+			}
+			if len(cfg.ReloadCommand) > 0 {
+				budget += reloadCommandTimeout
+				continue
+			}
+		}
+		budget += cfg.StopTimeout.Std() + perTargetGrace
 	}
 	return budget
 }
@@ -262,7 +278,7 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 	}
 	resp := okResp("ok")
 	resp.Body = make([]string, 0, len(targets))
-	var anyErr error
+	var collected []error
 
 	// Group consecutive same-filename targets and dispatch each group
 	// in parallel, mirroring stopAll's parallel-within-group / serial-
@@ -329,14 +345,19 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 		for k := range group {
 			resp.Body = append(resp.Body, bodies[k])
 			if errs[k] != nil {
-				anyErr = errs[k]
+				collected = append(collected, errs[k])
 			}
 		}
 	}
 
-	if anyErr != nil {
+	// errors.Join keeps every per-target failure in the status-line
+	// message, sanitized to one wire line by WriteResponse. The
+	// previous "last error wins" behavior dropped N-1 failures when
+	// `restart svcA svcB svcC` had multiple problems, leaving the
+	// operator with only the alphabetically-last service's error.
+	if len(collected) > 0 {
 		resp.Code = 1
-		resp.Msg = anyErr.Error()
+		resp.Msg = errors.Join(collected...).Error()
 	}
 	return resp
 }
@@ -344,26 +365,36 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 // cmdReloadService implements the per-service form of `zpctl reload`.
 // Targets are resolved like start/stop/restart; the orchestrator
 // dispatches per-runner based on each service's reload config.
-// Output mirrors cmdStartStopRestart so operators get a consistent
-// "<name>: reloaded" body line per affected runner.
+//
+// The body line per target reflects the actual outcome:
+//
+//	"svc: reloaded"                                   success
+//	"svc: reload_command exited 1 (service still running)"   reload_command path
+//	"svc: signal: <err>"                              reload_signal could not deliver
+//
+// so an operator (or a CI step running `zpctl reload nginx`) gets a
+// fail-closed signal when a reload_command misfires even though the
+// supervised process itself is unaffected.
 func (s *ControlServer) cmdReloadService(ctx context.Context, args []string) *ctlproto.Response {
 	targets, err := s.expandTargets(args, false)
 	if err != nil {
 		return errResp(err.Error())
 	}
-	if err := s.orch.reloadAcrossGroups(ctx, targets); err != nil {
-		resp := okResp("ok")
-		for _, r := range targets {
-			resp.Body = append(resp.Body, fmt.Sprintf("%s: reloaded", r.DisplayName()))
-		}
-		resp.Code = 1
-		resp.Msg = err.Error()
-		return resp
-	}
+	perTarget, aggErr := s.orch.reloadAcrossGroups(ctx, targets)
 	resp := okResp("ok")
 	resp.Body = make([]string, 0, len(targets))
-	for _, r := range targets {
-		resp.Body = append(resp.Body, fmt.Sprintf("%s: reloaded", r.DisplayName()))
+	for i, r := range targets {
+		var line string
+		if i < len(perTarget) && perTarget[i] != nil {
+			line = fmt.Sprintf("%s: %v", r.DisplayName(), perTarget[i])
+		} else {
+			line = fmt.Sprintf("%s: reloaded", r.DisplayName())
+		}
+		resp.Body = append(resp.Body, line)
+	}
+	if aggErr != nil {
+		resp.Code = 1
+		resp.Msg = aggErr.Error()
 	}
 	return resp
 }
@@ -387,14 +418,16 @@ func (s *ControlServer) cmdUpdate(ctx context.Context) *ctlproto.Response {
 	if err != nil {
 		return errResp("load: " + err.Error())
 	}
-	// Snapshot the diff before Reload applies it so the client sees
-	// exactly what was acted on. The window between this computeDiff
-	// and Reload's internal computeDiffLocked is the same window
-	// cmdReread already has against any subsequent Reload — i.e.
-	// vanishingly small and benign.
-	diff := s.orch.computeDiff(newCfg)
-	if err := s.orch.Reload(ctx, newCfg); err != nil {
-		return errResp("reload: " + err.Error())
+	// Reload returns the diff it actually applied, so the response
+	// shape matches what landed even if another reload races between
+	// our load and Reload's internal computeDiffLocked. The previous
+	// two-walk approach (computeDiff here, computeDiffLocked inside
+	// Reload) could disagree under contention. On reload error the
+	// diff still reflects the attempted action; the runner registry
+	// retries failed entries on the next reload.
+	diff, rerr := s.orch.Reload(ctx, newCfg)
+	if rerr != nil {
+		return errResp("reload: " + rerr.Error())
 	}
 	return diffResp(diff, "stopped", "restarted", "started", "no changes")
 }
@@ -614,9 +647,9 @@ func resolveTarget(snap []*Runner, arg string) ([]*Runner, error) {
 }
 
 func formatStatusLine(r *Runner) string {
-	state := mapToSupervisordState(r.State(), r.StoppedManually())
-	detail := stateDetail(r)
-	return fmt.Sprintf("%-32s %-9s %s", r.DisplayName(), state, detail)
+	snap := r.Snapshot()
+	state := mapToSupervisordState(snap.State, snap.Manual)
+	return fmt.Sprintf("%-32s %-9s %s", r.DisplayName(), state, stateDetail(snap))
 }
 
 func mapToSupervisordState(s State, manualStop bool) string {
@@ -642,16 +675,20 @@ func mapToSupervisordState(s State, manualStop bool) string {
 	return "UNKNOWN"
 }
 
-func stateDetail(r *Runner) string {
-	switch r.State() {
+// stateDetail renders the per-state suffix from a single Runner
+// Snapshot, so the "RUNNING pid 0" / "RUNNING pid X, uptime 0s"
+// race window that sequential per-field accessors expose can't
+// happen. DisplayName isn't on Status because it's derived from
+// immutable Runner fields and doesn't need the lock.
+func stateDetail(snap Status) string {
+	switch snap.State {
 	case StateRunning:
-		up := r.UpSince()
-		if up.IsZero() {
-			return fmt.Sprintf("pid %d", r.PID())
+		if snap.UpSince.IsZero() {
+			return fmt.Sprintf("pid %d", snap.PID)
 		}
-		return fmt.Sprintf("pid %d, uptime %s", r.PID(), formatUptime(time.Since(up)))
+		return fmt.Sprintf("pid %d, uptime %s", snap.PID, formatUptime(time.Since(snap.UpSince)))
 	case StateBackoff:
-		return fmt.Sprintf("backoff (crashes %d)", r.Crashes())
+		return fmt.Sprintf("backoff (crashes %d)", snap.Crashes)
 	case StateFatal:
 		return "Exited too quickly (process log may have details)"
 	case StateStarting:

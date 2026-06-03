@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -82,7 +83,11 @@ func TestReloadOne_Command(t *testing.T) {
 	}
 }
 
-func TestReloadOne_CommandNonZeroExitIsNotAnError(t *testing.T) {
+// Non-zero reload_command exits are now surfaced as errors so CI
+// pipelines running `zpctl reload svc && next_step` fail closed when
+// the reload payload was bad. The supervised service is unaffected —
+// the error text says so explicitly — but the operator gets a signal.
+func TestReloadOne_CommandNonZeroExitSurfacesError(t *testing.T) {
 	cfg := config.Service{
 		Name:          "x",
 		Command:       []string{"x"},
@@ -103,8 +108,15 @@ func TestReloadOne_CommandNonZeroExitIsNotAnError(t *testing.T) {
 			return exitCh, nil
 		},
 	}
-	if err := orch.reloadOne(context.Background(), f.runner); err != nil {
-		t.Errorf("non-zero exit should be logged but not returned: %v", err)
+	err := orch.reloadOne(context.Background(), f.runner)
+	if err == nil {
+		t.Fatal("expected non-nil error for non-zero reload_command exit")
+	}
+	if !strings.Contains(err.Error(), "exited 17") {
+		t.Errorf("error should mention exit code 17: %v", err)
+	}
+	if !strings.Contains(err.Error(), "service still running") {
+		t.Errorf("error should clarify the service is unaffected: %v", err)
 	}
 }
 

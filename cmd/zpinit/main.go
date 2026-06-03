@@ -353,7 +353,8 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 		cfg.Globals.Resources.ScaleDownAfter.Std(),
 		log,
 	)
-	sub := watcher.Subscribe()
+	sub, unsubscribe := watcher.Subscribe()
+	defer unsubscribe()
 	watcher.Start(watcherCtx)
 	go func() {
 		for {
@@ -421,7 +422,7 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 					log.Error("reload: config load failed; keeping running set", "err", err)
 					continue
 				}
-				if err := orch.Reload(ctx, newCfg); err != nil {
+				if _, err := orch.Reload(ctx, newCfg); err != nil {
 					log.Error("reload: failed", "err", err)
 				}
 			}

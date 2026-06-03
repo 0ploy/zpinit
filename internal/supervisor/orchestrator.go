@@ -503,11 +503,17 @@ func (o *Orchestrator) spawnRunnerGoroutine(r *Runner) {
 // reload is fully complete. Detachment is required because sum of
 // per-service boot_timeouts exceeds any reasonable client deadline.
 //
-// Returns a non-nil error if any service failed to terminate during
-// remove/restart-stop. Failed runners stay registered so their Run
-// goroutine keeps tracking the still-live process; a follow-up
-// reload will retry.
-func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) error {
+// Returns the diff that was actually applied alongside any error.
+// On error the diff still reflects what was attempted: failed
+// runners stay registered so their Run goroutine keeps tracking the
+// still-live process and a follow-up reload retries them, so the
+// remove/restart lists in the returned diff are still the right
+// thing to show the operator. Callers that previously called
+// computeDiff themselves to render the response can drop that walk
+// and use this diff directly: it eliminates the racy window where
+// the displayed diff and the applied diff could disagree if another
+// reload landed between the two computeDiff calls.
+func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) (reloadDiff, error) {
 	o.reloadMu.Lock()
 	defer o.reloadMu.Unlock()
 
@@ -635,9 +641,9 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) error 
 	// been added in this reload, or the target name may have changed.
 	o.installExitCodeWatcher()
 	if len(errs) > 0 {
-		return errors.Join(errs...)
+		return diff, errors.Join(errs...)
 	}
-	return nil
+	return diff, nil
 }
 
 // reloadBootJob carries the pre-built runner and its config through
@@ -734,6 +740,25 @@ func (o *Orchestrator) computeDiff(newCfg *config.Config) reloadDiff {
 // the same Spec(). The diff key remains the filename: a change to the
 // service spec restarts every replica; an unchanged spec leaves all
 // replicas alone.
+//
+// Three independent triggers can land a service in diff.restart:
+//
+//  1. Spec change. servicesEqual reports the loaded TOML differs from
+//     the running runners' Spec (ignoring Filename and the dynamic N
+//     for auto services). Per-filename diff walk below.
+//  2. globals.Env change. The orchestrator's cfg-level [env] map moved
+//     and every reloadable service that survives the per-filename
+//     walk needs a restart so its next spawn picks up the new merged
+//     env. Children can't be re-env'd in place. Tail block of this
+//     function.
+//  3. Resource snapshot change (cpu/memory). OnResourceChange owns
+//     this trigger; the per-runner reload (signal/command/restart) is
+//     dispatched outside computeDiffLocked via reloadAcrossGroups and
+//     does not show up in this diff. Listed here so the full picture
+//     of "what makes a service restart" lives in one place.
+//
+// All three honor reloadable=false: a non-reloadable service is left
+// running with its existing config and env regardless of trigger.
 func (o *Orchestrator) computeDiffLocked(newCfg *config.Config) reloadDiff {
 	existing := map[string][]*Runner{}
 	for _, r := range o.runners {
@@ -844,20 +869,70 @@ func sortRunners(rs []*Runner) {
 	})
 }
 
-// servicesEqual compares two service configs ignoring Filename
-// (the diff key, not a content field) and ignoring the dynamic
-// replica count for auto services (the scaler owns it; the file
-// reload from disk has N=0 by definition).
+// servicesEqual compares two service configs for reload-diff purposes.
+// Ignores Filename (the diff key, not a content field) and the dynamic
+// replica count for auto services (the scaler owns it; the file reload
+// from disk has N=0 by definition).
+//
+// Normalizes nil-vs-empty for every map/slice field and resolves the
+// Reloadable *bool pointer to its effective value before comparison.
+// Without the normalization, reflect.DeepEqual reports phantom
+// inequality for cosmetic edits that don't change semantics:
+//
+//   - `env = {}` vs no `env` key
+//   - `reloadable = true` vs no key (both mean reloadable)
+//   - `reload_on_change = []` vs no key (both disable the trigger)
+//   - `command = []` vs no key (both invalid; caught by validate)
+//
+// Each is niche on its own, but together they tie reload behavior to
+// TOML stylistic choices rather than to what the operator means.
 func servicesEqual(a, b config.Service) bool {
-	a.Filename = ""
-	b.Filename = ""
+	a.Filename, b.Filename = "", ""
 	if a.Replicas.Auto {
 		a.Replicas.N = 0
 	}
 	if b.Replicas.Auto {
 		b.Replicas.N = 0
 	}
+	// Effective reloadable value (nil == true; matches IsReloadable).
+	aRel := a.Reloadable == nil || *a.Reloadable
+	bRel := b.Reloadable == nil || *b.Reloadable
+	if aRel != bRel {
+		return false
+	}
+	a.Reloadable, b.Reloadable = nil, nil
+	// Nil-vs-empty normalization on every field DeepEqual would
+	// distinguish. Cheap: typical service configs touch a handful of
+	// these, the rest are no-ops.
+	normalizeMap(&a.Env, &b.Env)
+	normalizeSlice(&a.Command, &b.Command)
+	normalizeSlice(&a.ReloadCommand, &b.ReloadCommand)
+	normalizeSlice(&a.ReloadOnChange, &b.ReloadOnChange)
 	return reflect.DeepEqual(a, b)
+}
+
+func normalizeMap(a, b *map[string]string) {
+	if *a == nil && *b == nil {
+		return
+	}
+	if *a == nil {
+		*a = map[string]string{}
+	}
+	if *b == nil {
+		*b = map[string]string{}
+	}
+}
+
+func normalizeSlice(a, b *[]string) {
+	if *a == nil && *b == nil {
+		return
+	}
+	if *a == nil {
+		*a = []string{}
+	}
+	if *b == nil {
+		*b = []string{}
+	}
 }
 
 // removeServiceGroup stops every runner in a filename group in
@@ -911,24 +986,35 @@ func (o *Orchestrator) removeServiceGroup(ctx context.Context, group []*Runner) 
 	}
 	wg.Wait()
 
-	// Deregister successes under one critical section.
-	// copy+nil+truncate, not append-splice: the latter leaves the
-	// removed *Runner alive in the now-unreachable last slot of the
-	// backing array, leaking it until the slice grows past cap.
-	o.mu.Lock()
+	// Deregister successes under one critical section. Single pass
+	// over o.runners filtering out the removeSet so a remove of K
+	// runners is O(N+K) rather than O(N*K); important when
+	// MaxReplicas grows or many services are deleted in one reload.
+	// Trailing slots are nil'd, matching the original copy+nil+
+	// truncate pattern. Without that, the removed *Runner stays
+	// referenced from the backing array's tail and leaks until the
+	// slice grows past cap.
+	removeSet := make(map[*Runner]struct{}, len(group))
 	for idx, r := range group {
-		if errs[idx] != nil {
-			continue
-		}
-		for i, x := range o.runners {
-			if x == r {
-				copy(o.runners[i:], o.runners[i+1:])
-				o.runners[len(o.runners)-1] = nil
-				o.runners = o.runners[:len(o.runners)-1]
-				break
-			}
+		if errs[idx] == nil {
+			removeSet[r] = struct{}{}
 		}
 	}
+	if len(removeSet) == 0 {
+		return errs
+	}
+	o.mu.Lock()
+	keep := o.runners[:0]
+	for _, x := range o.runners {
+		if _, drop := removeSet[x]; drop {
+			continue
+		}
+		keep = append(keep, x)
+	}
+	for i := len(keep); i < len(o.runners); i++ {
+		o.runners[i] = nil
+	}
+	o.runners = keep
 	o.mu.Unlock()
 	return errs
 }

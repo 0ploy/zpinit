@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math/rand"
 	"strconv"
 	"sync"
 	"syscall"
@@ -108,6 +109,16 @@ type Runner struct {
 	// cancelRun so the read in removeService gets a happens-before edge
 	// to the write in spawnRunnerGoroutine.
 	runCancel context.CancelFunc
+
+	// jitterRand drives the ±10% backoff jitter that decorrelates
+	// crash-restart cycles across replicas of the same service.
+	// Seeded with replicaIndex so each replica gets a deterministic
+	// but distinct sequence: replica/0 lands at a different jitter
+	// from replica/1, but a given replica's pattern is reproducible
+	// across runs (useful for debugging). Accessed only from within
+	// r.mu in backoffStep, so rand.Rand's non-thread-safe state is
+	// covered by the existing lock.
+	jitterRand *rand.Rand
 }
 
 // setRunCancel stores the cancel function for the runner's own Run
@@ -133,7 +144,14 @@ func (r *Runner) cancelRun() {
 // NewRunner constructs a Runner in state Pending. Caller must invoke
 // Run in a goroutine and then drive the lifecycle via Start/Stop.
 // replicaIndex is 0 for single-copy services; for replicas > 1 the
-// orchestrator passes 0..N-1 from expandServiceToRunners.
+// orchestrator passes 0..N-1 from expandServiceToRunners (which uses
+// NewRunnerForReplica below).
+//
+// Sets r.spec = cfg, which is correct for non-replicated services
+// where the per-replica cfg and the original spec are the same. For
+// replicas, the per-replica cfg has rewritten log paths and ZPINIT_
+// REPLICA_INDEX injected, so spec must be the unmodified original;
+// use NewRunnerForReplica for that case.
 func NewRunner(cfg config.Service, baseEnv []string, replicaIndex int, spawn Spawner, clock Clock, log *slog.Logger) *Runner {
 	if log == nil {
 		log = slog.Default()
@@ -151,7 +169,26 @@ func NewRunner(cfg config.Service, baseEnv []string, replicaIndex int, spawn Spa
 		log:          log,
 		cmds:         make(chan command, 4),
 		state:        StatePending,
+		jitterRand:   rand.New(rand.NewSource(int64(replicaIndex))),
 	}
+}
+
+// NewRunnerForReplica constructs a Runner for one replica of a
+// replicated service. cfg is the per-replica copy (with log-path
+// rewrites and ZPINIT_REPLICA_INDEX-augmented env) used at spawn
+// time. spec is the unmodified service spec shared across all
+// replicas of the same filename: diff equality keys off it so a
+// per-replica log-path rewrite doesn't show up as a phantom change
+// every reload.
+//
+// Before this constructor existed, callers used NewRunner then
+// mutated r.spec by hand. The mutation was single-threaded (pre-
+// registration) and harmless, but a footgun for future callers; this
+// version makes the spec/cfg distinction explicit at the call site.
+func NewRunnerForReplica(cfg, spec config.Service, baseEnv []string, replicaIndex int, spawn Spawner, clock Clock, log *slog.Logger) *Runner {
+	r := NewRunner(cfg, baseEnv, replicaIndex, spawn, clock, log)
+	r.spec = spec
+	return r
 }
 
 // Spec returns the unmodified service spec (the same content across
@@ -412,6 +449,41 @@ func (r *Runner) LastExit() reaper.ExitInfo {
 	return r.lastExit
 }
 
+// Status is a tear-free snapshot of a Runner's externally-observable
+// state at one instant. Every field is read under a single r.mu
+// critical section, so callers rendering a status line never see a
+// half-transitioned mix like "RUNNING pid 0" that the individual
+// per-field accessors can produce when used in sequence.
+type Status struct {
+	State    State
+	Manual   bool
+	PID      int
+	UpSince  time.Time
+	Crashes  int
+	LastExit reaper.ExitInfo
+}
+
+// Snapshot returns a consistent view of every field formatStatusLine
+// needs. Use this in preference to per-field accessors when rendering
+// status output; the individual State()/PID()/etc. methods stay
+// available for callers that only need one field.
+func (r *Runner) Snapshot() Status {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	pid := 0
+	if r.process != nil {
+		pid = r.process.PID()
+	}
+	return Status{
+		State:    r.state,
+		Manual:   r.stoppedManually,
+		PID:      pid,
+		UpSince:  r.upSince,
+		Crashes:  r.crashes,
+		LastExit: r.lastExit,
+	}
+}
+
 // UpSince returns when the runner last entered Running, or the zero
 // time if it isn't currently running. Drives "uptime" in zpctl status.
 func (r *Runner) UpSince() time.Time {
@@ -466,7 +538,14 @@ func (r *Runner) SignalGroup(sig syscall.Signal) error {
 	return p.SignalGroup(sig)
 }
 
-// Cfg returns the service config (read-only access for orchestration).
+// Cfg returns the per-replica service config. The struct is returned
+// by value but its Env map, Command/ReloadCommand/ReloadOnChange
+// slices, and Reloadable pointer are shared with the Runner. Callers
+// must treat the returned value as read-only: mutating any of those
+// fields would silently corrupt subsequent spawn env merges, reload
+// diffs, and signal dispatch. Cfg is otherwise immutable for a
+// Runner's lifetime (set at construction; never reassigned), so the
+// shared references are safe to read without holding r.mu.
 func (r *Runner) Cfg() config.Service {
 	return r.cfg
 }
@@ -622,6 +701,14 @@ func (r *Runner) recordFailure(timers *runnerTimers) {
 // backoffStep returns the current delay and advances the next one (cap
 // at BackoffMax). Initialises from BackoffInitial on first call after
 // reset.
+//
+// The returned delay carries a per-replica deterministic ±10% jitter
+// to decorrelate restart cycles across replicas of the same service.
+// Without it, every replica that crashes together (e.g. a shared DB
+// going down) synchronizes its backoff timer, then thunder-herds the
+// recovering dependency on each retry pulse. The advanced
+// r.nextDelay is the unjittered base so the doubling sequence stays
+// predictable; only the *returned* delay is shifted.
 func (r *Runner) backoffStep() time.Duration {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -634,6 +721,16 @@ func (r *Runner) backoffStep() time.Duration {
 		next = max
 	}
 	r.nextDelay = next
+	// ±10% jitter. jitterRand is seeded with replicaIndex so each
+	// replica's pattern is deterministic but distinct from siblings.
+	// Float64() returns [0.0, 1.0); the (2*x - 1) maps it to [-1, 1).
+	if r.jitterRand != nil {
+		shift := time.Duration(float64(delay) * 0.1 * (2*r.jitterRand.Float64() - 1))
+		delay += shift
+		if delay < 0 {
+			delay = 0
+		}
+	}
 	return delay
 }
 
