@@ -43,10 +43,13 @@ container cannot use `zpctl`.
 
 ## Log file handling
 
-Service log destinations (`log.stdout`, `log.stderr`) and `zpctl tail`
-reads open files with `O_NOFOLLOW`. A symlink at the leaf of a
-configured path is rejected. `readLastBytes` additionally requires
-`Mode().IsRegular()`.
+Service log destinations (`log.stdout`, `log.stderr`), `zpctl tail`
+one-shot reads, and `zpctl tail --follow` streaming reads all open
+the configured log path with `O_NOFOLLOW`. A symlink at the leaf of
+a configured path is rejected at open time; the follow loop's
+inode-comparison rotation detection cannot bypass this because every
+reopen goes through the same `O_NOFOLLOW` path. `readLastBytes` and
+the follow loop additionally require `Mode().IsRegular()`.
 
 Without this hardening, an operator typo or a hostile service config
 could plant a symlink at a log path and cause zpinit to append a
@@ -55,15 +58,18 @@ still resolve normally; only the leaf is gated.
 
 ## Wire-protocol sanitization
 
-`zpctl tail` surfaces service-controlled log content, and config-error
-responses can contain multi-line TOML messages. Both flow through
-`ctlproto.WriteResponse`, which sanitizes every line: CR and LF become
-spaces, and a lone `.` is prefixed with a space (the line-based
-protocol uses `.` as a body terminator).
+`zpctl tail` and `zpctl tail --follow` surface service-controlled
+log content; config-error responses can contain multi-line TOML
+messages. All flow through `ctlproto.WriteResponse` (one-shot) or
+`ctlproto.WriteBodyLine` (streaming), which sanitize every line
+identically: CR and LF become spaces, and a lone `.` is prefixed
+with a space (the line-based protocol uses `.` as a body
+terminator).
 
 Without this, a service that writes a crafted log line could split a
 single field across frames or end the response body early at the
-client.
+client. The streaming path inherits the same guarantee because it
+shares the sanitizer with the one-shot path.
 
 ## Env injection and `/proc`
 

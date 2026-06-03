@@ -253,6 +253,19 @@ See [docs/clustering.md § Auto-scaled replicas](docs/clustering.md)
 and the `[resources]` block in
 [docs/configuration.md](docs/configuration.md).
 
+## Boot banner
+
+Every zpinit start emits one line to stderr (visible in `docker logs`)
+before dispatch:
+
+```
+[zpinit 0.4.0] mode=supervise services=4 cpu=8 memory=8GiB
+```
+
+Mode 1 (wrap) shows `argv=` instead of `services=`. Set
+`ZPINIT_NO_BANNER=1` if a noise-sensitive workload needs a clean
+stderr stream.
+
 ## Operator commands (zpctl)
 
 `zpctl` talks to zpinit over `/run/zpinit.sock` (bound `0600`, gated by
@@ -261,27 +274,53 @@ commands; non-root services in the same container cannot). State names
 match supervisorctl exactly.
 
 ```sh
-zpctl status [NAME[/N]...]    # list states; NAME/N for one replica
+zpctl status [--verbose] [NAME[/N]...] # list states; --verbose adds rss/cpu/fds/spawns
 zpctl start | stop | restart NAME[/N] | all
 zpctl reload NAME[/N] | all   # in-place: reload_signal/_command or stop+start
 zpctl signal NAME[/N] HUP     # arbitrary signal (lower-level than reload)
 zpctl pid [NAME[/N]]          # zpinit's PID, or a service replica's
-zpctl tail NAME[/N]           # last 8KB of file-logged stdout
+zpctl ready [NAME[/N]...]     # exit 0 iff selected services are Running and [ready] passed
+zpctl tail [--follow|-f] NAME[/N] # last 8KB; --follow streams new lines (Ctrl-C to stop)
 zpctl update                  # apply config changes (= SIGHUP)
 zpctl reread                  # dry-run config diff
 zpctl shutdown
 zpctl help
 ```
 
+`zpctl ready` is the scheduler-friendly "is this container's stack
+up?" check: 0 if every service is `RUNNING` and its `[ready]` probe
+passed (or it has none), non-zero with per-service reasons in the
+body otherwise.
+
+`zpctl status --verbose` adds the data operators reach for during
+triage: resident memory (`rss=`), accumulated CPU time (`cpu=`),
+open fd count (`fds=`), lifetime spawn count (`spawns=`), and
+last-exit reason. The data is read from `/proc/<pid>/` on demand;
+this is a human-driven command, not a polling target.
+
+`zpctl tail --follow` keeps the connection open and streams new
+log lines as they're appended, including across logrotate-style
+file rotation (detected by inode change). Ctrl-C or any client
+disconnect ends the stream cleanly.
+
 ## Validate before deploy
 
 ```sh
 zpinit --check-config /etc/zpinit/   # TOML + schema validation
+zpinit --plan         /etc/zpinit/   # resolved boot plan (dry-run, no exec)
 zpinit --doctor       /etc/zpinit/   # superset: binaries, runtimes, live state
 ```
 
 `--check-config` parses everything, applies defaults, validates, and
 either prints a one-line OK or every error in a single pass.
+
+`--plan` goes further: loads the same config, detects the CPU /
+memory budget, resolves `replicas = "auto"` against that snapshot,
+expands per-replica log paths, and prints the resolved boot plan
+that would have been used. No exec, no spawn, no entrypoint.d
+execution. CI scripts can diff this output across image versions
+to catch unexpected boot-plan drift; operators new to a config
+get one place to see what's actually going to happen.
 
 `--doctor` extends `--check-config` with runtime checks: it resolves
 each `command[0]` on PATH (or as an absolute path), surfaces runtime

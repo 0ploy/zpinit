@@ -108,8 +108,11 @@ dispatches per runner:
   re-reads its config (or whatever it's wired to do on the signal).
 - `reload_command` set → one-shot spawned via the centralized
   reaper. Inherits the service's env so it sees `ZPINIT_CPU_COUNT`
-  and friends. Capped at 30 s before we stop waiting on it; non-zero
-  exit is logged, not surfaced as an error from `zpctl`.
+  and friends. Capped at 30 s before we stop waiting on it. Non-zero
+  exit codes are surfaced as `zpctl reload` errors with the
+  "service still running" qualifier, so CI pipelines that chain
+  `zpctl reload && next` fail closed on a broken reload payload
+  without restarting the supervised process itself.
 - Neither → full stop+start (same as `zpctl restart`).
 
 Parallelism mirrors `stopRunnerGroup`: parallel within a replica
@@ -167,6 +170,17 @@ with `nc` or `socat`.
 
 State names match supervisorctl exactly (`RUNNING`, `STOPPED`,
 `BACKOFF`, `FATAL`, ...) so existing muscle memory transfers.
+
+A small protocol extension supports **streaming** responses for
+`tail --follow`: the server writes the status line and terminator
+the same way, but emits body lines as new bytes arrive on the
+watched log file and only writes the terminator when the stream
+ends (client disconnect, supervisor shutdown). The connection's
+read deadline is cleared for the streaming verb's lifetime; the
+write deadline is refreshed per drain so a wedged client is still
+bounded. `zpctl` detects `--follow` (or `-f`) and switches its
+client-side read loop to read body lines as they arrive rather
+than buffering until the terminator.
 
 ### Access control
 

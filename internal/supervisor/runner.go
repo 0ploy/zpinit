@@ -119,6 +119,26 @@ type Runner struct {
 	// r.mu in backoffStep, so rand.Rand's non-thread-safe state is
 	// covered by the existing lock.
 	jitterRand *rand.Rand
+
+	// totalSpawns counts every successful spawn over the runner's
+	// lifetime, including the initial one and every crash-restart.
+	// Distinct from r.crashes (which resets on a stable run and on
+	// manual Start during backoff). Surfaced by `zpctl status
+	// --verbose` as the restart count operators care about for
+	// long-term stability triage.
+	totalSpawns int
+
+	// readyPassed records whether the [ready] probe has ever succeeded
+	// (or been treated as succeeded under on_timeout=continue) for
+	// this runner. Set by the orchestrator's boot paths after
+	// waitReady returns, never reset. Drives `zpctl ready`: a service
+	// with no [ready] is always considered ready once Running; a
+	// service with [ready] becomes ready when readyPassed is true and
+	// stays ready through subsequent crash-restarts (the probe is
+	// boot-time only per design). Mu-protected because the writer
+	// (orchestrator boot goroutine) and reader (control-socket
+	// handler) run concurrently.
+	readyPassed bool
 }
 
 // setRunCancel stores the cancel function for the runner's own Run
@@ -455,12 +475,14 @@ func (r *Runner) LastExit() reaper.ExitInfo {
 // half-transitioned mix like "RUNNING pid 0" that the individual
 // per-field accessors can produce when used in sequence.
 type Status struct {
-	State    State
-	Manual   bool
-	PID      int
-	UpSince  time.Time
-	Crashes  int
-	LastExit reaper.ExitInfo
+	State       State
+	Manual      bool
+	PID         int
+	UpSince     time.Time
+	Crashes     int
+	LastExit    reaper.ExitInfo
+	ReadyPassed bool
+	TotalSpawns int
 }
 
 // Snapshot returns a consistent view of every field formatStatusLine
@@ -475,13 +497,35 @@ func (r *Runner) Snapshot() Status {
 		pid = r.process.PID()
 	}
 	return Status{
-		State:    r.state,
-		Manual:   r.stoppedManually,
-		PID:      pid,
-		UpSince:  r.upSince,
-		Crashes:  r.crashes,
-		LastExit: r.lastExit,
+		State:       r.state,
+		Manual:      r.stoppedManually,
+		PID:         pid,
+		UpSince:     r.upSince,
+		Crashes:     r.crashes,
+		LastExit:    r.lastExit,
+		ReadyPassed: r.readyPassed,
+		TotalSpawns: r.totalSpawns,
 	}
+}
+
+// MarkReady records that the [ready] probe has passed (or been
+// treated as passed via on_timeout=continue) for this runner.
+// Idempotent. Called by the orchestrator's boot paths.
+func (r *Runner) MarkReady() {
+	r.mu.Lock()
+	r.readyPassed = true
+	r.mu.Unlock()
+}
+
+// ReadyPassed reports whether MarkReady has been called for this
+// runner. Use for `zpctl ready` and similar readiness queries; does
+// not consult State (a service that was ready then crashed into
+// backoff still returns true here; combine with State() if you want
+// "ready AND currently running").
+func (r *Runner) ReadyPassed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.readyPassed
 }
 
 // UpSince returns when the runner last entered Running, or the zero
@@ -630,6 +674,7 @@ func (r *Runner) spawnNext(timers *runnerTimers) {
 	r.setProcess(proc)
 	r.mu.Lock()
 	r.upSince = r.clock.Now()
+	r.totalSpawns++
 	r.mu.Unlock()
 	r.setState(StateRunning)
 }

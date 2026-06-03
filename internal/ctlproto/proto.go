@@ -107,7 +107,7 @@ func (c *Conn) ReadResponse() (*Response, error) {
 }
 
 func (c *Conn) WriteResponse(resp *Response) error {
-	if _, err := fmt.Fprintf(c.w, "%d %s\n", resp.Code, sanitizeLine(resp.Msg)); err != nil {
+	if err := c.WriteStatusLine(resp.Code, resp.Msg); err != nil {
 		return err
 	}
 	for _, b := range resp.Body {
@@ -115,10 +115,66 @@ func (c *Conn) WriteResponse(resp *Response) error {
 			return err
 		}
 	}
+	return c.WriteEnd()
+}
+
+// WriteStatusLine writes the response's leading "<code> <msg>\n"
+// line and flushes. Exposed for streaming responses (e.g. `tail
+// --follow`) where the server writes the status up front and then
+// emits body lines as they arrive; WriteResponse stays the
+// one-shot convenience for the common case.
+func (c *Conn) WriteStatusLine(code int, msg string) error {
+	if _, err := fmt.Fprintf(c.w, "%d %s\n", code, sanitizeLine(msg)); err != nil {
+		return err
+	}
+	return c.w.Flush()
+}
+
+// WriteBodyLine writes one body line and flushes so the client
+// sees it without waiting for the terminator. Use during a
+// streaming response; for one-shot writes the buffered
+// WriteResponse path is cheaper.
+func (c *Conn) WriteBodyLine(line string) error {
+	if _, err := fmt.Fprintln(c.w, sanitizeLine(line)); err != nil {
+		return err
+	}
+	return c.w.Flush()
+}
+
+// WriteEnd writes the response terminator and flushes. Pairs with
+// WriteStatusLine + WriteBodyLine for streaming responses.
+func (c *Conn) WriteEnd() error {
 	if _, err := fmt.Fprintln(c.w, Terminator); err != nil {
 		return err
 	}
 	return c.w.Flush()
+}
+
+// ReadStatusLine reads the leading "<code> <msg>\n" line of a
+// response. Use for streaming clients that want to print body
+// lines as they arrive; ReadResponse stays the one-shot
+// convenience that buffers the whole response.
+func (c *Conn) ReadStatusLine() (int, string, error) {
+	line, err := c.readLine()
+	if err != nil {
+		return 0, "", err
+	}
+	return parseStatus(line)
+}
+
+// ReadBodyLine reads one body line. Returns done=true when the
+// terminator is seen; the caller stops looping then. Errors are
+// surfaced; an io.EOF before the terminator means the server
+// closed mid-stream and the caller should report that.
+func (c *Conn) ReadBodyLine() (line string, done bool, err error) {
+	line, err = c.readLine()
+	if err != nil {
+		return "", false, err
+	}
+	if line == Terminator {
+		return "", true, nil
+	}
+	return line, false, nil
 }
 
 // sanitizeLine fixes content that would break the line-based wire

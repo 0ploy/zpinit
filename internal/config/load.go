@@ -138,10 +138,26 @@ func loadServices(dir string, cfg *Config) error {
 	})
 
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".toml") {
+		if e.IsDir() {
 			continue
 		}
-		path := filepath.Join(dir, e.Name())
+		name := e.Name()
+		// Skip dotfiles and the `.disabled` suffix convention so the
+		// loader matches entrypoint.d's hidden/disabled rules. An
+		// operator can park a service file out of rotation with
+		//   mv 20_worker.toml 20_worker.toml.disabled
+		// without renaming away from .toml and without `zpctl
+		// reread` complaining. Editor swap files (`.foo.toml.swp`,
+		// `#foo.toml`-style autosave variants) also become safe to
+		// leave in services/ during edits because the `.foo.toml`
+		// branch is hidden and `.swp` is not `.toml`.
+		if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".disabled") {
+			continue
+		}
+		if !strings.HasSuffix(name, ".toml") {
+			continue
+		}
+		path := filepath.Join(dir, name)
 		var svc Service
 		md, err := toml.DecodeFile(path, &svc)
 		if err != nil {
@@ -150,9 +166,9 @@ func loadServices(dir string, cfg *Config) error {
 		if undecoded := md.Undecoded(); len(undecoded) > 0 {
 			return fmt.Errorf("%s: unknown keys: %s", path, joinKeys(undecoded))
 		}
-		svc.Filename = e.Name()
+		svc.Filename = name
 		if svc.Name == "" {
-			svc.Name = nameFromFilename(e.Name())
+			svc.Name = nameFromFilename(name)
 		}
 		applyServiceDefaults(&svc, &cfg.Globals, md.IsDefined("reload_on_change"))
 		cfg.Services = append(cfg.Services, svc)

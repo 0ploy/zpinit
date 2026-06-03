@@ -290,12 +290,25 @@ func (o *Orchestrator) bootOne(ctx context.Context, r *Runner) error {
 		env := service.MergeEnv(r.BaseEnv(), cfg.Env)
 		if err := waitReady(ctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
 			if cfg.Ready.OnTimeout == config.ReadyContinue {
+				// Boot proceeds; from a `zpctl ready` standpoint the
+				// operator opted into "best effort" so we count this
+				// as ready (the alternative would block ready forever
+				// on a service that explicitly tolerates probe
+				// timeout).
+				r.MarkReady()
 				o.log.Warn("readiness failed; continuing per on_timeout", "service", name, "err", err)
 				return nil
 			}
 			return fmt.Errorf("readiness: %w", err)
 		}
+		r.MarkReady()
 		o.log.Info("boot: ready", "service", name)
+	} else {
+		// No [ready] configured: the service is considered ready as
+		// soon as it reaches Running, so mark it immediately after
+		// WaitBootResult so `zpctl ready` doesn't have to special-case
+		// "no probe" everywhere.
+		r.MarkReady()
 	}
 	return nil
 }
@@ -695,13 +708,21 @@ func (o *Orchestrator) bootReloadJob(ctx context.Context, j reloadBootJob) {
 		env := service.MergeEnv(r.BaseEnv(), cfg.Env)
 		if err := waitReady(ctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
 			if cfg.Ready.OnTimeout == config.ReadyContinue {
+				// See bootOne: on_timeout=continue counts as ready
+				// for `zpctl ready` purposes since the operator
+				// declared the probe non-blocking.
+				r.MarkReady()
 				o.log.Warn("reload: readiness failed; continuing per on_timeout",
 					"service", name, "err", err)
 			} else {
 				o.log.Error("reload: added service readiness failed",
 					"service", name, "err", err)
 			}
+		} else {
+			r.MarkReady()
 		}
+	} else {
+		r.MarkReady()
 	}
 }
 

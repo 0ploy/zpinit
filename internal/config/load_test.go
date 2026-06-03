@@ -67,6 +67,31 @@ func TestLoad_ValidMinimal(t *testing.T) {
 	}
 }
 
+// Mirror the entrypoint.d hidden/disabled rules so an operator can
+// park a service file out of rotation without renaming away from
+// .toml, and editor swap/autosave files don't get loaded mid-edit.
+func TestLoad_SkipsDisabledAndDotfiles(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_redis.toml"), `command = ["redis-server"]`)
+	write(t, filepath.Join(dir, "services", "20_worker.toml.disabled"), `command = ["worker"]`)
+	write(t, filepath.Join(dir, "services", ".#editor-swap.toml"), `command = ["nope"]`)
+	write(t, filepath.Join(dir, "services", ".hidden.toml"), `command = ["nope"]`)
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Services) != 1 {
+		var names []string
+		for _, s := range cfg.Services {
+			names = append(names, s.Filename)
+		}
+		t.Fatalf("want 1 service (redis only), got %d: %v", len(cfg.Services), names)
+	}
+	if cfg.Services[0].Name != "redis" {
+		t.Errorf("loaded service = %q, want redis", cfg.Services[0].Name)
+	}
+}
+
 func TestLoad_GlobalDefaults(t *testing.T) {
 	dir := t.TempDir()
 	cfg, err := Load(dir)

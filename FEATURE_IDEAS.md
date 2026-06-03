@@ -91,23 +91,6 @@ Open questions:
 - `ensure_dirs` mode/owner: hard-coded `0755 root:root`, or per-entry?
 - Conflict policy when `ensure_dirs` overlaps with mounted volumes?
 
-## 4. Boot banner and structured exit envelope
-
-One line on zpinit's own stdout before exec / before service boot starts:
-
-```
-[zpinit v1.4.0] mode=exec argv=[my-app --port 8080] env=prod ulimit_nofile=65535 user=app
-```
-
-Cheap, fleet-uniform `docker logs` parsing surface. Writes to zpinit's own
-stdout pre-exec, not the child's FDs, so no conflict with the "no log
-piping" non-goal.
-
-Open questions:
-
-- Format: key=value or single-line JSON?
-- Opt-out flag for noise-sensitive workloads?
-
 ## 5. Swiss-army subcommands
 
 Even when zpinit `exec`s away in mode 1, the static binary sits in every
@@ -615,45 +598,6 @@ Open questions:
 - Rotation: explicitly no (matches the "no log rotation" non-goal),
   document it.
 
-## 18. `--dry-run` resolved-plan output
-
-Different from `--check-config` (validates schema). `--dry-run` prints
-the resolved phase plan WITHOUT executing:
-
-```
-$ zpinit --dry-run /etc/zpinit/
-phase wait:
-  tcp db:5432 timeout=30s
-phase require:
-  env: DB_HOST DB_PASSWORD
-  mounts: /var/lib/myapp
-phase runtime:
-  ulimit_nofile=65535 umask=0022 tz=UTC
-phase chown:
-  /var/lib/myapp -> app:app (recursive)
-phase secrets:
-  DB_PASSWORD <- vault:secret/data/myapp/db#password
-phase render:
-  /etc/nginx.conf.tpl -> /etc/nginx.conf
-phase entrypoint (zpinit.toml):
-  wait-db        timeout=30s
-  migrate        once=/var/lib/myapp/.migrated user=app
-phase entrypoint (entrypoint.d/):
-  10-fix-perms.sh
-  20-warm-cache.sh
-mode: exec ["my-app", "--port", "8080"] user=app
-```
-
-Operator-facing. CI smoke tests can diff this output across image
-versions to catch unexpected boot-plan changes. Useful for explaining
-"why isn't my script running?" without spelunking through filenames.
-
-Open questions:
-
-- Exit code: 0 always (just printing), or non-zero if any phase
-  references something missing (binary at `command[0]`, file at
-  `template`, etc.)?
-
 ## 19. Parallel execution within priority bands (opt-in)
 
 Today `entrypoint.d/` is strictly sequential. Scripts that share a
@@ -953,31 +897,6 @@ Open questions:
   `Orchestrator.ShutdownBudget()` already recomputed at signal time
   (per `CLAUDE.md`). Validate at config load.
 
-## 27. `zpctl ready` and `zpctl status --verbose`
-
-Two small zpctl additions, no new concepts:
-
-- `zpctl ready` exits 0 if every service has passed its `[ready]` probe
-  (or has none); non-zero otherwise. Useful for scheduler integration
-  ("is this container's whole stack up?") without an HTTP endpoint
-  (which is a non-goal).
-- `zpctl status --verbose` enriches each service line with `/proc/<pid>/`
-  data: rss, cpu time, fd count, lifetime, restart count.
-
-```
-$ zpctl status redis --verbose
-redis  RUNNING  pid=42  uptime=4h12m  rss=18MB  cpu=1.2%  fds=14  restarts=0
-```
-
-Why: introspection without a metrics endpoint. The data is already in
-`/proc`; zpinit just reads and formats it on the control socket.
-
-Open questions:
-
-- Refresh cost: reading `/proc/<pid>/status` for many services on every
-  `zpctl status` call. Probably fine; this is a human-driven command,
-  not a polling target.
-
 ## 28. Better `[ready]` failure diagnostics
 
 When boot times out because `[ready]` never passed, today's error is
@@ -1142,9 +1061,6 @@ Open questions:
   `/proc/<pid>/status` and logs `[zpinit] WARN service X rss grew
   64MB -> 512MB over 2h`. No alerting (no metrics endpoint), just
   observable in `docker logs`.
-- **`zpctl tail --follow`**: stream new lines as they appear. Needs a
-  streaming protocol on the control socket; today's tail is one-shot.
-  Defer unless real demand.
 - **`zpctl complete bash|zsh`**: shell completion. Trivial polish,
   unrelated to mode 3 specifically.
 
@@ -1179,19 +1095,33 @@ Recorded so we don't relitigate later. From `CLAUDE.md`:
   via `zpinit envsubst` is the workaround and stays out of the config.
 - **Pipe-based log enrichment** (zpinit captures child stdout/stderr and
   rewraps it). Collides with the FD-inheritance-only rule. The boot banner
-  in (4) is fine because it writes to zpinit's own stdout pre-exec, not the
-  child's stream.
+  shipped in v0.4.0 is fine because it writes to zpinit's own stderr pre-
+  dispatch, not the child's stream.
 - **Service dependency graphs** (anything with explicit `depends_on`
   edges, condition-based ordering beyond filename, or "wait until peer
   service emits an event"). Collides with "filename order + readiness
   probes only." Service groups (mid-tier in the mode-3 list) sit close
   to this line; they're a flat label, not a graph, but worth a check.
 - **Interactive `zpctl fg`** (attach-and-watch a service's stdout in
-  real-time). Explicit non-goal. `zpctl tail --follow` (mid-tier above)
-  is the one variant we'd consider, since it streams a log file rather
-  than the live process FD; even that is borderline.
+  real-time). Explicit non-goal. `zpctl tail --follow` (shipped) is the
+  closest variant: it streams a log file rather than the live process
+  FD, which keeps the FD-inheritance-only rule intact.
 - **Log rotation inside zpinit.** Use logrotate or stdout-to-host-logging
   (existing non-goal); affects items 17 and 23.
+
+## Already shipped (kept here for the priority discussion only)
+
+The following items from earlier drafts have landed and are no longer
+in the "pending" section above:
+
+- Item 4 boot banner (shipped v0.4.0).
+- Item 18 `--dry-run` resolved plan (shipped v0.4.0 as `zpinit --plan`).
+- Item 27 `zpctl ready` and `zpctl status --verbose` (shipped v0.4.0).
+- Mid-tier item `zpctl tail --follow` (shipped v0.4.0 with a streaming
+  control-protocol extension).
+
+References below preserve their original numbering for traceability;
+the items themselves were removed from the body of this file.
 
 ## Suggested priority if we move forward
 
@@ -1200,8 +1130,7 @@ The cluster with the best signal-to-cost ratio:
 1. `[[wait]]` external preconditions
 2. `[require]` assertions
 3. `[runtime]` normalization
-4. Boot banner
-5. Swiss-army subcommands
+4. Swiss-army subcommands (was item 5)
 
 Small, declarative, mode-agnostic, don't blur existing mode boundaries, and
 turn mode 1 from "exec with config validation" into "the shortest path to
@@ -1223,8 +1152,6 @@ Within the mode-2 cluster (items 11-19):
   handwriting footguns.
 - (16) per-script and per-phase timing envelope: cheap, fleet-uniform
   `docker logs` triage.
-- (18) `--dry-run` resolved plan: CI / debugging force-multiplier; the
-  feature that makes the rest of this list approachable to operators.
 
 (11) `[[entrypoint]]` and (12) sidecar config are mid-tier: high
 expressiveness, but they expand the schema meaningfully and need a clear
@@ -1255,9 +1182,8 @@ Within the mode-3 cluster (items 20-29):
   with unequal trust. Pure rlimit + oom_score_adj is small-surface;
   cgroup support is a later phase.
 - (23) audit / crashlog: high value for operators, low risk, builds
-  on the timing-envelope work from items 4 and 16.
-- (27) `zpctl ready` and `--verbose`: tiny additions, high
-  every-day-utility, no new concepts.
+  on the timing-envelope work from item 16 (the boot banner shipped
+  separately in v0.4.0).
 - (26) multi-signal stop ladder: medium value, fits naturally into
   the existing reverse-serial shutdown.
 

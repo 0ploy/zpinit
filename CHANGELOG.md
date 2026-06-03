@@ -4,6 +4,49 @@
 
 ### Features
 
+- **`zpctl ready` reports stack readiness.** Exits 0 iff every
+  selected service is `RUNNING` and either has no `[ready]` probe
+  or has passed it; non-zero with per-service reasons in the body
+  otherwise. The check schedulers, healthchecks, and CI deploys
+  reach for without zpinit having to grow an HTTP endpoint.
+
+- **`zpctl status --verbose` enriches status rows.** Each line
+  picks up `rss`, `cpu` time, `fds`, lifetime `spawns`, and
+  last-exit reason from `/proc`. Pure read; this is a human-
+  driven command, not a polling target. Linux only (non-linux
+  builds emit the row without the `/proc`-derived fields).
+
+- **`zpctl tail --follow` streams new log lines.** Keeps the
+  connection open and emits body lines as they're appended,
+  including across logrotate-style file rotation (detected via
+  inode change). Ctrl-C or any client disconnect ends the stream
+  cleanly. The control protocol gained a small streaming
+  extension (`WriteStatusLine` / `WriteBodyLine` / `WriteEnd` on
+  the server side, `ReadStatusLine` / `ReadBodyLine` on the
+  client side) so new long-running verbs can reuse the shape.
+
+- **`zpinit --plan` prints the resolved boot plan.** Loads the
+  config, detects the CPU/memory budget, resolves
+  `replicas = "auto"` against the current snapshot, expands per-
+  replica log paths, and writes a human-readable plan to stdout.
+  No exec, no spawn, no entrypoint.d execution. CI scripts can
+  diff this output across image versions to catch unexpected
+  boot-plan drift; operators learning a new config get one
+  authoritative view of what would actually happen.
+
+- **Boot banner.** zpinit now prints one stderr line before
+  dispatch:
+  `[zpinit 0.4.0] mode=supervise services=4 cpu=8 memory=8GiB`
+  Mode 1 (wrap) shows `argv=` instead of `services=`. Set
+  `ZPINIT_NO_BANNER=1` to suppress.
+
+- **Service files starting with `.` or ending in `.disabled` are
+  skipped.** Mirrors the `entrypoint.d/` hidden/disabled
+  convention. Operators can park a service out of rotation with
+  `mv 20_worker.toml 20_worker.toml.disabled` and editor swap
+  files (`.foo.toml.swp`-style) no longer surprise `zpctl
+  reread` mid-edit.
+
 - **Backoff has ±10% per-replica jitter.** Replicas of a service
   that crash together (e.g. their shared upstream went down) no
   longer synchronize their retry pulses on the doubling backoff

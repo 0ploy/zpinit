@@ -1,7 +1,10 @@
 # Configuration
 
 zpinit reads everything under `/etc/zpinit/`. Validate with
-`zpinit --check-config /etc/zpinit/` before deploying.
+`zpinit --check-config /etc/zpinit/` before deploying, and preview the
+fully-resolved boot plan with `zpinit --plan /etc/zpinit/` (loads
+config, detects resources, expands replicas, prints what would have
+run — no exec, no spawn).
 
 ## Layout
 
@@ -24,6 +27,20 @@ from the resolved service name (`10_redis.toml` becomes service
 
 Service names must match `^[a-zA-Z0-9_-]+$` and must be unique after
 stripping prefixes. `--check-config` reports collisions.
+
+**Hidden and disabled files are skipped.** Service files starting
+with `.` (editor swap/autosave) and files ending in `.disabled` are
+ignored by the loader, mirroring `entrypoint.d/`'s convention. To
+take a service out of rotation without deleting the file, rename:
+
+```
+mv services/20_worker.toml services/20_worker.toml.disabled
+zpctl reread        # confirms it would disappear from the running set
+zpctl update        # applies (or send SIGHUP)
+```
+
+`zpctl reread` doesn't complain about either form, so dev-loop edits
+under `services/` are safe.
 
 ## `zpinit.toml` (globals)
 

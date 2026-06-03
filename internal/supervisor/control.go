@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -132,6 +133,23 @@ func (s *ControlServer) handleConn(conn net.Conn) {
 		return
 	}
 
+	// Streaming verbs (`tail --follow`) bypass the regular Response
+	// path: the handler writes its own status line, streams body
+	// lines as they arrive, and writes the terminator on shutdown.
+	// We hand it the live conn so it can manage its own write
+	// deadline (a regular dispatch budget is meaningless for an
+	// open-ended follow). Read deadline is cleared because there's
+	// no further client-driven I/O to time-bound; the goroutine
+	// exits when the client closes the connection (write error) or
+	// the supervisor shuts down.
+	if isStreamingRequest(req) {
+		_ = conn.SetReadDeadline(time.Time{})
+		streamCtx, streamCancel := context.WithCancel(context.Background())
+		defer streamCancel()
+		s.handleStream(streamCtx, conn, pc, req)
+		return
+	}
+
 	deadline := time.Now().Add(s.dispatchBudget(req))
 	_ = conn.SetDeadline(deadline)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
@@ -139,6 +157,39 @@ func (s *ControlServer) handleConn(conn net.Conn) {
 
 	resp := s.dispatch(ctx, req)
 	_ = pc.WriteResponse(resp)
+}
+
+// isStreamingRequest reports whether the request takes the
+// streaming code path (status line + ad-hoc body lines + late
+// terminator). Today only `tail --follow` qualifies.
+func isStreamingRequest(req *ctlproto.Request) bool {
+	if req.Verb != "tail" {
+		return false
+	}
+	for _, a := range req.Args {
+		if a == "--follow" || a == "-f" {
+			return true
+		}
+	}
+	return false
+}
+
+// handleStream dispatches the streaming verbs and writes the
+// response terminator on the way out. The verb handlers stream
+// body lines directly via pc.WriteBodyLine and return when they're
+// done (client disconnect, ctx cancel, or self-termination).
+func (s *ControlServer) handleStream(ctx context.Context, conn net.Conn, pc *ctlproto.Conn, req *ctlproto.Request) {
+	switch req.Verb {
+	case "tail":
+		s.cmdTailFollow(ctx, conn, pc, req.Args)
+	default:
+		_ = pc.WriteResponse(&ctlproto.Response{Code: 1, Msg: "internal: unknown streaming verb " + req.Verb})
+		return
+	}
+	// Terminator after the stream ends. Best-effort: the client may
+	// already be gone, in which case the write fails and we log
+	// nothing.
+	_ = pc.WriteEnd()
 }
 
 // dispatchBudget returns how long the connection may stay open for
@@ -249,6 +300,8 @@ func (s *ControlServer) dispatch(ctx context.Context, req *ctlproto.Request) *ct
 		return s.cmdShutdown()
 	case "signal":
 		return s.cmdSignal(req.Args)
+	case "ready":
+		return s.cmdReady(req.Args)
 	case "help":
 		return s.cmdHelp()
 	default:
@@ -257,15 +310,44 @@ func (s *ControlServer) dispatch(ctx context.Context, req *ctlproto.Request) *ct
 }
 
 func (s *ControlServer) cmdStatus(args []string) *ctlproto.Response {
+	// --verbose appended to status decorates each runner line with
+	// /proc-derived data (RSS, CPU time, fd count) and lifetime
+	// counters (last exit, total spawns). Stripped before passing to
+	// expandTargets so service-name parsing stays simple. Anywhere in
+	// the arg list works ("status --verbose all", "status all
+	// --verbose") so operators don't have to remember the position.
+	verbose, args := extractFlag(args, "--verbose")
 	targets, err := s.expandTargets(args, true)
 	if err != nil {
 		return errResp(err.Error())
 	}
 	resp := okResp("ok")
 	for _, r := range targets {
-		resp.Body = append(resp.Body, formatStatusLine(r))
+		if verbose {
+			resp.Body = append(resp.Body, formatStatusLineVerbose(r))
+		} else {
+			resp.Body = append(resp.Body, formatStatusLine(r))
+		}
 	}
 	return resp
+}
+
+// extractFlag removes every occurrence of name from args and reports
+// whether it was present. Used to strip control-protocol flags
+// before name resolution. Multi-strip is intentional so operators
+// don't get confusing "unknown service: --verbose" errors when they
+// accidentally write the flag twice.
+func extractFlag(args []string, name string) (bool, []string) {
+	found := false
+	out := args[:0]
+	for _, a := range args {
+		if a == name {
+			found = true
+			continue
+		}
+		out = append(out, a)
+	}
+	return found, out
 }
 
 func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, action string) *ctlproto.Response {
@@ -484,6 +566,182 @@ func replicaSuffix(r config.Replicas) string {
 	return fmt.Sprintf(" [%d replicas]", r.N)
 }
 
+// cmdTailFollow streams new lines as they're appended to a
+// service's stdout log file until the client disconnects or the
+// supervisor shuts down. Polls with os.Stat + ReadAt rather than
+// inotify so it works on every container filesystem (tmpfs,
+// overlayfs, NFS — inotify is famously unreliable on the second
+// and third).
+//
+// Detects log rotation by inode change (logrotate's default mode
+// renames the old file and creates a new one). When the inode
+// moves, the next poll reopens the new file from offset 0 so the
+// operator's view follows the rotation instead of getting wedged
+// on a file that no app writes to anymore.
+//
+// Wire shape: writes the status line "0 ok" immediately, then
+// streams one body line per log line (after sanitization). The
+// terminator is written by handleStream when this function
+// returns; the client's read loop treats the terminator (or a
+// network error) as the end of the stream.
+func (s *ControlServer) cmdTailFollow(ctx context.Context, conn net.Conn, pc *ctlproto.Conn, args []string) {
+	// Args layout: ["--follow", "name"] or ["name", "--follow"], in
+	// either order. Strip the flag (and any -f alias) before name
+	// resolution.
+	_, args = extractFlag(args, "--follow")
+	_, args = extractFlag(args, "-f")
+	if len(args) != 1 {
+		_ = pc.WriteStatusLine(1, "usage: tail --follow NAME[/N]")
+		return
+	}
+	name := args[0]
+	rs, err := resolveTarget(s.orch.snapshotRunners(), name)
+	if err != nil {
+		_ = pc.WriteStatusLine(1, err.Error())
+		return
+	}
+	if len(rs) > 1 {
+		_ = pc.WriteStatusLine(1, fmt.Sprintf("%s has %d replicas; specify which one: tail --follow %s/N", name, len(rs), name))
+		return
+	}
+	cfg := rs[0].Cfg()
+	if cfg.Log.Stdout == "" || cfg.Log.Stdout == "inherit" {
+		_ = pc.WriteStatusLine(1, fmt.Sprintf("%s logs to stdout (no file to tail)", rs[0].DisplayName()))
+		return
+	}
+	if err := pc.WriteStatusLine(0, "ok"); err != nil {
+		return
+	}
+	streamFile(ctx, conn, pc, cfg.Log.Stdout, s.log)
+}
+
+// streamFile is the actual follow loop, factored out so future
+// callers (e.g. tail --follow on stderr) can reuse it. Initial
+// dump is the last 8KB to match one-shot tail; then poll every
+// 200ms for size growth, reopening on inode change. Exits when
+// ctx fires or a write to the client fails.
+func streamFile(ctx context.Context, conn net.Conn, pc *ctlproto.Conn, path string, log *slog.Logger) {
+	const initialTail = int64(8192)
+	const pollInterval = 200 * time.Millisecond
+
+	openWithCheck := func() (*os.File, os.FileInfo, error) {
+		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		st, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, nil, err
+		}
+		if !st.Mode().IsRegular() {
+			f.Close()
+			return nil, nil, fmt.Errorf("not a regular file: %s", path)
+		}
+		return f, st, nil
+	}
+
+	f, st, err := openWithCheck()
+	if err != nil {
+		_ = pc.WriteBodyLine(fmt.Sprintf("zpinit: %v", err))
+		return
+	}
+	defer f.Close()
+
+	// Emit the last initialTail bytes as the snapshot, just like
+	// one-shot `tail`. Pin the offset to the start of the first
+	// complete line so half-line snippets don't appear mid-stream.
+	offset := st.Size() - initialTail
+	if offset < 0 {
+		offset = 0
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		_ = pc.WriteBodyLine(fmt.Sprintf("zpinit: seek: %v", err))
+		return
+	}
+	reader := bufio.NewReader(f)
+	if offset > 0 {
+		// Drop the first (likely partial) line.
+		if _, err := reader.ReadString('\n'); err != nil && err != io.EOF {
+			_ = pc.WriteBodyLine(fmt.Sprintf("zpinit: read: %v", err))
+			return
+		}
+	}
+	if err := emitAvailable(reader, pc, conn); err != nil {
+		return
+	}
+
+	prevIno := inodeOf(st)
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		// Detect rotation via inode change: logrotate renames the old
+		// file out and creates a new one at the same path. When that
+		// happens, reopen and reset the reader. Without this, the
+		// follow loop would stay parked on the renamed (now dead)
+		// inode and never see the new logs.
+		newSt, statErr := os.Stat(path)
+		if statErr == nil && inodeOf(newSt) != prevIno {
+			f.Close()
+			f, _, err = openWithCheck()
+			if err != nil {
+				_ = pc.WriteBodyLine(fmt.Sprintf("zpinit: reopen: %v", err))
+				return
+			}
+			reader = bufio.NewReader(f)
+			prevIno = inodeOf(newSt)
+			log.Info("tail --follow: file rotated; reopened", "path", path)
+		}
+		if err := emitAvailable(reader, pc, conn); err != nil {
+			return
+		}
+	}
+}
+
+// emitAvailable drains every complete line currently in the reader,
+// writes each as a body line, and returns nil at EOF (more bytes
+// may arrive later). Returns an error if the client write fails so
+// the streaming loop can exit promptly on disconnect.
+func emitAvailable(reader *bufio.Reader, pc *ctlproto.Conn, conn net.Conn) error {
+	// Refresh the write deadline on every drain so a long-running
+	// follow doesn't time out on the kernel's socket buffer side.
+	_ = conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			trimmed := strings.TrimRight(line, "\r\n")
+			if werr := pc.WriteBodyLine(trimmed); werr != nil {
+				return werr
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			// Read error other than EOF: surface and stop.
+			_ = pc.WriteBodyLine(fmt.Sprintf("zpinit: read: %v", err))
+			return err
+		}
+	}
+}
+
+// inodeOf extracts the inode from a FileInfo via the underlying
+// syscall.Stat_t. Linux-specific in spirit; on macOS the same
+// field exists so this works for dev as well. Returns 0 if the
+// info doesn't expose the syscall struct (no platform we ship to
+// today hits that).
+func inodeOf(info os.FileInfo) uint64 {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return uint64(st.Ino)
+	}
+	return 0
+}
+
 func (s *ControlServer) cmdTail(args []string) *ctlproto.Response {
 	if len(args) != 1 {
 		return errResp("usage: tail NAME[/N]")
@@ -552,9 +810,65 @@ func (s *ControlServer) cmdSignal(args []string) *ctlproto.Response {
 	return resp
 }
 
+// cmdReady is the scheduler-friendly "is this container's stack up?"
+// verb. Exits 0 (code 0 on the wire) iff every selected service is
+// currently Running AND has either passed its [ready] probe or has
+// no probe configured. With no args, considers every runner; with
+// args, restricts to the named services/replicas (same syntax as
+// other verbs). The body lists each not-ready runner with the
+// reason ("starting", "backoff", "[ready] not passed", etc.) so an
+// operator (or a CI pipeline running `zpctl ready` between deploys)
+// can diagnose without a separate `zpctl status` call.
+//
+// A service that was ready and is currently in Backoff stays
+// "ready" in the readyPassed sense but counts as not-ready here
+// because State != Running. The intent of `ready` is "right now,
+// is the stack serving"; a transient backoff dip is therefore a
+// non-zero exit (which is what schedulers want to see).
+func (s *ControlServer) cmdReady(args []string) *ctlproto.Response {
+	targets, err := s.expandTargets(args, true)
+	if err != nil {
+		return errResp(err.Error())
+	}
+	resp := okResp("ok")
+	var notReady []string
+	for _, r := range targets {
+		snap := r.Snapshot()
+		ready := snap.State == StateRunning && (r.Cfg().Ready == nil || snap.ReadyPassed)
+		if ready {
+			continue
+		}
+		reason := readyReason(snap, r.Cfg().Ready != nil)
+		notReady = append(notReady, fmt.Sprintf("%s: %s", r.DisplayName(), reason))
+	}
+	if len(notReady) == 0 {
+		resp.Body = []string{fmt.Sprintf("all %d service(s) ready", len(targets))}
+		return resp
+	}
+	resp.Body = notReady
+	resp.Code = 1
+	resp.Msg = fmt.Sprintf("%d/%d not ready", len(notReady), len(targets))
+	return resp
+}
+
+// readyReason produces a short human-readable note for a not-ready
+// runner. Picks the most informative of:
+//
+//	state != Running        → state name (BACKOFF / FATAL / STOPPED / ...)
+//	state == Running, probe → "[ready] not passed"
+func readyReason(snap Status, hasProbe bool) string {
+	if snap.State != StateRunning {
+		return strings.ToLower(string(snap.State))
+	}
+	if hasProbe && !snap.ReadyPassed {
+		return "[ready] not passed"
+	}
+	return "not ready"
+}
+
 func (s *ControlServer) cmdHelp() *ctlproto.Response {
 	return okBody("ok", []string{
-		"status [NAME...]      list service states (no args = all)",
+		"status [--verbose] [NAME...] list service states (no args = all)",
 		"start NAME[/N]...     start service(s); 'all' for everything",
 		"stop NAME[/N]...      stop service(s); 'all' for everything",
 		"restart NAME[/N]...   stop then start; 'all' for everything",
@@ -563,7 +877,8 @@ func (s *ControlServer) cmdHelp() *ctlproto.Response {
 		"reload                with no args: alias for update",
 		"reload NAME[/N]...    in-place reload (reload_signal/_command or full restart)",
 		"reread                dry-run config diff",
-		"tail NAME[/N]         dump last 8KB of file-logged stdout (snapshot only)",
+		"ready [NAME[/N]...]   exit 0 iff selected services are Running and [ready] passed",
+		"tail [--follow] NAME[/N] dump file-logged stdout; --follow streams new lines",
 		"signal NAME[/N] SIG   send arbitrary signal to service's process group",
 		"shutdown              stop supervisor and exit",
 		"help                  this list",
@@ -650,6 +965,78 @@ func formatStatusLine(r *Runner) string {
 	snap := r.Snapshot()
 	state := mapToSupervisordState(snap.State, snap.Manual)
 	return fmt.Sprintf("%-32s %-9s %s", r.DisplayName(), state, stateDetail(snap))
+}
+
+// formatStatusLineVerbose returns the verbose status row: the
+// regular state line plus key=value pairs for the data operators
+// typically reach for during triage but otherwise have to assemble
+// from `cat /proc/$(zpctl pid svc)/status` and `zpctl status` runs.
+// Pure read; no side effects, no rate-limiting (this is a human-
+// driven command, not a polling target).
+//
+// RSS/CPU/FDs come from /proc and are only meaningful when the
+// service is actually running with a PID; the formatter prints them
+// only in that case. last_exit / spawns are always meaningful.
+func formatStatusLineVerbose(r *Runner) string {
+	snap := r.Snapshot()
+	state := mapToSupervisordState(snap.State, snap.Manual)
+	base := fmt.Sprintf("%-32s %-9s %s", r.DisplayName(), state, stateDetail(snap))
+
+	var extras []string
+	if snap.PID > 0 {
+		ps := readProcStats(snap.PID)
+		if ps.RSSBytes > 0 {
+			extras = append(extras, fmt.Sprintf("rss=%s", formatBytes(ps.RSSBytes)))
+		}
+		if ps.CPUSeconds > 0 {
+			extras = append(extras, fmt.Sprintf("cpu=%s", formatCPU(ps.CPUSeconds)))
+		}
+		if ps.FDCount > 0 {
+			extras = append(extras, fmt.Sprintf("fds=%d", ps.FDCount))
+		}
+	}
+	extras = append(extras, fmt.Sprintf("spawns=%d", snap.TotalSpawns))
+	if le := snap.LastExit; le.PID != 0 {
+		if le.Signaled {
+			extras = append(extras, fmt.Sprintf("last_exit=signal:%s", le.Signal.String()))
+		} else {
+			extras = append(extras, fmt.Sprintf("last_exit=code:%d", le.ExitCode))
+		}
+	}
+	return base + "  " + strings.Join(extras, " ")
+}
+
+// formatBytes renders a byte count for verbose status. Picks the
+// biggest unit that yields a value >= 1 (using binary 1024-based
+// units to match what /proc reports).
+func formatBytes(n uint64) string {
+	const (
+		Ki = uint64(1) << 10
+		Mi = uint64(1) << 20
+		Gi = uint64(1) << 30
+	)
+	switch {
+	case n >= Gi:
+		return fmt.Sprintf("%.1fGiB", float64(n)/float64(Gi))
+	case n >= Mi:
+		return fmt.Sprintf("%.1fMiB", float64(n)/float64(Mi))
+	case n >= Ki:
+		return fmt.Sprintf("%.1fKiB", float64(n)/float64(Ki))
+	}
+	return fmt.Sprintf("%dB", n)
+}
+
+// formatCPU renders accumulated CPU seconds as Hh:Mm:Ss or Mm:Ss,
+// matching supervisord-style readability.
+func formatCPU(secs float64) string {
+	totalSecs := int(secs)
+	h := totalSecs / 3600
+	m := (totalSecs % 3600) / 60
+	s := totalSecs % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%d:%02d", m, s)
 }
 
 func mapToSupervisordState(s State, manualStop bool) string {

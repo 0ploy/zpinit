@@ -279,12 +279,24 @@ release page with nothing useful in it.
   explicitly named in `[log]` are ever mkdir'd; the `O_NOFOLLOW` leaf
   check is unaffected.
 
-- Wire-protocol responses (`ctlproto.WriteResponse`) sanitize `Msg`
-  and every body line via `sanitizeLine`: CR/LF become spaces and a
-  lone `.` is prefixed with a space. `cmdTail` surfaces service-
-  controlled log content and `cmdUpdate` surfaces multi-line TOML
-  errors; without sanitization either could split a single field
-  across frames or end the body early at the client.
+- Wire-protocol responses sanitize `Msg` and every body line via
+  `sanitizeLine`: CR/LF become spaces and a lone `.` is prefixed
+  with a space. The one-shot path (`WriteResponse`) and the
+  streaming helpers (`WriteStatusLine` / `WriteBodyLine` / `WriteEnd`,
+  used by `tail --follow`) share the same sanitizer; both `cmdTail`
+  and the follow loop surface service-controlled log content, and
+  `cmdUpdate` surfaces multi-line TOML errors. Without the shared
+  sanitizer either could split a single field across frames or end
+  the body early at the client. Don't add a streaming write path
+  that bypasses sanitizeLine.
+
+- Streaming-verb dispatch (`isStreamingRequest` → `handleStream`)
+  runs `cmdTailFollow` with the read deadline cleared and a
+  per-drain write deadline. `handleStream` writes the terminator
+  after the handler returns, so handlers should NEVER write the
+  terminator themselves. New streaming verbs follow the same shape:
+  add to `isStreamingRequest`, write a status line, stream body
+  lines via `pc.WriteBodyLine`, return; the framework appends `.`.
 
 - `replicas = N` expands one service spec into N first-class
   Runners with the same `cfg.Filename` but distinct `replicaIndex`

@@ -36,6 +36,7 @@ func main() {
 		skipEntrypoint bool
 		doctorFlag     bool
 		doctorQuiet    bool
+		planFlag       bool
 	)
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.StringVar(&checkConfig, "check-config", "", "validate configuration in `dir` and exit")
@@ -43,6 +44,7 @@ func main() {
 	flag.BoolVar(&skipEntrypoint, "skip-entrypoint", false, "skip entrypoint.d scripts (useful for `docker run image bash` debug shells)")
 	flag.BoolVar(&doctorFlag, "doctor", false, "run the pre-flight environment audit and exit (filesystem, config, runtimes, state)")
 	flag.BoolVar(&doctorQuiet, "doctor-quiet", false, "with --doctor: suppress OK rows in the output")
+	flag.BoolVar(&planFlag, "plan", false, "print the resolved boot plan and exit (dry-run; no exec, no spawn, no entrypoint.d)")
 	flag.Parse()
 
 	if showVersion {
@@ -56,6 +58,10 @@ func main() {
 
 	if doctorFlag {
 		os.Exit(runDoctor(configDir, doctorQuiet))
+	}
+
+	if planFlag {
+		os.Exit(runPlan(configDir, flag.Args()))
 	}
 
 	// Track whether --config was passed explicitly so missing-dir
@@ -165,6 +171,17 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 	)
 	bootEnv := layeredMerge(finalEnv, resourceEnv)
 
+	// Boot banner on zpinit's own stderr, before mode dispatch. One
+	// line, key=value, fleet-uniform: every `docker logs` triage starts
+	// with "did zpinit even start, and which mode?" and the banner
+	// answers both on line 1. Writes to stderr (not stdout) so wrap-
+	// mode CMDs that emit structured output on stdout aren't polluted.
+	// Operators can opt out with ZPINIT_NO_BANNER=1 for noise-sensitive
+	// workloads.
+	if os.Getenv("ZPINIT_NO_BANNER") != "1" {
+		printBootBanner(cmdline, cfg, snap)
+	}
+
 	switch detectMode(cmdline) {
 	case modeWrap:
 		return execCmd(log, cmdline, bootEnv)
@@ -179,6 +196,51 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 		return runSupervise(log, configDir, cfg, bootEnv, containerEnv, scriptEnv, resourceEnv, snap, r)
 	}
 	return 1 // unreachable
+}
+
+// printBootBanner emits the one-line "what zpinit is about to do"
+// summary on stderr. Format is key=value so `docker logs` consumers
+// can grep for it; bytes worth optimizing because every container
+// the operator restarts emits one of these.
+//
+// Mode 1 (wrap) shows argv so the operator confirms which binary
+// gets execed; mode 3 (supervise) shows the service count. CPU and
+// memory come from the already-reserved snapshot so they reflect
+// what services will actually see (matches ZPINIT_CPU_COUNT /
+// ZPINIT_MEMORY_BYTES).
+func printBootBanner(cmdline []string, cfg *config.Config, snap resources.Snapshot) {
+	mode := "supervise"
+	tail := fmt.Sprintf("services=%d", len(cfg.Services))
+	if len(cmdline) > 0 {
+		mode = "wrap"
+		tail = fmt.Sprintf("argv=%q", cmdline)
+	}
+	mem := "unlimited"
+	if snap.MemoryBytes > 0 {
+		mem = formatMemoryBanner(snap.MemoryBytes)
+	}
+	fmt.Fprintf(os.Stderr, "[zpinit %s] mode=%s %s cpu=%d memory=%s\n",
+		version, mode, tail, snap.CPUCount, mem)
+}
+
+// formatMemoryBanner renders a byte count for the boot banner.
+// Picks a binary unit (MiB/GiB) when the value is a whole multiple,
+// otherwise prints two decimals of GiB; falls back to raw bytes for
+// values below 1 MiB.
+func formatMemoryBanner(n uint64) string {
+	const Mi = uint64(1) << 20
+	const Gi = uint64(1) << 30
+	switch {
+	case n >= Gi && n%Gi == 0:
+		return fmt.Sprintf("%dGiB", n/Gi)
+	case n >= Gi:
+		return fmt.Sprintf("%.2fGiB", float64(n)/float64(Gi))
+	case n >= Mi && n%Mi == 0:
+		return fmt.Sprintf("%dMiB", n/Mi)
+	case n >= Mi:
+		return fmt.Sprintf("%.2fMiB", float64(n)/float64(Mi))
+	}
+	return fmt.Sprintf("%dB", n)
 }
 
 // layeredMerge merges maps left-to-right; later maps override earlier ones.
