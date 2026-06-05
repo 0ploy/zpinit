@@ -780,24 +780,7 @@ func streamFile(ctx context.Context, conn net.Conn, pc *ctlproto.Conn, path stri
 	const initialTail = int64(8192)
 	const pollInterval = 200 * time.Millisecond
 
-	openWithCheck := func() (*os.File, os.FileInfo, error) {
-		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-		if err != nil {
-			return nil, nil, err
-		}
-		st, err := f.Stat()
-		if err != nil {
-			f.Close()
-			return nil, nil, err
-		}
-		if !st.Mode().IsRegular() {
-			f.Close()
-			return nil, nil, fmt.Errorf("not a regular file: %s", path)
-		}
-		return f, st, nil
-	}
-
-	f, st, err := openWithCheck()
+	f, st, err := openRegularNoFollow(path)
 	if err != nil {
 		_ = pc.WriteBodyLine(fmt.Sprintf("zpinit: %v", err))
 		return
@@ -844,7 +827,7 @@ func streamFile(ctx context.Context, conn net.Conn, pc *ctlproto.Conn, path stri
 		newSt, statErr := os.Stat(path)
 		if statErr == nil && inodeOf(newSt) != prevIno {
 			f.Close()
-			f, _, err = openWithCheck()
+			f, _, err = openRegularNoFollow(path)
 			if err != nil {
 				_ = pc.WriteBodyLine(fmt.Sprintf("zpinit: reopen: %v", err))
 				return
@@ -1341,25 +1324,38 @@ func formatUptime(d time.Duration) string {
 	return fmt.Sprintf("%d:%02d:%02d", hours, mins, secs)
 }
 
-func readLastBytes(path string, n int64) (string, error) {
-	// O_NOFOLLOW rejects the open if the final path component is a
-	// symlink, so a service config that points log.stdout at a
-	// symlink can't trick `zpctl tail` into reading whatever the
-	// link targets. The IsRegular check below covers the rest:
-	// device files, FIFOs, and directories all return non-regular
-	// from Stat and would either hang or dump nonsense.
+// openRegularNoFollow opens path read-only with O_NOFOLLOW and verifies
+// it is a regular file, returning the open file and its FileInfo. It is
+// the single home for the log-file hardening documented in
+// docs/security.md: O_NOFOLLOW rejects a symlink at the leaf (so a
+// service config pointing log.stdout at a symlink can't trick `zpctl
+// tail` into reading the link target), and the IsRegular check rejects
+// device files, FIFOs, and directories that would otherwise hang or
+// dump nonsense. Shared by the one-shot read and the follow loop
+// (including its post-rotation reopen) so the guarantee can't drift.
+func openRegularNoFollow(path string) (*os.File, os.FileInfo, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	if !st.Mode().IsRegular() {
+		f.Close()
+		return nil, nil, fmt.Errorf("not a regular file: %s", path)
+	}
+	return f, st, nil
+}
+
+func readLastBytes(path string, n int64) (string, error) {
+	f, st, err := openRegularNoFollow(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	if !st.Mode().IsRegular() {
-		return "", fmt.Errorf("not a regular file: %s", path)
-	}
 	offset := st.Size() - n
 	if offset < 0 {
 		offset = 0
