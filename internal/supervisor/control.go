@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,23 @@ import (
 	"github.com/0ploy/zpinit/internal/config"
 	"github.com/0ploy/zpinit/internal/ctlproto"
 )
+
+// errUnknownService marks an error whose root cause is "no service by
+// that name". resolveTarget wraps it so handlers can map it to the
+// CodeUnknownService wire code via errRespFor; a machine consumer
+// (e.g. a Puppet provider) treats that distinctly from a generic
+// operation failure.
+var errUnknownService = errors.New("unknown service")
+
+// errRespFor builds an error response, mapping an unknown-service
+// error to CodeUnknownService and everything else to CodeFailed.
+func errRespFor(err error) *ctlproto.Response {
+	code := ctlproto.CodeFailed
+	if errors.Is(err, errUnknownService) {
+		code = ctlproto.CodeUnknownService
+	}
+	return &ctlproto.Response{Code: code, Msg: err.Error()}
+}
 
 // ControlServer is the daemon side of the zpctl protocol. One request
 // per connection, dispatched against the orchestrator's runners.
@@ -197,9 +215,38 @@ func (s *ControlServer) handleStream(ctx context.Context, conn net.Conn, pc *ctl
 // sum-of-(stop_timeout+grace) over the affected runners; everything
 // else gets the floor.
 func (s *ControlServer) dispatchBudget(req *ctlproto.Request) time.Duration {
+	// Strip control flags so target resolution sees only service names
+	// (otherwise `start --wait all` treats "--wait" as a name, fails to
+	// resolve it, and falls back to the floor budget). Note whether
+	// --wait is present: it makes start/restart run until the service is
+	// ready, which needs boot_timeout + the probe timeout on top of any
+	// stop budget.
+	wait := false
+	args := make([]string, 0, len(req.Args))
+	for _, a := range req.Args {
+		switch a {
+		case "--wait":
+			wait = true
+		case "--verbose", "--json":
+			// flags, not targets
+		default:
+			args = append(args, a)
+		}
+	}
+
+	// stopVerb: needs stop_timeout + grace per filename group.
+	// waitVerb: needs boot_timeout + probe timeout + grace per group.
+	stopVerb := false
 	switch req.Verb {
 	case "stop", "restart", "update", "reload", "shutdown":
+		stopVerb = true
+	case "start":
+		// only extends the budget when waiting for readiness
 	default:
+		return minDispatchBudget
+	}
+	waitVerb := wait && (req.Verb == "start" || req.Verb == "restart")
+	if !stopVerb && !waitVerb {
 		return minDispatchBudget
 	}
 
@@ -209,17 +256,17 @@ func (s *ControlServer) dispatchBudget(req *ctlproto.Request) time.Duration {
 	case req.Verb == "shutdown" || req.Verb == "update":
 		// These touch every running service in the worst case.
 		targets = snap
-	case req.Verb == "reload" && len(req.Args) == 0:
+	case req.Verb == "reload" && len(args) == 0:
 		// No-arg reload is the alias for update.
 		targets = snap
-	case len(req.Args) == 0:
+	case len(args) == 0:
 		// dispatch will reject with usage error; floor budget is enough.
 		return minDispatchBudget
-	case len(req.Args) == 1 && req.Args[0] == "all":
+	case len(args) == 1 && args[0] == "all":
 		targets = snap
 	default:
-		targets = make([]*Runner, 0, len(req.Args))
-		for _, n := range req.Args {
+		targets = make([]*Runner, 0, len(args))
+		for _, n := range args {
 			// Budget should reflect the actual targets; ignore
 			// resolution errors here and let dispatch surface them.
 			rs, err := resolveTarget(snap, n)
@@ -233,18 +280,20 @@ func (s *ControlServer) dispatchBudget(req *ctlproto.Request) time.Duration {
 	// Budget per filename group, not per runner. dispatch processes
 	// replicas of one logical service in parallel (matching stopAll
 	// / removeServiceGroup), so a `replicas = 64` service contributes
-	// one unit of stop_timeout+grace to the budget, not 64. The
-	// previous per-runner accumulation produced multi-hour deadlines
-	// for `stop all` / `restart all` on heavily-replicated services,
-	// which kept the daemon-side handler goroutine and socket open
-	// for that long even after a client disconnect.
+	// one unit per group, not 64. The previous per-runner accumulation
+	// produced multi-hour deadlines for `stop all` / `restart all` on
+	// heavily-replicated services, which kept the daemon-side handler
+	// goroutine and socket open for that long even after a client
+	// disconnect.
 	//
 	// Per-verb shape: `reload` with reload_signal configured is a
 	// kill(2) and finishes in microseconds; no stop budget needed.
 	// `reload` with reload_command waits at most reloadCommandTimeout.
-	// Everything else (stop, restart, reload-as-restart, update,
-	// shutdown) needs stop_timeout + grace per filename group.
+	// stop / restart / reload-as-restart / update / shutdown need
+	// stop_timeout + grace per group. start/restart --wait additionally
+	// need boot_timeout + the readiness probe timeout per group.
 	const perTargetGrace = reapGrace + 5*time.Second
+	bootTimeout := s.orch.BootTimeout()
 	budget := minDispatchBudget
 	seenFiles := make(map[string]struct{}, len(targets))
 	for _, r := range targets {
@@ -254,16 +303,24 @@ func (s *ControlServer) dispatchBudget(req *ctlproto.Request) time.Duration {
 			continue
 		}
 		seenFiles[fn] = struct{}{}
-		if req.Verb == "reload" {
-			if cfg.ReloadSignal != "" {
-				continue
-			}
-			if len(cfg.ReloadCommand) > 0 {
+
+		if stopVerb {
+			switch {
+			case req.Verb == "reload" && cfg.ReloadSignal != "":
+				// instant kill(2); no stop budget
+			case req.Verb == "reload" && len(cfg.ReloadCommand) > 0:
 				budget += reloadCommandTimeout
-				continue
+			default:
+				budget += cfg.StopTimeout.Std() + perTargetGrace
 			}
 		}
-		budget += cfg.StopTimeout.Std() + perTargetGrace
+		if waitVerb {
+			readyTimeout := time.Duration(0)
+			if cfg.Ready != nil {
+				readyTimeout = cfg.Ready.Timeout.Std()
+			}
+			budget += bootTimeout + readyTimeout + perTargetGrace
+		}
 	}
 	return budget
 }
@@ -281,7 +338,9 @@ func (s *ControlServer) dispatch(ctx context.Context, req *ctlproto.Request) *ct
 	case "pid":
 		return s.cmdPID(req.Args)
 	case "update":
-		return s.cmdUpdate(ctx)
+		return s.cmdUpdate(ctx, req.Args)
+	case "resolve":
+		return s.cmdResolve(req.Args)
 	case "reload":
 		// Dual-purpose for backwards compatibility: `reload` with no
 		// args remains an alias for `update` (config re-read), the
@@ -289,7 +348,7 @@ func (s *ControlServer) dispatch(ctx context.Context, req *ctlproto.Request) *ct
 		// reload — the supervisord-aligned semantic — dispatching
 		// reload_signal / reload_command / full restart as configured.
 		if len(req.Args) == 0 {
-			return s.cmdUpdate(ctx)
+			return s.cmdUpdate(ctx, nil)
 		}
 		return s.cmdReloadService(ctx, req.Args)
 	case "reread":
@@ -317,15 +376,24 @@ func (s *ControlServer) cmdStatus(args []string) *ctlproto.Response {
 	// the arg list works ("status --verbose all", "status all
 	// --verbose") so operators don't have to remember the position.
 	verbose, args := extractFlag(args, "--verbose")
+	jsonOut, args := extractFlag(args, "--json")
 	targets, err := s.expandTargets(args, true)
 	if err != nil {
-		return errResp(err.Error())
+		return errRespFor(err)
 	}
 	resp := okResp("ok")
 	for _, r := range targets {
-		if verbose {
+		switch {
+		case jsonOut:
+			// One compact JSON object per body line (NDJSON): the wire
+			// is line-based and sanitizeLine would mangle pretty-printed
+			// multi-line JSON. /proc fields ride along only with
+			// --verbose so the plain --json path stays cheap for a
+			// polling consumer.
+			resp.Body = append(resp.Body, formatStatusJSON(r, verbose))
+		case verbose:
 			resp.Body = append(resp.Body, formatStatusLineVerbose(r))
-		} else {
+		default:
 			resp.Body = append(resp.Body, formatStatusLine(r))
 		}
 	}
@@ -351,12 +419,20 @@ func extractFlag(args []string, name string) (bool, []string) {
 }
 
 func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, action string) *ctlproto.Response {
+	// --wait blocks each target until it is RUNNING and its [ready]
+	// probe has passed (or it reaches a terminal/FATAL state). Only
+	// meaningful for actions that bring a service up; reject it on stop
+	// so the operator gets a clear error rather than a silent no-op.
+	wait, args := extractFlag(args, "--wait")
 	if len(args) == 0 {
-		return errResp(fmt.Sprintf("usage: %s NAME [NAME...] | %s all", action, action))
+		return errResp(fmt.Sprintf("usage: %s [--wait] NAME [NAME...] | %s all", action, action))
+	}
+	if wait && action == "stop" {
+		return errResp("--wait is only valid for start and restart")
 	}
 	targets, err := s.expandTargets(args, false)
 	if err != nil {
-		return errResp(err.Error())
+		return errRespFor(err)
 	}
 	resp := okResp("ok")
 	resp.Body = make([]string, 0, len(targets))
@@ -420,6 +496,21 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 						return
 					}
 				}
+				// --wait: block until the just-started service is
+				// actually up (RUNNING + [ready] probe passed) or fails.
+				// A service that crash-loops to FATAL or never passes
+				// readiness reports an operation failure (CodeFailed),
+				// so a provider's `ensure => running` doesn't converge
+				// on a service that isn't really up.
+				if wait {
+					if werr := s.orch.WaitUntilReady(ctx, r); werr != nil {
+						errs[k] = fmt.Errorf("%s: %s-wait: %w", name, action, werr)
+						bodies[k] = fmt.Sprintf("%s: %s but not ready: %v", name, action, werr)
+						return
+					}
+					bodies[k] = fmt.Sprintf("%s: %s, ready", name, action)
+					return
+				}
 				bodies[k] = fmt.Sprintf("%s: %s", name, action)
 			}(k, r)
 		}
@@ -460,7 +551,7 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 func (s *ControlServer) cmdReloadService(ctx context.Context, args []string) *ctlproto.Response {
 	targets, err := s.expandTargets(args, false)
 	if err != nil {
-		return errResp(err.Error())
+		return errRespFor(err)
 	}
 	perTarget, aggErr := s.orch.reloadAcrossGroups(ctx, targets)
 	resp := okResp("ok")
@@ -487,7 +578,7 @@ func (s *ControlServer) cmdPID(args []string) *ctlproto.Response {
 	}
 	rs, err := resolveTarget(s.orch.snapshotRunners(), args[0])
 	if err != nil {
-		return errResp(err.Error())
+		return errRespFor(err)
 	}
 	if len(rs) > 1 {
 		return errResp(fmt.Sprintf("%s has %d replicas; specify which one: pid %s/N", args[0], len(rs), args[0]))
@@ -495,10 +586,13 @@ func (s *ControlServer) cmdPID(args []string) *ctlproto.Response {
 	return okBody("ok", []string{strconv.Itoa(rs[0].PID())})
 }
 
-func (s *ControlServer) cmdUpdate(ctx context.Context) *ctlproto.Response {
+func (s *ControlServer) cmdUpdate(ctx context.Context, names []string) *ctlproto.Response {
 	newCfg, err := config.Load(s.orch.configDir())
 	if err != nil {
 		return errResp("load: " + err.Error())
+	}
+	if len(names) > 0 {
+		return s.cmdUpdateScoped(ctx, newCfg, names)
 	}
 	// Reload returns the diff it actually applied, so the response
 	// shape matches what landed even if another reload races between
@@ -512,6 +606,77 @@ func (s *ControlServer) cmdUpdate(ctx context.Context) *ctlproto.Response {
 		return errResp("reload: " + rerr.Error())
 	}
 	return diffResp(diff, "stopped", "restarted", "started", "no changes")
+}
+
+// cmdUpdateScoped applies only the named services' add/remove/restart
+// actions from the full diff, leaving services whose files changed
+// out-of-band untouched. Global [env] changes are NOT applied here
+// (children can't be re-env'd in place and that would touch every
+// reloadable service); a note tells the operator to run a full
+// `update` for those. See Orchestrator.ReloadScoped.
+func (s *ControlServer) cmdUpdateScoped(ctx context.Context, newCfg *config.Config, names []string) *ctlproto.Response {
+	diff, rerr := s.orch.ReloadScoped(ctx, newCfg, names)
+	if rerr != nil {
+		if errors.Is(rerr, errUnknownService) {
+			return errRespFor(rerr)
+		}
+		return errResp("update: " + rerr.Error())
+	}
+	resp := diffResp(diff, "stopped", "restarted", "started", "no changes")
+	// Surface deferred global changes so the operator isn't surprised
+	// that a [env] edit didn't take effect on this scoped update.
+	if !envMapsEqual(s.orch.GlobalsEnv(), newCfg.Globals.Env) {
+		resp.Body = append(resp.Body,
+			"note: global [env] changed; run 'zpctl update' (no args) to apply it to all services")
+	}
+	return resp
+}
+
+// cmdResolve reports the on-disk source file for a service NAME and
+// whether the loader currently enables it. It scans the config
+// services dir fresh (not just the running runners) so it can resolve
+// services parked with the `.disabled` convention, which a provider
+// needs in order to enable them. Output is one JSON line so it fits
+// the line protocol and matches `status --json`. CodeUnknownService
+// when no file resolves to NAME so the consumer can treat it as absent.
+func (s *ControlServer) cmdResolve(args []string) *ctlproto.Response {
+	if len(args) != 1 {
+		return errResp("usage: resolve NAME")
+	}
+	name := args[0]
+	files, err := config.ScanServiceFiles(s.orch.configDir())
+	if err != nil {
+		return errResp("resolve: " + err.Error())
+	}
+	var matches []config.ServiceFileInfo
+	for _, f := range files {
+		if f.Name == name {
+			matches = append(matches, f)
+		}
+	}
+	if len(matches) == 0 {
+		return &ctlproto.Response{Code: ctlproto.CodeUnknownService, Msg: "unknown service: " + name}
+	}
+	if len(matches) > 1 {
+		// Two files resolve to the same name (e.g. a live foo.toml and a
+		// stale foo.toml.disabled). Ambiguous config the operator must
+		// resolve; list the paths so they can.
+		resp := errResp("ambiguous: " + name + " resolves to multiple files")
+		for _, m := range matches {
+			resp.Body = append(resp.Body, m.Path)
+		}
+		return resp
+	}
+	m := matches[0]
+	b, err := json.Marshal(struct {
+		Name    string `json:"name"`
+		Path    string `json:"path"`
+		Enabled bool   `json:"enabled"`
+	}{Name: m.Name, Path: m.Path, Enabled: m.Enabled})
+	if err != nil {
+		return errResp("resolve: " + err.Error())
+	}
+	return okBody("ok", []string{string(b)})
 }
 
 func (s *ControlServer) cmdReread() *ctlproto.Response {
@@ -597,7 +762,11 @@ func (s *ControlServer) cmdTailFollow(ctx context.Context, conn net.Conn, pc *ct
 	name := args[0]
 	rs, err := resolveTarget(s.orch.snapshotRunners(), name)
 	if err != nil {
-		_ = pc.WriteStatusLine(1, err.Error())
+		code := ctlproto.CodeFailed
+		if errors.Is(err, errUnknownService) {
+			code = ctlproto.CodeUnknownService
+		}
+		_ = pc.WriteStatusLine(code, err.Error())
 		return
 	}
 	if len(rs) > 1 {
@@ -749,7 +918,7 @@ func (s *ControlServer) cmdTail(args []string) *ctlproto.Response {
 	name := args[0]
 	rs, err := resolveTarget(s.orch.snapshotRunners(), name)
 	if err != nil {
-		return errResp(err.Error())
+		return errRespFor(err)
 	}
 	if len(rs) > 1 {
 		return errResp(fmt.Sprintf("%s has %d replicas; specify which one: tail %s/N", name, len(rs), name))
@@ -761,7 +930,7 @@ func (s *ControlServer) cmdTail(args []string) *ctlproto.Response {
 	}
 	body, err := readLastBytes(cfg.Log.Stdout, 8192)
 	if err != nil {
-		return errResp(err.Error())
+		return errRespFor(err)
 	}
 	lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
 	if len(lines) == 1 && lines[0] == "" {
@@ -783,7 +952,7 @@ func (s *ControlServer) cmdSignal(args []string) *ctlproto.Response {
 	}
 	rs, err := resolveTarget(s.orch.snapshotRunners(), args[0])
 	if err != nil {
-		return errResp(err.Error())
+		return errRespFor(err)
 	}
 	sig, ok := config.ParseSignal(args[1])
 	if !ok {
@@ -828,7 +997,7 @@ func (s *ControlServer) cmdSignal(args []string) *ctlproto.Response {
 func (s *ControlServer) cmdReady(args []string) *ctlproto.Response {
 	targets, err := s.expandTargets(args, true)
 	if err != nil {
-		return errResp(err.Error())
+		return errRespFor(err)
 	}
 	resp := okResp("ok")
 	var notReady []string
@@ -868,12 +1037,13 @@ func readyReason(snap Status, hasProbe bool) string {
 
 func (s *ControlServer) cmdHelp() *ctlproto.Response {
 	return okBody("ok", []string{
-		"status [--verbose] [NAME...] list service states (no args = all)",
-		"start NAME[/N]...     start service(s); 'all' for everything",
+		"status [--verbose] [--json] [NAME...] list service states (no args = all)",
+		"start [--wait] NAME[/N]... start service(s); --wait blocks until ready",
 		"stop NAME[/N]...      stop service(s); 'all' for everything",
-		"restart NAME[/N]...   stop then start; 'all' for everything",
+		"restart [--wait] NAME[/N]... stop then start; --wait blocks until ready",
 		"pid [NAME[/N]]        PID of zpinit (no arg) or service replica",
-		"update                reload config and apply (= SIGHUP)",
+		"resolve NAME          print service's source TOML path + enabled state (JSON)",
+		"update [NAME...]      reload config and apply (= SIGHUP); NAME = scoped",
 		"reload                with no args: alias for update",
 		"reload NAME[/N]...    in-place reload (reload_signal/_command or full restart)",
 		"reread                dry-run config diff",
@@ -885,6 +1055,7 @@ func (s *ControlServer) cmdHelp() *ctlproto.Response {
 		"",
 		"NAME refers to a service; for services declared with replicas > 1,",
 		"NAME selects every replica and NAME/N selects replica N (0..replicas-1).",
+		"Exit codes: 0 ok, 1 failed, 2 unreachable, 3 unknown service.",
 	})
 }
 
@@ -945,7 +1116,7 @@ func resolveTarget(snap []*Runner, arg string) ([]*Runner, error) {
 			}
 		}
 		if total == 0 {
-			return nil, fmt.Errorf("unknown service: %s", name)
+			return nil, fmt.Errorf("%w: %s", errUnknownService, name)
 		}
 		return nil, fmt.Errorf("replica %d out of range for %s (has %d replica(s), valid 0..%d)", idx, name, total, total-1)
 	}
@@ -956,9 +1127,89 @@ func resolveTarget(snap []*Runner, arg string) ([]*Runner, error) {
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("unknown service: %s", arg)
+		return nil, fmt.Errorf("%w: %s", errUnknownService, arg)
 	}
 	return out, nil
+}
+
+// statusJSON is the machine-readable shape emitted by `zpctl status
+// --json`, one object per target (each replica is its own object).
+// Pointer fields render as JSON null when not applicable so a consumer
+// can branch on presence rather than sentinel values.
+type statusJSON struct {
+	Name          string        `json:"name"`           // display name, includes /N for replicas
+	Service       string        `json:"service"`        // logical service name (no /N)
+	ReplicaIndex  *int          `json:"replica_index"`  // null when the service is not replicated
+	State         string        `json:"state"`          // supervisord state string
+	PID           *int          `json:"pid"`            // null when no live process
+	UptimeSeconds *int64        `json:"uptime_seconds"` // null unless currently RUNNING
+	TotalSpawns   int           `json:"total_spawns"`
+	LastExit      *lastExitJSON `json:"last_exit"` // null until the service has exited at least once
+	// /proc-derived fields, present only with --verbose and a live PID.
+	RSSBytes   *uint64  `json:"rss_bytes,omitempty"`
+	CPUSeconds *float64 `json:"cpu_seconds,omitempty"`
+	FDs        *int     `json:"fds,omitempty"`
+}
+
+// lastExitJSON carries exactly one of code/signal (whichever the last
+// reaped exit produced); the unused field is omitted.
+type lastExitJSON struct {
+	Code   *int    `json:"code,omitempty"`
+	Signal *string `json:"signal,omitempty"`
+}
+
+// formatStatusJSON renders one runner as a compact single-line JSON
+// object. Mirrors the data formatStatusLine/Verbose surface, but in a
+// stable machine-readable shape. Marshal of these plain types cannot
+// fail; on the impossible error we emit a minimal object so the line
+// is still valid JSON.
+func formatStatusJSON(r *Runner, verbose bool) string {
+	snap := r.Snapshot()
+	cfg := r.Cfg()
+
+	out := statusJSON{
+		Name:        r.DisplayName(),
+		Service:     cfg.Name,
+		State:       mapToSupervisordState(snap.State, snap.Manual),
+		TotalSpawns: snap.TotalSpawns,
+	}
+	if cfg.Replicas.N > 1 || cfg.Replicas.Auto {
+		idx := r.ReplicaIndex()
+		out.ReplicaIndex = &idx
+	}
+	if snap.PID > 0 {
+		pid := snap.PID
+		out.PID = &pid
+	}
+	if snap.State == StateRunning && !snap.UpSince.IsZero() {
+		up := int64(time.Since(snap.UpSince).Seconds())
+		out.UptimeSeconds = &up
+	}
+	if le := snap.LastExit; le.PID != 0 {
+		out.LastExit = &lastExitJSON{}
+		if le.Signaled {
+			sig := le.Signal.String()
+			out.LastExit.Signal = &sig
+		} else {
+			code := le.ExitCode
+			out.LastExit.Code = &code
+		}
+	}
+	if verbose && snap.PID > 0 {
+		ps := readProcStats(snap.PID)
+		rss := ps.RSSBytes
+		cpu := ps.CPUSeconds
+		fds := ps.FDCount
+		out.RSSBytes = &rss
+		out.CPUSeconds = &cpu
+		out.FDs = &fds
+	}
+
+	b, err := json.Marshal(out)
+	if err != nil {
+		return fmt.Sprintf(`{"name":%q,"state":%q}`, out.Name, out.State)
+	}
+	return string(b)
 }
 
 func formatStatusLine(r *Runner) string {

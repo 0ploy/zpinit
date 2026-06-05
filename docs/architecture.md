@@ -171,6 +171,30 @@ with `nc` or `socat`.
 State names match supervisorctl exactly (`RUNNING`, `STOPPED`,
 `BACKOFF`, `FATAL`, ...) so existing muscle memory transfers.
 
+The response status-line `code` maps 1:1 to `zpctl`'s process exit
+status, and the taxonomy is stable for machine consumers: `0` success,
+`1` operation failed, `2` daemon unreachable (set by `zpctl` itself on
+a connect or mid-request IO error; the daemon never returns it), `3`
+unknown service. The daemon wraps "no such service" resolution errors
+so handlers map them to `3` (`errRespFor`); a consumer treats that as
+"stopped/absent" rather than a hard failure.
+
+Machine-readable output rides the same line protocol: `status --json`
+emits one compact JSON object per body line (NDJSON), never
+pretty-printed multi-line JSON, because every body line is run through
+`sanitizeLine`. `resolve` returns a single JSON line the same way.
+
+`start --wait` / `restart --wait` are non-streaming but can run for a
+service's `boot_timeout` plus its `[ready].timeout`; the handler's
+dispatch budget is extended to cover that and the client skips its
+fixed 30s read deadline for them (as it does for streaming verbs).
+`update NAME...` applies only the named services' add/remove/restart
+from the full diff and never commits a global `[env]` change (that
+would restart every reloadable service); a later argument-less
+`update` still applies the deferred global change. It shares Reload's
+apply path (`applyReloadDiff`); only the diff is filtered and the
+committed config keeps the running globals.
+
 A small protocol extension supports **streaming** responses for
 `tail --follow`: the server writes the status line and terminator
 the same way, but emits body lines as new bytes arrive on the

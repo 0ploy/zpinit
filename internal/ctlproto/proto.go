@@ -26,6 +26,23 @@ import (
 
 const Terminator = "."
 
+// Response/exit codes. The daemon sets Code on the wire; zpctl maps it
+// 1:1 to its process exit status (os.Exit). The taxonomy is stable so
+// machine consumers (e.g. a Puppet service provider) can branch on it:
+//
+//	CodeOK          success
+//	CodeFailed      operation failed (raise)
+//	CodeUnreachable daemon unreachable: connect or mid-request IO error.
+//	                Set by zpctl locally; the daemon never returns it.
+//	CodeUnknownService  named service does not exist. A consumer can treat
+//	                this as "stopped/absent" rather than a hard failure.
+const (
+	CodeOK             = 0
+	CodeFailed         = 1
+	CodeUnreachable    = 2
+	CodeUnknownService = 3
+)
+
 // MaxLineLen caps the size of any single line read from the wire.
 // Without this, a misbehaving (or malicious) local client could keep
 // sending bytes with no newline and grow our bufio buffer until OOM.

@@ -41,6 +41,13 @@ filesystem permissions to allow a non-root operator UID, you must keep
 the peer-cred check, not widen it. Non-root services in the same
 container cannot use `zpctl`.
 
+The client resolves the socket path from `--socket PATH`, then the
+`ZPINIT_SOCKET` environment variable, then `/run/zpinit.sock`. This only
+changes which socket `zpctl` dials; it does not relax either access
+gate. The daemon binds the path from `control_socket` in
+`zpinit.toml`, so a non-default socket must be configured on both
+ends.
+
 ## Log file handling
 
 Service log destinations (`log.stdout`, `log.stderr`), `zpctl tail`

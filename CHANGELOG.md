@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **`zpctl status --json` for machine consumers.** Emits one compact
+  JSON object per line (NDJSON), one per replica, with `name`,
+  `service`, `replica_index`, `state`, `pid`, `uptime_seconds`,
+  `total_spawns`, and `last_exit`. Add `--verbose` to include the
+  `/proc` fields (`rss_bytes`, `cpu_seconds`, `fds`) for live
+  processes. Tools no longer have to parse the fixed-width human
+  columns; plain `--json` stays lock-only and cheap to poll.
+
+- **`zpctl start --wait` / `restart --wait` block until ready.** The
+  command returns only once the service is `RUNNING` with its
+  `[ready]` probe passed, or it reaches a terminal/FATAL state (which
+  exits non-zero). A service that crash-loops to FATAL no longer
+  reports success, so a deploy or provisioning step doesn't mistake
+  "spawned" for "converged". Bounded by `boot_timeout` and the
+  probe's `timeout`.
+
+- **`zpctl resolve NAME` locates a service's source file.** Prints the
+  absolute TOML path and whether the service is currently enabled, as
+  one JSON line. It scans the services dir fresh so it also resolves
+  files parked with the `.disabled` convention, which the running
+  config doesn't know about. Lets external tooling find the file
+  without reimplementing name resolution.
+
+- **`zpctl update NAME [NAME...]` scopes a reload to named services.**
+  Applies only those services' add/remove/restart actions, so toggling
+  one service can't incidentally start or stop unrelated services
+  whose files changed out of band. Global `[env]` changes are deferred
+  (they would restart every reloadable service); run `zpctl update`
+  with no arguments to apply them.
+
+- **`ZPINIT_SOCKET` selects the control socket for `zpctl`.**
+  Precedence is `--socket PATH`, then `ZPINIT_SOCKET`, then
+  `/run/zpinit.sock`. A tool that shells out to `zpctl` repeatedly can
+  set it once instead of threading `--socket` through every call.
+
+### Changes
+
+- **Stable `zpctl` exit codes.** `0` success, `1` operation failed,
+  `2` daemon unreachable, `3` unknown service. Unknown-service errors
+  now return `3` (previously `1`), so a machine consumer can treat a
+  missing service as stopped/absent rather than a hard failure. The
+  other codes are unchanged.
+
 ## v0.4.0
 
 ### Features

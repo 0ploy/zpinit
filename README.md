@@ -274,18 +274,56 @@ commands; non-root services in the same container cannot). State names
 match supervisorctl exactly.
 
 ```sh
-zpctl status [--verbose] [NAME[/N]...] # list states; --verbose adds rss/cpu/fds/spawns
-zpctl start | stop | restart NAME[/N] | all
+zpctl status [--verbose] [--json] [NAME[/N]...] # states; --verbose adds rss/cpu/fds/spawns; --json = NDJSON
+zpctl start [--wait] NAME[/N] | all  # --wait blocks until RUNNING and [ready] passed
+zpctl stop NAME[/N] | all
+zpctl restart [--wait] NAME[/N] | all
 zpctl reload NAME[/N] | all   # in-place: reload_signal/_command or stop+start
 zpctl signal NAME[/N] HUP     # arbitrary signal (lower-level than reload)
 zpctl pid [NAME[/N]]          # zpinit's PID, or a service replica's
 zpctl ready [NAME[/N]...]     # exit 0 iff selected services are Running and [ready] passed
+zpctl resolve NAME            # source TOML path + enabled state, as JSON
 zpctl tail [--follow|-f] NAME[/N] # last 8KB; --follow streams new lines (Ctrl-C to stop)
-zpctl update                  # apply config changes (= SIGHUP)
+zpctl update [NAME...]        # apply config changes (= SIGHUP); NAME = scoped to those services
 zpctl reread                  # dry-run config diff
 zpctl shutdown
 zpctl help
 ```
+
+The socket is resolved from `--socket PATH`, else the `ZPINIT_SOCKET`
+environment variable, else `/run/zpinit.sock`. Set `ZPINIT_SOCKET` once
+(e.g. for a config-management tool that shells out to `zpctl`
+repeatedly) instead of passing `--socket` on every call.
+
+`zpctl` exit codes are stable so a machine consumer can branch on them:
+`0` success, `1` operation failed, `2` daemon unreachable (the socket
+isn't there or the connection broke), `3` unknown service (a consumer
+can treat this as "stopped/absent" rather than a hard error).
+
+`zpctl status --json` emits one compact JSON object per line (NDJSON,
+one per replica): `name`, `service`, `replica_index`, `state`, `pid`,
+`uptime_seconds`, `total_spawns`, and `last_exit`. Add `--verbose` to
+include the `/proc`-derived `rss_bytes`, `cpu_seconds`, and `fds` for
+live processes. Plain `--json` stays lock-only and cheap to poll.
+
+`zpctl start --wait` (and `restart --wait`) block until the service is
+actually up: `RUNNING` with its `[ready]` probe passed, bounded by
+`boot_timeout` and the probe's `timeout`. A service that crash-loops to
+`FATAL` or never passes readiness returns a non-zero exit, so a deploy
+or provisioning step doesn't mistake "spawned" for "converged".
+
+`zpctl resolve NAME` prints the source file for a service even when it
+is parked with the `.disabled` convention (the running config only
+knows enabled services), so a provisioning tool can locate the TOML
+without reimplementing zpinit's name resolution. Output is one JSON
+line: `{"name","path","enabled"}`.
+
+`zpctl update NAME [NAME...]` applies only the named services'
+add/remove/restart actions instead of the whole-directory diff, so
+toggling one service can't incidentally start or stop unrelated
+services whose files changed out of band. Global `[env]` changes are
+deferred (they would restart every reloadable service); run `zpctl
+update` with no arguments to apply those.
 
 `zpctl ready` is the scheduler-friendly "is this container's stack
 up?" check: 0 if every service is `RUNNING` and its `[ready]` probe

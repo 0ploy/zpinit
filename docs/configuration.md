@@ -42,6 +42,13 @@ zpctl update        # applies (or send SIGHUP)
 `zpctl reread` doesn't complain about either form, so dev-loop edits
 under `services/` are safe.
 
+`zpctl resolve NAME` reports the source file a name resolves to and
+whether it is currently enabled, scanning `services/` fresh so it sees
+`.disabled` files too (the running config only knows enabled
+services). A provisioning tool uses it to locate a service's TOML
+without reimplementing the prefix-stripping / `name=` override / skip
+rules above.
+
 ## `zpinit.toml` (globals)
 
 Every key is optional. Defaults shown.
@@ -90,6 +97,14 @@ control_socket = "/run/zpinit.sock"
 APP_ENV   = "production"
 LOG_LEVEL = "info"
 ```
+
+`control_socket` sets where the daemon binds. On the client side,
+`zpctl` resolves the socket from `--socket PATH`, then the
+`ZPINIT_SOCKET` environment variable, then the `/run/zpinit.sock`
+default. Point a config-management tool that shells out to `zpctl` at a
+non-default socket by exporting `ZPINIT_SOCKET` once rather than
+threading `--socket` through every call. (This is a public client-side
+override, unlike the internal `ZPINIT_ENV_FILE` test hook.)
 
 ### Globals env
 

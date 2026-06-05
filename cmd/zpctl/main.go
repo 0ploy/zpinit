@@ -20,13 +20,25 @@ func main() {
 		socket      string
 	)
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
-	flag.StringVar(&socket, "socket", defaultSocket, "control socket `path`")
+	flag.StringVar(&socket, "socket", "", "control socket `path` (default $ZPINIT_SOCKET or "+defaultSocket+")")
 	flag.Usage = usage
 	flag.Parse()
 
 	if showVersion {
 		fmt.Println(version)
 		return
+	}
+
+	// Socket resolution precedence: explicit --socket flag, then the
+	// ZPINIT_SOCKET environment variable, then the compiled-in default.
+	// Lets a caller (e.g. a Puppet provider shelling out repeatedly)
+	// point every invocation at a non-default socket via the
+	// environment instead of threading --socket through each call.
+	if socket == "" {
+		socket = os.Getenv("ZPINIT_SOCKET")
+	}
+	if socket == "" {
+		socket = defaultSocket
 	}
 	args := flag.Args()
 	if len(args) == 0 {
@@ -48,19 +60,25 @@ func main() {
 	conn, err := net.DialTimeout("unix", socket, 5*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "zpctl: connect %s: %v\n", socket, err)
-		os.Exit(2)
+		os.Exit(ctlproto.CodeUnreachable)
 	}
 	defer conn.Close()
 
 	streaming := isStreamingCmd(args)
-	if !streaming {
+	// `start --wait` / `restart --wait` block server-side for up to a
+	// service's boot_timeout + [ready].timeout, which can exceed the
+	// 30s default. The daemon bounds its own handler and always writes
+	// a response, so we just skip the fixed client deadline for these
+	// (as we do for streaming) and trust the server-side budget.
+	longRunning := !streaming && isWaitCmd(args)
+	if !streaming && !longRunning {
 		_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	}
 
 	pc := ctlproto.NewConn(conn)
 	if err := pc.WriteRequest(&ctlproto.Request{Verb: args[0], Args: args[1:]}); err != nil {
 		fmt.Fprintf(os.Stderr, "zpctl: send: %v\n", err)
-		os.Exit(2)
+		os.Exit(ctlproto.CodeUnreachable)
 	}
 
 	if streaming {
@@ -70,7 +88,7 @@ func main() {
 	resp, err := pc.ReadResponse()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "zpctl: read response: %v\n", err)
-		os.Exit(2)
+		os.Exit(ctlproto.CodeUnreachable)
 	}
 	for _, line := range resp.Body {
 		fmt.Println(line)
@@ -101,6 +119,22 @@ func isStreamingCmd(args []string) bool {
 	return false
 }
 
+// isWaitCmd reports whether the verb+args is a `start --wait` or
+// `restart --wait`, which can block server-side past the 30s default
+// client deadline. Mirrors the daemon's flag handling (position-
+// independent --wait).
+func isWaitCmd(args []string) bool {
+	if args[0] != "start" && args[0] != "restart" {
+		return false
+	}
+	for _, a := range args[1:] {
+		if a == "--wait" {
+			return true
+		}
+	}
+	return false
+}
+
 // runStreamingClient drives the read side of a streaming response:
 // status line first, then body lines printed as they arrive until
 // the server writes the terminator or the connection closes.
@@ -111,7 +145,7 @@ func runStreamingClient(conn net.Conn, pc *ctlproto.Conn) {
 	code, msg, err := pc.ReadStatusLine()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "zpctl: read status: %v\n", err)
-		os.Exit(2)
+		os.Exit(ctlproto.CodeUnreachable)
 	}
 	if code != 0 {
 		fmt.Fprintf(os.Stderr, "zpctl: %s\n", msg)
@@ -135,7 +169,7 @@ func runStreamingClient(conn net.Conn, pc *ctlproto.Conn) {
 			// io.EOF without a terminator (server closed mid-stream)
 			// is reported as an unclean shutdown so CI loops notice.
 			fmt.Fprintf(os.Stderr, "zpctl: stream ended: %v\n", rerr)
-			os.Exit(2)
+			os.Exit(ctlproto.CodeUnreachable)
 		}
 		if done {
 			return
@@ -150,16 +184,21 @@ func usage() {
 Commands match supervisorctl naming where possible.
 
 Common commands:
-  status [--verbose] [NAME...]
-                          list service states; --verbose adds RSS/CPU/fd/spawns
-  start NAME[/N] | all    start service(s)
+  status [--verbose] [--json] [NAME...]
+                          list service states; --verbose adds RSS/CPU/fd/spawns;
+                          --json emits one JSON object per line (NDJSON)
+  start [--wait] NAME[/N] | all
+                          start service(s); --wait blocks until RUNNING + ready
   stop NAME[/N] | all     stop service(s)
-  restart NAME[/N] | all  stop then start
+  restart [--wait] NAME[/N] | all
+                          stop then start; --wait blocks until RUNNING + ready
   pid [NAME[/N]]          PID of zpinit or a service replica
   ready [NAME[/N]...]     exit 0 iff selected services are Running and [ready] passed
+  resolve NAME            print the service's source TOML path + enabled state (JSON)
   tail [--follow|-f] NAME[/N]
                           dump file-logged stdout (last 8KB); --follow streams new lines
-  update                  apply config changes (= SIGHUP)
+  update [NAME...]        apply config changes (= SIGHUP); with NAME(s), apply only
+                          those services' add/remove/restart (global [env] deferred)
   reload [NAME[/N]...]    in-place reload (reload_signal/_command or full restart);
                           no args is equivalent to update
   reread                  dry-run config diff
@@ -169,5 +208,10 @@ Common commands:
 NAME refers to a service; for services with replicas > 1, NAME selects
 every replica and NAME/N selects replica N (0..replicas-1).
 
-`)
+Socket resolution: --socket PATH, else $ZPINIT_SOCKET, else %s.
+
+Exit codes: 0 ok, 1 operation failed, 2 daemon unreachable,
+3 unknown service.
+
+`, defaultSocket)
 }

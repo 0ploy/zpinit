@@ -176,6 +176,80 @@ func loadServices(dir string, cfg *Config) error {
 	return nil
 }
 
+// ServiceFileInfo describes one service file found on disk, with its
+// resolved service name and whether the loader currently enables it.
+// Used by `zpctl resolve` so a machine consumer can locate the source
+// TOML without reimplementing zpinit's name resolution.
+type ServiceFileInfo struct {
+	Name    string // resolved service name (name= override, else prefix-stripped filename)
+	Path    string // absolute path to the file on disk
+	Enabled bool   // false for the `.disabled` convention; true otherwise
+}
+
+// ScanServiceFiles lists every service file under root/services,
+// including the `.disabled` ones the loader skips, with the service
+// name each resolves to. Unlike Load it does not validate or apply
+// defaults: it answers "what file does this name come from, and is it
+// active?" for `zpctl resolve`. Dotfiles (editor swap/autosave) and
+// non-.toml files are skipped, matching loadServices. A missing
+// services dir is not an error (returns an empty slice).
+func ScanServiceFiles(root string) ([]ServiceFileInfo, error) {
+	dir := filepath.Join(root, servicesDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", dir, err)
+	}
+	var out []ServiceFileInfo
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		// A `.disabled` file resolves by stripping the suffix and
+		// deriving from the underlying .toml name, so `resolve` can
+		// still locate a parked service.
+		enabled := true
+		tomlName := name
+		if strings.HasSuffix(name, ".disabled") {
+			enabled = false
+			tomlName = strings.TrimSuffix(name, ".disabled")
+		}
+		if !strings.HasSuffix(tomlName, ".toml") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			abs = path
+		}
+		out = append(out, ServiceFileInfo{
+			Name:    serviceNameForFile(path, tomlName),
+			Path:    abs,
+			Enabled: enabled,
+		})
+	}
+	return out, nil
+}
+
+// serviceNameForFile resolves a service file's name the same way
+// loadServices does: an explicit name= in the TOML wins, otherwise the
+// prefix-stripped filename. Decode is best-effort: a file mid-edit that
+// fails to parse falls back to the filename-derived name so `resolve`
+// still returns something useful.
+func serviceNameForFile(path, tomlFilename string) string {
+	var svc Service
+	if _, err := toml.DecodeFile(path, &svc); err == nil && svc.Name != "" {
+		return svc.Name
+	}
+	return nameFromFilename(tomlFilename)
+}
+
 // nameFromFilename strips a leading numeric prefix (with optional - or _
 // separator) and the .toml suffix.
 //

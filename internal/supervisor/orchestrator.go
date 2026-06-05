@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -313,6 +314,44 @@ func (o *Orchestrator) bootOne(ctx context.Context, r *Runner) error {
 	return nil
 }
 
+// WaitUntilReady blocks until r is RUNNING and its [ready] probe has
+// passed, or it reaches a terminal/FATAL state, or ctx expires. It is
+// the wait half of `zpctl start --wait` / `restart --wait`: the caller
+// has already issued StartCtx, and this mirrors bootOne's
+// WaitBootResult → waitReady → MarkReady sequence so a manual start
+// gets the same readiness semantics boot does (the [ready] probe is
+// otherwise boot-time only). Reaching Running is bounded by the global
+// boot_timeout; the probe is bounded by its own [ready].timeout.
+// on_timeout=continue counts as ready, matching bootOne.
+func (o *Orchestrator) WaitUntilReady(ctx context.Context, r *Runner) error {
+	o.mu.RLock()
+	bootTimeout := o.cfg.Globals.BootTimeout.Std()
+	o.mu.RUnlock()
+
+	bctx, bcancel := context.WithTimeout(ctx, bootTimeout)
+	err := r.WaitBootResult(bctx)
+	bcancel()
+	if err != nil {
+		return err
+	}
+
+	cfg := r.Cfg()
+	if cfg.Ready == nil {
+		r.MarkReady()
+		return nil
+	}
+	env := service.MergeEnv(r.BaseEnv(), cfg.Env)
+	if err := waitReady(ctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
+		if cfg.Ready.OnTimeout == config.ReadyContinue {
+			r.MarkReady()
+			return nil
+		}
+		return fmt.Errorf("readiness: %w", err)
+	}
+	r.MarkReady()
+	return nil
+}
+
 // installExitCodeWatcher (re)installs the watcher goroutine for the
 // currently-configured exit_code_from service. Idempotent: any
 // previously-running watcher is canceled first. Caller must NOT hold
@@ -540,24 +579,194 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) (reloa
 	// a phantom restart.
 	newCfg.Services = ResolveAutoReplicasAtBoot(newCfg.Services, snap)
 
-	o.mu.RLock()
-	diff := o.computeDiffLocked(newCfg)
-	builder := o.baseEnvBuilder
-	o.mu.RUnlock()
 	// Recompute baseEnv from the new globals.Env if main.go installed
 	// a builder. Without one, fall back to the existing baseEnv (tests
 	// that don't care about env propagation rely on this). The current
 	// resource env is captured under the same lock so a watcher-driven
 	// update concurrent with reload doesn't race with the rebuild.
 	o.mu.RLock()
+	diff := o.computeDiffLocked(newCfg)
+	builder := o.baseEnvBuilder
 	resourceEnv := o.resourceEnv
-	o.mu.RUnlock()
 	newBaseEnv := o.baseEnv
+	o.mu.RUnlock()
 	if builder != nil {
 		newBaseEnv = builder(newCfg.Globals.Env, resourceEnv)
 	}
 	o.log.Info("reload", "add", len(diff.add), "remove", len(diff.remove), "restart", len(diff.restart))
 
+	err := o.applyReloadDiff(ctx, diff, newCfg, newBaseEnv)
+	return diff, err
+}
+
+// ReloadScoped applies only the add/remove/restart actions for the
+// named services, leaving every other service untouched even if its
+// file changed on disk. It is the engine behind `zpctl update NAME`.
+//
+// Two invariants distinguish it from Reload:
+//
+//  1. Global [env] changes are NOT applied. Propagating a globals.env
+//     change restarts every reloadable service (children can't be
+//     re-env'd in place), which is exactly the blast radius a scoped
+//     update exists to avoid. We compute the diff against a probe
+//     config whose env equals the running env so computeDiffLocked's
+//     globals-propagation block is a no-op, then commit a config that
+//     keeps the running Globals and swaps in only the named services'
+//     specs. A later full `zpctl update` still sees and applies the
+//     deferred globals change.
+//  2. Only the named filenames' actions are applied; the rest of the
+//     full diff is discarded. Committing the running specs for every
+//     other file (rather than the disk specs) means a subsequent full
+//     update still diffs unrelated out-of-band edits normally and does
+//     not re-restart the services this call already updated.
+//
+// Returns the filtered diff that was applied. An unknown NAME yields an
+// errUnknownService-wrapped error and applies nothing.
+func (o *Orchestrator) ReloadScoped(ctx context.Context, newCfg *config.Config, names []string) (reloadDiff, error) {
+	o.reloadMu.Lock()
+	defer o.reloadMu.Unlock()
+
+	o.mu.RLock()
+	snap := o.currentSnapshot
+	o.mu.RUnlock()
+	newCfg.Services = ResolveAutoReplicasAtBoot(newCfg.Services, snap)
+
+	// Build name -> filename from both the running set and the disk
+	// config so an operator can name a service being added (disk only),
+	// removed (running only), or changed (both).
+	o.mu.RLock()
+	curCfg := o.cfg
+	curBaseEnv := o.baseEnv
+	runFiles := map[string]string{}
+	seenFile := map[string]bool{}
+	for _, r := range o.runners {
+		sp := r.Spec()
+		if !seenFile[sp.Filename] {
+			seenFile[sp.Filename] = true
+			runFiles[sp.Name] = sp.Filename
+		}
+	}
+	o.mu.RUnlock()
+
+	diskFiles := map[string]string{}
+	for _, s := range newCfg.Services {
+		diskFiles[s.Name] = s.Filename
+	}
+
+	wantFiles := map[string]struct{}{}
+	var unknown []string
+	for _, n := range names {
+		if strings.Contains(n, "/") {
+			return reloadDiff{}, fmt.Errorf("update operates on whole services; drop the /N from %q", n)
+		}
+		if fn, ok := diskFiles[n]; ok {
+			wantFiles[fn] = struct{}{}
+			continue
+		}
+		if fn, ok := runFiles[n]; ok {
+			wantFiles[fn] = struct{}{}
+			continue
+		}
+		unknown = append(unknown, n)
+	}
+	if len(unknown) > 0 {
+		return reloadDiff{}, fmt.Errorf("%w: %s", errUnknownService, strings.Join(unknown, ", "))
+	}
+
+	// Probe config with env forced equal to the running env, so the
+	// diff carries spec-level changes only (no globals propagation).
+	probe := *newCfg
+	probe.Globals = curCfg.Globals
+	probe.Globals.Env = curCfg.Globals.Env
+	probe.Services = newCfg.Services
+
+	o.mu.RLock()
+	full := o.computeDiffLocked(&probe)
+	o.mu.RUnlock()
+
+	// Keep only the named filenames' actions.
+	var diff reloadDiff
+	for _, r := range full.remove {
+		if _, ok := wantFiles[r.Cfg().Filename]; ok {
+			diff.remove = append(diff.remove, r)
+		}
+	}
+	for _, p := range full.restart {
+		if _, ok := wantFiles[p.new.Filename]; ok {
+			diff.restart = append(diff.restart, p)
+		}
+	}
+	for _, s := range full.add {
+		if _, ok := wantFiles[s.Filename]; ok {
+			diff.add = append(diff.add, s)
+		}
+	}
+
+	// Commit config: running services with only the named files'
+	// specs swapped in / removed; Globals untouched so the deferred
+	// env change still shows up on the next full update.
+	svcByFile := map[string]config.Service{}
+	for _, s := range curCfg.Services {
+		svcByFile[s.Filename] = s
+	}
+	for _, r := range diff.remove {
+		delete(svcByFile, r.Cfg().Filename)
+	}
+	for _, p := range diff.restart {
+		svcByFile[p.new.Filename] = p.new
+	}
+	for _, s := range diff.add {
+		svcByFile[s.Filename] = s
+	}
+	mergedServices := make([]config.Service, 0, len(svcByFile))
+	for _, s := range svcByFile {
+		mergedServices = append(mergedServices, s)
+	}
+	sort.Slice(mergedServices, func(i, j int) bool {
+		return mergedServices[i].Filename < mergedServices[j].Filename
+	})
+	merged := *curCfg
+	merged.Services = mergedServices
+
+	o.log.Info("update (scoped)", "names", names,
+		"add", len(diff.add), "remove", len(diff.remove), "restart", len(diff.restart))
+
+	// baseEnv unchanged: globals env is not applied on a scoped update.
+	err := o.applyReloadDiff(ctx, diff, &merged, curBaseEnv)
+	return diff, err
+}
+
+// BootTimeout returns the configured global boot timeout. The control
+// server uses it to size the dispatch budget for `start --wait` /
+// `restart --wait`, which legitimately run until a service reaches
+// RUNNING (bounded by this) plus its readiness probe timeout.
+func (o *Orchestrator) BootTimeout() time.Duration {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.cfg.Globals.BootTimeout.Std()
+}
+
+// GlobalsEnv returns a copy-free reference to the running globals [env]
+// map. Used by the control server to tell whether a scoped update left
+// a globals change deferred. Read under the orchestrator lock; callers
+// must not mutate the returned map.
+func (o *Orchestrator) GlobalsEnv() map[string]string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.cfg.Globals.Env
+}
+
+// applyReloadDiff carries out a computed reload diff: stop removals and
+// restart-olds in filename groups, expand (re)added specs into runners,
+// commit the new runner set + config + baseEnv under one critical
+// section, then boot the adds in a detached serial goroutine and rebind
+// the exit_code_from watcher. Shared by the whole-dir Reload and the
+// scoped ReloadScoped; the caller holds o.reloadMu and supplies the
+// config to commit (commitCfg) and the baseEnv freshly-spawned children
+// should use. Returns the joined per-action errors (nil on full
+// success); failed removals stay registered for the next reload to
+// retry.
+func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, commitCfg *config.Config, newBaseEnv []string) error {
 	var errs []error
 	// diff.remove is built in filename-sorted order and packs every
 	// replica of a filename consecutively (see computeDiffLocked).
@@ -629,7 +838,7 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) (reloa
 		o.runners = append(o.runners, j.runner)
 	}
 	sortRunners(o.runners)
-	o.cfg = newCfg
+	o.cfg = commitCfg
 	o.baseEnv = newBaseEnv
 	bootRoot := o.runnerCtx
 	o.mu.Unlock()
@@ -646,7 +855,7 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) (reloa
 		// Tying boots to o.runnerCtx ties their lifetime to the
 		// supervisor itself.
 		bootJobs := append([]reloadBootJob(nil), jobs...)
-		globals := newCfg.Globals
+		globals := commitCfg.Globals
 		go o.runReloadBoots(bootRoot, bootJobs, globals)
 	}
 
@@ -654,9 +863,9 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) (reloa
 	// been added in this reload, or the target name may have changed.
 	o.installExitCodeWatcher()
 	if len(errs) > 0 {
-		return diff, errors.Join(errs...)
+		return errors.Join(errs...)
 	}
-	return diff, nil
+	return nil
 }
 
 // reloadBootJob carries the pre-built runner and its config through
