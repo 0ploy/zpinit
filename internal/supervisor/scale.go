@@ -52,27 +52,23 @@ func (o *Orchestrator) scaleAutoServices(ctx context.Context, snap resources.Sna
 		})
 	}
 	baseEnv := o.baseEnv
-	bootRoot := o.runnerCtx
 	o.mu.Unlock()
-	if bootRoot == nil {
-		bootRoot = context.Background()
-	}
 
 	for _, a := range actions {
 		if a.target > len(a.running) {
-			o.scaleUp(bootRoot, a.spec, len(a.running), a.target, baseEnv)
+			o.scaleUp(a.spec, len(a.running), a.target, baseEnv)
 		} else {
 			o.scaleDown(ctx, a.running, a.target)
 		}
 	}
 }
 
-// scaleUp spawns the new replicas for indices [from, to). Boot is
-// detached and serialized on reloadBootMu so back-to-back resource
-// commits don't interleave their boots. The new runners are
-// registered synchronously so a subsequent scaleAutoServices call
-// sees the correct count.
-func (o *Orchestrator) scaleUp(bootRoot context.Context, spec config.Service, from, to int, baseEnv []string) {
+// scaleUp spawns the new replicas for indices [from, to). Registration
+// and the detached, reloadBootMu-serialized boot are handled by
+// registerAndBoot (shared with reload); commitCfg is nil because
+// autoscale only adds replicas to the already-committed config (the
+// new Replicas.N was written by scaleAutoServices).
+func (o *Orchestrator) scaleUp(spec config.Service, from, to int, baseEnv []string) {
 	if to <= from {
 		return
 	}
@@ -90,19 +86,7 @@ func (o *Orchestrator) scaleUp(bootRoot context.Context, spec config.Service, fr
 		r := NewRunnerForReplica(perReplica, spec, env, i, o.spawner, o.clock, o.log)
 		jobs = append(jobs, reloadBootJob{cfg: r.Cfg(), runner: r})
 	}
-
-	o.mu.Lock()
-	for _, j := range jobs {
-		o.runners = append(o.runners, j.runner)
-	}
-	sortRunners(o.runners)
-	globals := o.cfg.Globals
-	o.mu.Unlock()
-
-	for _, j := range jobs {
-		o.spawnRunnerGoroutine(j.runner)
-	}
-	go o.runReloadBoots(bootRoot, jobs, globals)
+	o.registerAndBoot(jobs, nil, nil)
 }
 
 // scaleDown stops the runners whose replicaIndex is >= target and

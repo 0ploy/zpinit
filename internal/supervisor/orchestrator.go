@@ -825,39 +825,11 @@ func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, com
 		}
 	}
 
-	// Register runners + commit cfg + baseEnv + sort under one critical
-	// section so external readers see a consistent set. Capture
-	// runnerCtx under the same lock so the detached boot goroutine
-	// gets a properly-published value (Run is the sole writer; the
-	// pairing makes the read race-detector-clean and refactor-safe).
-	// Spawning the per-runner goroutines happens after the unlock —
-	// spawnRunnerGoroutine takes no orchestrator locks but does pull
-	// o.runnerCtx via setRunCancel.
-	o.mu.Lock()
-	for _, j := range jobs {
-		o.runners = append(o.runners, j.runner)
-	}
-	sortRunners(o.runners)
-	o.cfg = commitCfg
-	o.baseEnv = newBaseEnv
-	bootRoot := o.runnerCtx
-	o.mu.Unlock()
-
-	for _, j := range jobs {
-		o.spawnRunnerGoroutine(j.runner)
-	}
-
-	if len(jobs) > 0 {
-		// Detached: caller-ctx is intentionally NOT honored here.
-		// SIGHUP-driven reloads come from main.go which never cancels
-		// its ctx (the timeout-bound context.WithDeadline used by the
-		// control server is also too tight for a multi-service boot).
-		// Tying boots to o.runnerCtx ties their lifetime to the
-		// supervisor itself.
-		bootJobs := append([]reloadBootJob(nil), jobs...)
-		globals := commitCfg.Globals
-		go o.runReloadBoots(bootRoot, bootJobs, globals)
-	}
+	// Commit the new config + baseEnv atomically with the runner
+	// registration, then boot the adds. registerAndBoot owns the lock
+	// discipline and the detached serial-boot handoff shared with
+	// autoscale's scaleUp.
+	o.registerAndBoot(jobs, commitCfg, newBaseEnv)
 
 	// Rebind the exit_code_from watcher: the watched service may have
 	// been added in this reload, or the target name may have changed.
@@ -866,6 +838,53 @@ func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, com
 		return errors.Join(errs...)
 	}
 	return nil
+}
+
+// registerAndBoot appends jobs' runners to o.runners under the
+// orchestrator lock, re-sorts, optionally commits a new config and
+// baseEnv in the same critical section (so external readers see a
+// consistent runners+cfg set), starts each runner's Run goroutine, and
+// launches a single detached goroutine that boots the adds serially in
+// filename order. Shared by applyReloadDiff (which commits cfg/baseEnv)
+// and autoscale's scaleUp (which passes nil commitCfg because it only
+// adds replicas to an already-committed config).
+//
+// Boots run on o.runnerCtx, not any caller ctx: SIGHUP-driven reloads
+// come from main.go which never cancels its ctx, and the control
+// server's per-request deadline is too tight for a multi-service boot.
+// Tying boots to runnerCtx ties their lifetime to the supervisor.
+func (o *Orchestrator) registerAndBoot(jobs []reloadBootJob, commitCfg *config.Config, newBaseEnv []string) {
+	// Capture runnerCtx under the same lock as the registration so the
+	// detached boot goroutine reads a properly-published value (Run is
+	// the sole writer of runnerCtx; the pairing keeps it race-clean).
+	o.mu.Lock()
+	for _, j := range jobs {
+		o.runners = append(o.runners, j.runner)
+	}
+	sortRunners(o.runners)
+	if commitCfg != nil {
+		o.cfg = commitCfg
+		o.baseEnv = newBaseEnv
+	}
+	globals := o.cfg.Globals
+	bootRoot := o.runnerCtx
+	o.mu.Unlock()
+	if bootRoot == nil {
+		// No live Run loop (constructed-directly tests); boots still
+		// need a non-nil root for runReloadBoots' ctx handling.
+		bootRoot = context.Background()
+	}
+
+	// spawnRunnerGoroutine takes no orchestrator locks but pulls
+	// runnerCtx via setRunCancel, so run it after the unlock.
+	for _, j := range jobs {
+		o.spawnRunnerGoroutine(j.runner)
+	}
+
+	if len(jobs) > 0 {
+		bootJobs := append([]reloadBootJob(nil), jobs...)
+		go o.runReloadBoots(bootRoot, bootJobs, globals)
+	}
 }
 
 // reloadBootJob carries the pre-built runner and its config through
