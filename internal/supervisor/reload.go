@@ -126,17 +126,12 @@ func (o *Orchestrator) reloadOne(ctx context.Context, r *Runner) error {
 func (o *Orchestrator) reloadByRestart(ctx context.Context, r *Runner) error {
 	name := r.DisplayName()
 	o.log.Info("reload: restart", "service", name)
-	if err := r.StopCtx(ctx); err != nil {
-		return fmt.Errorf("%s: stop: %w", name, err)
-	}
-	waitCtx, cancel := context.WithTimeout(ctx, r.Cfg().StopTimeout.Std()+reapGrace)
-	state, werr := r.WaitTerminal(waitCtx)
-	cancel()
-	if werr != nil {
-		return fmt.Errorf("%s: did not stop within timeout (state=%s): %w", name, state, werr)
-	}
-	if err := r.StartCtx(ctx); err != nil {
-		return fmt.Errorf("%s: start: %w", name, err)
+	// RestartCtx returns phase-prefixed errors ("stop:" /
+	// "did not stop within timeout (state=X):" / "start:"), so the
+	// historical reload message shape ("<name>: stop: ...") is
+	// preserved by just prefixing the service name.
+	if err := r.RestartCtx(ctx); err != nil {
+		return fmt.Errorf("%s: %w", name, err)
 	}
 	return nil
 }

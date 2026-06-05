@@ -477,22 +477,9 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 						return
 					}
 				case "restart":
-					if err := r.StopCtx(ctx); err != nil {
-						errs[k] = fmt.Errorf("%s: restart-stop: %w", name, err)
-						bodies[k] = fmt.Sprintf("%s: stop failed: %v", name, err)
-						return
-					}
-					waitCtx, cancel := context.WithTimeout(ctx, r.Cfg().StopTimeout.Std()+reapGrace)
-					state, werr := r.WaitTerminal(waitCtx)
-					cancel()
-					if werr != nil {
-						errs[k] = fmt.Errorf("%s: restart-wait: %w", name, werr)
-						bodies[k] = fmt.Sprintf("%s: did not stop within timeout (state=%s); restart aborted", name, state)
-						return
-					}
-					if err := r.StartCtx(ctx); err != nil {
-						errs[k] = fmt.Errorf("%s: restart-start: %w", name, err)
-						bodies[k] = fmt.Sprintf("%s: start failed: %v", name, err)
+					if err := r.RestartCtx(ctx); err != nil {
+						errs[k] = fmt.Errorf("%s: restart: %w", name, err)
+						bodies[k] = fmt.Sprintf("%s: restart failed: %v", name, err)
 						return
 					}
 				}

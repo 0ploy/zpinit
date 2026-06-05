@@ -8,6 +8,7 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand"
 	"strconv"
@@ -329,6 +330,30 @@ func (r *Runner) StartCtx(ctx context.Context) error { return r.sendCtx(ctx, cmd
 
 // StopCtx is the context-aware variant of Stop.
 func (r *Runner) StopCtx(ctx context.Context) error { return r.sendCtx(ctx, cmdStop) }
+
+// RestartCtx stops the runner, waits for it to reach a terminal state
+// (bounded by the service's stop_timeout + reapGrace, derived from
+// ctx), then starts it again. It is the single home for the
+// stop -> wait-terminal -> start sequence shared by `zpctl restart` and
+// reload's restart fallback, so the ordering and the timeout bound
+// can't drift between the two. Errors are phase-prefixed
+// ("stop:" / "did not stop within timeout (state=X):" / "start:") so
+// callers can render phase-aware messages without re-deriving them.
+func (r *Runner) RestartCtx(ctx context.Context) error {
+	if err := r.StopCtx(ctx); err != nil {
+		return fmt.Errorf("stop: %w", err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, r.Cfg().StopTimeout.Std()+reapGrace)
+	state, werr := r.WaitTerminal(waitCtx)
+	cancel()
+	if werr != nil {
+		return fmt.Errorf("did not stop within timeout (state=%s): %w", state, werr)
+	}
+	if err := r.StartCtx(ctx); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	return nil
+}
 
 func (r *Runner) sendCtx(ctx context.Context, kind cmdKind) error {
 	done := make(chan struct{})
