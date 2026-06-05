@@ -484,6 +484,17 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 					log.Error("reload: config load failed; keeping running set", "err", err)
 					continue
 				}
+				// Reload runs inline on the signal loop. Its remove /
+				// restart-stop phase is synchronous and bounded by
+				// stop_timeout+grace per filename group, so a SIGTERM
+				// arriving mid-reload waits in userCh (buffered, not
+				// lost) until Reload returns before shutdown begins.
+				// Acceptable: the delay is seconds for normal configs and
+				// reloadMu would serialize an async reload against zpctl
+				// update anyway. If shutdown latency under an
+				// orchestrator's kill grace ever bites, move this Reload
+				// to its own goroutine, but then the SIGTERM path must
+				// wait for the in-flight reload before returning from Run.
 				if _, err := orch.Reload(ctx, newCfg); err != nil {
 					log.Error("reload: failed", "err", err)
 				}
