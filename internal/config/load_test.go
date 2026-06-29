@@ -20,6 +20,86 @@ func write(t *testing.T, path, content string) {
 	}
 }
 
+// loadExpectSkip loads dir and returns the aggregated error string of
+// the single service file the loader skipped. Per-file parse and
+// validation failures are non-fatal now (the valid files still load),
+// so Load itself must succeed; the bad file shows up in SkippedFiles
+// instead of aborting the batch. Fails the test unless exactly one
+// file was skipped and no service loaded from it.
+func loadExpectSkip(t *testing.T, dir string) string {
+	t.Helper()
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load returned a fatal error; per-file failures should be skipped, not fatal: %v", err)
+	}
+	if len(cfg.SkippedFiles) != 1 {
+		t.Fatalf("want exactly 1 skipped file, got %d: %v", len(cfg.SkippedFiles), cfg.SkippedFiles)
+	}
+	if len(cfg.Services) != 0 {
+		t.Fatalf("an invalid file should not have produced a service, got %d", len(cfg.Services))
+	}
+	return cfg.SkippedFiles[0].Error()
+}
+
+// TestLoad_MixedValidAndInvalid is the core per-file-isolation
+// contract: a directory holding a mix of good and bad files loads
+// every valid service, skips each invalid one with its exact error,
+// and does not return a fatal error. This is the regression guard for
+// the "one stray file aborts the whole directory" bug.
+func TestLoad_MixedValidAndInvalid(t *testing.T) {
+	dir := t.TempDir()
+	// Two valid services.
+	write(t, filepath.Join(dir, "services", "10_redis.toml"), `command = ["redis-server"]`)
+	write(t, filepath.Join(dir, "services", "40_nginx.toml"), `command = ["nginx"]`)
+	// Parse failure: the exact shape that triggered the bug report.
+	write(t, filepath.Join(dir, "services", "0050_apache2.toml"), `
+command = ["apache2"]
+replicas = ""
+`)
+	// Validation failure (parses fine, fails per-service validation).
+	write(t, filepath.Join(dir, "services", "60_bad.toml"), `
+command = ["x"]
+restart = "sometimes"
+`)
+
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load must not fail the batch over per-file errors: %v", err)
+	}
+
+	// Valid services loaded, in filename order.
+	gotNames := make([]string, len(cfg.Services))
+	for i, s := range cfg.Services {
+		gotNames[i] = s.Filename
+	}
+	wantNames := []string{"10_redis.toml", "40_nginx.toml"}
+	if len(gotNames) != len(wantNames) {
+		t.Fatalf("loaded services = %v, want %v", gotNames, wantNames)
+	}
+	for i := range wantNames {
+		if gotNames[i] != wantNames[i] {
+			t.Errorf("service[%d] = %q, want %q", i, gotNames[i], wantNames[i])
+		}
+	}
+
+	// Both bad files skipped, with their errors, ordered by filename.
+	if len(cfg.SkippedFiles) != 2 {
+		t.Fatalf("SkippedFiles = %v, want 2", cfg.SkippedFiles)
+	}
+	if cfg.SkippedFiles[0].File != "0050_apache2.toml" {
+		t.Errorf("first skip = %q, want 0050_apache2.toml", cfg.SkippedFiles[0].File)
+	}
+	if !strings.Contains(cfg.SkippedFiles[0].Err.Error(), "replicas") {
+		t.Errorf("apache2 skip error should mention replicas: %v", cfg.SkippedFiles[0].Err)
+	}
+	if cfg.SkippedFiles[1].File != "60_bad.toml" {
+		t.Errorf("second skip = %q, want 60_bad.toml", cfg.SkippedFiles[1].File)
+	}
+	if !strings.Contains(cfg.SkippedFiles[1].Err.Error(), "restart") {
+		t.Errorf("bad skip error should mention restart: %v", cfg.SkippedFiles[1].Err)
+	}
+}
+
 func TestNameFromFilename(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"10_mysql.toml", "mysql"},
@@ -186,24 +266,18 @@ func TestLoad_InvalidRestart(t *testing.T) {
 command = ["redis-server"]
 restart = "sometimes"
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "restart") {
-		t.Errorf("error should mention restart: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "restart") {
+		t.Errorf("skip error should mention restart: %v", msg)
 	}
 }
 
 func TestLoad_MissingCommand(t *testing.T) {
 	dir := t.TempDir()
 	write(t, filepath.Join(dir, "services", "redis.toml"), `name = "redis"`)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "command") {
-		t.Errorf("error should mention command: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "command") {
+		t.Errorf("skip error should mention command: %v", msg)
 	}
 }
 
@@ -284,12 +358,9 @@ func TestLoad_UnknownKey(t *testing.T) {
 command = ["redis-server"]
 restartt = "always"
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error on typo'd key")
-	}
-	if !strings.Contains(err.Error(), "unknown") {
-		t.Errorf("error should mention unknown key: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "unknown") {
+		t.Errorf("skip error should mention unknown key: %v", msg)
 	}
 }
 
@@ -328,12 +399,9 @@ command = ["redis-server"]
 [ready]
 interval = "1s"
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "[ready].command") {
-		t.Errorf("error should mention [ready].command: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "[ready].command") {
+		t.Errorf("skip error should mention [ready].command: %v", msg)
 	}
 }
 
@@ -358,12 +426,9 @@ func TestLoad_NameWithInvalidChars(t *testing.T) {
 name = "redis/server"
 command = ["redis-server"]
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error on invalid name")
-	}
-	if !strings.Contains(err.Error(), "name") {
-		t.Errorf("error should mention name: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "name") {
+		t.Errorf("skip error should mention name: %v", msg)
 	}
 }
 
@@ -373,10 +438,7 @@ func TestLoad_DurationParseError(t *testing.T) {
 command = ["redis-server"]
 backoff_initial = "two seconds"
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected duration parse error")
-	}
+	_ = loadExpectSkip(t, dir)
 }
 
 func TestLoad_GlobalsEnvParses(t *testing.T) {
@@ -450,12 +512,9 @@ func TestLoad_ReplicasNegative(t *testing.T) {
 command = ["x"]
 replicas = -1
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error for negative replicas")
-	}
-	if !strings.Contains(err.Error(), "replicas") || !strings.Contains(err.Error(), "non-negative") {
-		t.Errorf("error should mention replicas non-negative: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "replicas") || !strings.Contains(msg, "non-negative") {
+		t.Errorf("skip error should mention replicas non-negative: %v", msg)
 	}
 }
 
@@ -465,12 +524,9 @@ func TestLoad_ReplicasTooLarge(t *testing.T) {
 command = ["x"]
 replicas = 1000
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error for too-large replicas")
-	}
-	if !strings.Contains(err.Error(), "replicas must be <= 64") {
-		t.Errorf("error should mention <= 64: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "replicas must be <= 64") {
+		t.Errorf("skip error should mention <= 64: %v", msg)
 	}
 }
 
@@ -481,12 +537,9 @@ command = ["x"]
 [env]
 ZPINIT_REPLICA_INDEX = "0"
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error for reserved env key in service [env]")
-	}
-	if !strings.Contains(err.Error(), "reserved") || !strings.Contains(err.Error(), "ZPINIT_REPLICA_INDEX") {
-		t.Errorf("error should mention reserved + ZPINIT_REPLICA_INDEX: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "reserved") || !strings.Contains(msg, "ZPINIT_REPLICA_INDEX") {
+		t.Errorf("skip error should mention reserved + ZPINIT_REPLICA_INDEX: %v", msg)
 	}
 }
 
@@ -595,12 +648,9 @@ command = ["x"]
 [env]
 `+k+` = "override"
 `)
-			_, err := Load(dir)
-			if err == nil {
-				t.Fatalf("expected error for reserved key %s", k)
-			}
-			if !strings.Contains(err.Error(), "reserved") || !strings.Contains(err.Error(), k) {
-				t.Errorf("error should mention reserved + %s: %v", k, err)
+			msg := loadExpectSkip(t, dir)
+			if !strings.Contains(msg, "reserved") || !strings.Contains(msg, k) {
+				t.Errorf("skip error should mention reserved + %s: %v", k, msg)
 			}
 		})
 	}
@@ -655,12 +705,9 @@ func TestLoad_ReloadSignalUnknown(t *testing.T) {
 command = ["x"]
 reload_signal = "NOPE"
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error for unknown reload signal")
-	}
-	if !strings.Contains(err.Error(), "reload_signal") {
-		t.Errorf("error should mention reload_signal: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "reload_signal") {
+		t.Errorf("skip error should mention reload_signal: %v", msg)
 	}
 }
 
@@ -671,12 +718,9 @@ command = ["x"]
 reload_signal = "HUP"
 reload_command = ["/bin/true"]
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error for both reload_signal and reload_command")
-	}
-	if !strings.Contains(err.Error(), "mutually exclusive") {
-		t.Errorf("error should mention mutually exclusive: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "mutually exclusive") {
+		t.Errorf("skip error should mention mutually exclusive: %v", msg)
 	}
 }
 
@@ -721,12 +765,9 @@ replicas = "auto"
 replicas_min = 8
 replicas_max = 4
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error for min > max")
-	}
-	if !strings.Contains(err.Error(), "replicas_min") {
-		t.Errorf("error should mention replicas_min: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "replicas_min") {
+		t.Errorf("skip error should mention replicas_min: %v", msg)
 	}
 }
 
@@ -737,12 +778,9 @@ command = ["x"]
 replicas = 3
 replicas_min = 2
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error for replicas_min without auto")
-	}
-	if !strings.Contains(err.Error(), "auto") {
-		t.Errorf("error should mention auto: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "auto") {
+		t.Errorf("skip error should mention auto: %v", msg)
 	}
 }
 
@@ -753,10 +791,7 @@ command = ["x"]
 replicas = "auto"
 restart = "never"
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error for auto + restart=never")
-	}
+	_ = loadExpectSkip(t, dir)
 }
 
 func TestLoad_ReplicasAutoImpliesReloadOnChange(t *testing.T) {
@@ -813,12 +848,9 @@ func TestLoad_ReloadOnChangeUnknownDim(t *testing.T) {
 command = ["x"]
 reload_on_change = ["cpu", "disk"]
 `)
-	_, err := Load(dir)
-	if err == nil {
-		t.Fatal("expected error for unknown dimension")
-	}
-	if !strings.Contains(err.Error(), "reload_on_change") {
-		t.Errorf("error should mention reload_on_change: %v", err)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "reload_on_change") {
+		t.Errorf("skip error should mention reload_on_change: %v", msg)
 	}
 }
 

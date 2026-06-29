@@ -170,6 +170,12 @@ config dir, diffs against the running set, and applies adds, removes,
 and restarts (per-service `reloadable = false` opts out). `zpctl
 reread` previews the diff without applying.
 
+Service files are parsed and validated independently: one malformed
+file (a stray `replicas = ""`, an unknown key) is skipped with its
+error while every valid service still loads. Boot and SIGHUP log the
+skip and continue; `zpctl update` / `reread` report it and exit
+non-zero so Puppet/CI notice. See [docs/configuration.md](docs/configuration.md).
+
 For runtime reloads (the running config on disk hasn't changed, but
 you want the service to re-read it), use `zpctl reload <service>`.
 Per-service `reload_signal` (e.g. `"HUP"` for nginx) or
@@ -350,7 +356,9 @@ zpinit --doctor       /etc/zpinit/   # superset: binaries, runtimes, live state
 ```
 
 `--check-config` parses everything, applies defaults, validates, and
-either prints a one-line OK or every error in a single pass.
+either prints a one-line OK or every error in a single pass. A service
+file that fails to parse or validate is reported as `skipped` and
+forces a non-zero exit, while the other valid files are still checked.
 
 `--plan` goes further: loads the same config, detects the CPU /
 memory budget, resolves `replicas = "auto"` against that snapshot,

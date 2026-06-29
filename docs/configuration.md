@@ -42,6 +42,33 @@ zpctl update        # applies (or send SIGHUP)
 `zpctl reread` doesn't complain about either form, so dev-loop edits
 under `services/` are safe.
 
+**A malformed file is skipped, not fatal.** Each service file is
+parsed and validated independently. One file that fails to parse
+(e.g. a stray `replicas = ""`) or fails validation (bad `restart`,
+unknown key, reserved env var) is skipped with its exact error; every
+other valid file still loads. A single bad file can no longer block
+the whole directory.
+
+How a skip surfaces depends on the path:
+
+- **Daemon boot / SIGHUP reload:** the skipped file is logged at
+  `error` level and the supervisor boots (or keeps running) with the
+  valid services. A typo in one service file never crashes PID 1.
+- **`zpctl update` / `update NAME` / `reread`:** the valid files are
+  applied, each skipped file is listed in the response with its
+  error, and `zpctl` exits **non-zero** so a Puppet/CI run notices.
+  A parse error in an unrelated file does not block updating a named
+  service.
+- **`--check-config`, `plan`, `doctor`:** report each skipped file and
+  exit non-zero (a `Fail` row for `doctor`).
+
+On `zpctl update`, a service whose file has *become* unparseable is
+left running with its last-good config rather than being torn down: a
+parse error is treated as "no opinion" until the file is fixed. Genuine
+whole-config errors stay fatal and abort the load: a missing config dir,
+an invalid `zpinit.toml`, a name collision, or `exit_code_from`
+pointing at a service that didn't load.
+
 `zpctl resolve NAME` reports the source file a name resolves to and
 whether it is currently enabled, scanning `services/` fresh so it sees
 `.disabled` files too (the running config only knows enabled
@@ -339,7 +366,11 @@ zpinit --check-config /etc/zpinit/
 ```
 
 Loads everything, applies defaults, validates, and either prints a
-one-line OK summary or every error found in one pass. Exit 0 / 1.
+one-line OK summary or every error found in one pass. Exit 0 / 1. A
+service file that fails to parse or validate is reported as `skipped`
+(with its error) and forces exit 1, but the remaining valid files are
+still checked. Whole-config errors (invalid `zpinit.toml`, name
+collisions, `exit_code_from` to a missing service) abort the load.
 
 `--check-config` validates:
 

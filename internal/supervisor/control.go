@@ -589,7 +589,28 @@ func (s *ControlServer) cmdUpdate(ctx context.Context, names []string) *ctlproto
 	if rerr != nil {
 		return errResp("reload: " + rerr.Error())
 	}
-	return diffResp(diff, "stopped", "restarted", "started", "no changes")
+	resp := diffResp(diff, "stopped", "restarted", "started", "no changes")
+	appendSkipErrors(resp, newCfg)
+	return resp
+}
+
+// appendSkipErrors surfaces per-file load failures in the response and
+// forces a non-zero exit code so a Puppet/CI caller notices, even
+// though the valid files still loaded and applied. The bad files are
+// listed with their exact parse/validation error; nothing is hidden.
+// If the operation already failed (resp.Code != 0) the existing
+// status message is preserved and the skip lines are just appended.
+func appendSkipErrors(resp *ctlproto.Response, cfg *config.Config) {
+	if len(cfg.SkippedFiles) == 0 {
+		return
+	}
+	for _, fe := range cfg.SkippedFiles {
+		resp.Body = append(resp.Body, fmt.Sprintf("! %s: skipped (%s)", fe.File, fe.Err.Error()))
+	}
+	if resp.Code == 0 {
+		resp.Code = 1
+		resp.Msg = fmt.Sprintf("%d service file(s) skipped due to errors", len(cfg.SkippedFiles))
+	}
 }
 
 // cmdUpdateScoped applies only the named services' add/remove/restart
@@ -613,6 +634,11 @@ func (s *ControlServer) cmdUpdateScoped(ctx context.Context, newCfg *config.Conf
 		resp.Body = append(resp.Body,
 			"note: global [env] changed; run 'zpctl update' (no args) to apply it to all services")
 	}
+	// A parse error in an unrelated file does not block updating the
+	// named service (it was skipped during load, so ReloadScoped never
+	// saw it), but we still report it and exit non-zero so the bad file
+	// is noticed.
+	appendSkipErrors(resp, newCfg)
 	return resp
 }
 
@@ -673,7 +699,9 @@ func (s *ControlServer) cmdReread() *ctlproto.Response {
 	// can change the answer. That is acceptable — `reread` is a
 	// snapshot, not a transaction; the next `update` recomputes.
 	diff := s.orch.computeDiff(newCfg)
-	return diffResp(diff, "will stop", "will restart", "will start", "no changes")
+	resp := diffResp(diff, "will stop", "will restart", "will start", "no changes")
+	appendSkipErrors(resp, newCfg)
+	return resp
 }
 
 // diffResp renders a reload diff into a response body using

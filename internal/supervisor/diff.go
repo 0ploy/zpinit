@@ -71,6 +71,15 @@ func (o *Orchestrator) computeDiffLocked(newCfg *config.Config) reloadDiff {
 	for _, s := range newCfg.Services {
 		newSet[s.Filename] = s
 	}
+	// Files the loader could not parse/validate are absent from
+	// newSet. Without this guard they'd look "removed" and we'd stop a
+	// healthy running service because someone fat-fingered its file. A
+	// parse error is "no opinion": leave whatever is running for that
+	// filename untouched until the file is fixed.
+	skipped := map[string]config.FileError{}
+	for _, fe := range newCfg.SkippedFiles {
+		skipped[fe.File] = fe
+	}
 
 	allFiles := map[string]struct{}{}
 	for fn := range existing {
@@ -91,6 +100,11 @@ func (o *Orchestrator) computeDiffLocked(newCfg *config.Config) reloadDiff {
 		s, hasNew := newSet[fn]
 		switch {
 		case hasOld && !hasNew:
+			if fe, isSkipped := skipped[fn]; isSkipped {
+				o.log.Warn("reload: service file failed to parse/validate; keeping running service unchanged",
+					"file", fn, "err", fe.Err)
+				continue
+			}
 			diff.remove = append(diff.remove, oldRunners...)
 		case !hasOld && hasNew:
 			diff.add = append(diff.add, s)

@@ -158,4 +158,23 @@ type Config struct {
 	Globals  Globals
 	Services []Service // sorted by Filename
 	Warnings []string  // non-fatal issues collected during load
+	// SkippedFiles records service files that failed to parse or
+	// validate and were left out of Services. Per-file isolation:
+	// one malformed file does not abort the whole load, so the valid
+	// files still appear in Services. Callers report these and decide
+	// the exit code (zpctl/--check-config exit non-zero; daemon boot
+	// logs and continues). Ordered by filename, matching the load walk.
+	SkippedFiles []FileError
 }
+
+// FileError pairs a service file's basename with the parse or
+// validation error that caused the loader to skip it. File is the
+// on-disk basename (e.g. "0050_apache2.toml"), which is also the diff
+// key, so the supervisor can match a skipped file against a running
+// runner and leave it untouched rather than tearing it down.
+type FileError struct {
+	File string
+	Err  error
+}
+
+func (fe FileError) Error() string { return fe.File + ": " + fe.Err.Error() }

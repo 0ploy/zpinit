@@ -143,6 +143,12 @@ func checkConfig(configDir string) (*config.Config, []Check) {
 	for _, w := range cfg.Warnings {
 		out = append(out, Check{"config", "load warning", StatusWarn, w})
 	}
+	// Per-file failures are isolated by the loader: the valid services
+	// above still loaded, but each skipped file is a Fail row so an
+	// operator running doctor sees exactly which file to fix.
+	for _, fe := range cfg.SkippedFiles {
+		out = append(out, Check{"config", "service file skipped", StatusFail, fe.Error()})
+	}
 
 	for _, s := range cfg.Services {
 		// Replicas: report the log layout (shared file vs per-replica

@@ -92,6 +92,14 @@ func runCheckConfig(dir string) int {
 	for _, w := range cfg.Warnings {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 	}
+	if len(cfg.SkippedFiles) > 0 {
+		for _, fe := range cfg.SkippedFiles {
+			fmt.Fprintf(os.Stderr, "skipped %s: %s\n", fe.File, fe.Err.Error())
+		}
+		fmt.Fprintf(os.Stderr, "config FAILED: %d service file(s) skipped, %d service(s) valid in %s/services\n",
+			len(cfg.SkippedFiles), len(cfg.Services), dir)
+		return 1
+	}
 	fmt.Printf("config OK: %d service(s) in %s/services\n", len(cfg.Services), dir)
 	return 0
 }
@@ -129,6 +137,12 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 	}
 	for _, w := range cfg.Warnings {
 		log.Warn("config", "warning", w)
+	}
+	// Per-file load failures must never crash PID 1: log each skipped
+	// service file and boot with the valid ones. An operator fixes the
+	// file and `zpctl update`s it back in.
+	for _, fe := range cfg.SkippedFiles {
+		log.Error("config: service file skipped (failed to parse/validate)", "file", fe.File, "err", fe.Err)
 	}
 
 	r := reaper.New(log)
@@ -483,6 +497,10 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 				if err != nil {
 					log.Error("reload: config load failed; keeping running set", "err", err)
 					continue
+				}
+				for _, fe := range newCfg.SkippedFiles {
+					log.Error("reload: service file skipped (failed to parse/validate); keeping any running copy unchanged",
+						"file", fe.File, "err", fe.Err)
 				}
 				// Reload runs inline on the signal loop. Its remove /
 				// restart-stop phase is synchronous and bounded by

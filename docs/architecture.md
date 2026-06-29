@@ -72,6 +72,14 @@ relies on.
 `exit_code_from` is rebound on every reload, so the watched service
 can be added, removed, or retargeted.
 
+Each service file is parsed and validated independently (see
+`docs/configuration.md`). A file that fails to parse or validate is
+skipped, recorded in `Config.SkippedFiles`, and excluded from the
+diff's remove set: a service whose file just became unparseable is
+left running with its last-good config rather than being torn down
+over a typo. The valid files reload normally. `zpctl` exits non-zero
+when any file was skipped; daemon boot and SIGHUP log and continue.
+
 ### Live resource watcher
 
 A polling goroutine in `internal/resources.Watcher` re-runs

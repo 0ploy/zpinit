@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **One malformed service file no longer takes down the whole
+  directory.** Service files are now parsed and validated
+  independently: a file with a stray `replicas = ""`, an unknown key,
+  or any other parse/validation error is skipped with its exact error
+  while every other valid service still loads. Previously a single bad
+  file aborted the entire load, so unrelated, healthy services failed
+  to start and `zpctl update` / `reread` refused the whole batch.
+  Daemon boot and SIGHUP log the skipped file and continue (a typo
+  never crashes PID 1); `zpctl update`, `update NAME`, `reread`,
+  `--check-config`, `plan`, and `doctor` report each skipped file and
+  exit non-zero so Puppet/CI notice. On `update`, a service whose file
+  just became unparseable keeps running with its last-good config
+  instead of being torn down. Whole-config errors (bad `zpinit.toml`,
+  name collisions, `exit_code_from` to a missing service) stay fatal.
+
 ## v0.5.0
 
 ### Features

@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -10,6 +11,41 @@ import (
 
 	"github.com/0ploy/zpinit/internal/config"
 )
+
+// TestCmdRereadReportsSkippedFiles drives cmdReread against a config
+// dir holding a mix of valid and invalid service files and asserts the
+// per-file-isolation contract at the control-socket boundary: the
+// response exits non-zero (so Puppet/CI notice) and names each skipped
+// file with its error, while the valid file is still planned.
+func TestCmdRereadReportsSkippedFiles(t *testing.T) {
+	root := t.TempDir()
+	sdir := filepath.Join(root, "services")
+	if err := os.MkdirAll(sdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(sdir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("10_redis.toml", `command = ["redis-server"]`)
+	write("50_apache2.toml", "command = [\"apache2\"]\nreplicas = \"\"\n")
+
+	o := &Orchestrator{log: testLog(), cfg: &config.Config{Dir: root, Globals: config.Globals{ExitCodeFrom: "default"}}}
+	s := &ControlServer{orch: o, log: testLog()}
+
+	resp := s.cmdReread()
+	if resp.Code != 1 {
+		t.Errorf("cmdReread Code = %d, want 1 when a file was skipped", resp.Code)
+	}
+	body := strings.Join(resp.Body, "\n")
+	if !strings.Contains(body, "50_apache2.toml") || !strings.Contains(body, "skipped") {
+		t.Errorf("response should name the skipped file:\n%s", body)
+	}
+	if !strings.Contains(body, "redis") {
+		t.Errorf("valid service should still be planned (will start):\n%s", body)
+	}
+}
 
 func TestReadLastBytes_RejectsSymlink(t *testing.T) {
 	dir := t.TempDir()
@@ -30,6 +66,43 @@ func TestReadLastBytes_RejectsSymlink(t *testing.T) {
 		t.Fatalf("readLastBytes(real): %v", err)
 	} else if got != "hello\n" {
 		t.Errorf("readLastBytes(real) = %q, want %q", got, "hello\n")
+	}
+}
+
+// TestComputeDiff_SkippedFileNotRemoved pins the reload-safety rule:
+// a service file that failed to parse/validate (so it's absent from
+// newCfg.Services but present in newCfg.SkippedFiles) must NOT be
+// treated as a removal. The running service is left untouched until
+// the file is fixed, rather than being torn down over a typo.
+func TestComputeDiff_SkippedFileNotRemoved(t *testing.T) {
+	svc := config.Service{Name: "api", Filename: "10_api.toml", Command: []string{"x"},
+		Restart: config.RestartAlways, StopSignal: "TERM"}
+	o := &Orchestrator{
+		log: testLog(),
+		cfg: &config.Config{Services: []config.Service{svc}, Globals: config.Globals{ExitCodeFrom: "default"}},
+	}
+	o.runners = []*Runner{NewRunner(svc, nil, 0, nil, nil, testLog())}
+
+	// The file is now broken on disk: it parsed before but fails this
+	// reload, so the loader skips it. It is gone from Services but
+	// recorded in SkippedFiles.
+	newCfg := &config.Config{
+		Globals:      config.Globals{ExitCodeFrom: "default"},
+		SkippedFiles: []config.FileError{{File: "10_api.toml", Err: errors.New("toml: bad")}},
+	}
+	diff := o.computeDiff(newCfg)
+	if len(diff.remove) != 0 {
+		t.Errorf("skipped file must not remove the running service; diff.remove = %v", diff.remove)
+	}
+	if len(diff.add) != 0 || len(diff.restart) != 0 {
+		t.Errorf("skipped file must not add/restart; diff = %+v", diff)
+	}
+
+	// Control: with the file genuinely gone (no skip record), it IS
+	// removed. Confirms the guard is the skip record, not a no-op diff.
+	goneCfg := &config.Config{Globals: config.Globals{ExitCodeFrom: "default"}}
+	if diff := o.computeDiff(goneCfg); len(diff.remove) != 1 {
+		t.Errorf("genuinely-removed file should be removed; diff.remove = %v", diff.remove)
 	}
 }
 

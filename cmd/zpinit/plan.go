@@ -36,6 +36,9 @@ func printPlan(w io.Writer, configDir string, cmdline []string) int {
 	for _, warn := range cfg.Warnings {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", warn)
 	}
+	for _, fe := range cfg.SkippedFiles {
+		fmt.Fprintf(os.Stderr, "skipped %s: %s\n", fe.File, fe.Err.Error())
+	}
 
 	snap := resources.Detect().WithReserves(
 		cfg.Globals.Resources.ReserveCPU,
@@ -95,6 +98,11 @@ func printPlan(w io.Writer, configDir string, cmdline []string) int {
 	}
 	if cfg.Globals.ExitCodeFrom != "default" {
 		fmt.Fprintf(w, "exit_code_from: %s\n", cfg.Globals.ExitCodeFrom)
+	}
+	// Mirror --check-config: a skipped file is a config error, so the
+	// plan exits non-zero even though the valid services are planned.
+	if len(cfg.SkippedFiles) > 0 {
+		return 1
 	}
 	return 0
 }

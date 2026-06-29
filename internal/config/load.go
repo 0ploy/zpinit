@@ -158,22 +158,47 @@ func loadServices(dir string, cfg *Config) error {
 			continue
 		}
 		path := filepath.Join(dir, name)
-		var svc Service
-		md, err := toml.DecodeFile(path, &svc)
-		if err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
+		// Per-file isolation: a file that fails to parse or validate
+		// is recorded and skipped, never aborting the batch. A single
+		// malformed file (e.g. a stray `replicas = ""` from a config
+		// generator) must not stop unrelated, valid services from
+		// loading. Cross-service checks (name collisions,
+		// exit_code_from) stay in validate() and remain fatal: those
+		// aren't "one bad file" but genuine whole-config conflicts.
+		svc, ferr := loadServiceFile(path, name, &cfg.Globals)
+		if ferr != nil {
+			cfg.SkippedFiles = append(cfg.SkippedFiles, FileError{File: name, Err: ferr})
+			continue
 		}
-		if undecoded := md.Undecoded(); len(undecoded) > 0 {
-			return fmt.Errorf("%s: unknown keys: %s", path, joinKeys(undecoded))
-		}
-		svc.Filename = name
-		if svc.Name == "" {
-			svc.Name = nameFromFilename(name)
-		}
-		applyServiceDefaults(&svc, &cfg.Globals, md.IsDefined("reload_on_change"))
-		cfg.Services = append(cfg.Services, svc)
+		cfg.Services = append(cfg.Services, *svc)
 	}
 	return nil
+}
+
+// loadServiceFile decodes, defaults, and per-service-validates a single
+// service file. The returned error is everything wrong with this file,
+// joined into one message so an operator can fix all of it in one pass
+// (matching validate()'s aggregate-then-report behavior, scoped to the
+// file). It never touches other files, so the caller can isolate the
+// failure.
+func loadServiceFile(path, name string, g *Globals) (*Service, error) {
+	var svc Service
+	md, err := toml.DecodeFile(path, &svc)
+	if err != nil {
+		return nil, err
+	}
+	if undecoded := md.Undecoded(); len(undecoded) > 0 {
+		return nil, fmt.Errorf("unknown keys: %s", joinKeys(undecoded))
+	}
+	svc.Filename = name
+	if svc.Name == "" {
+		svc.Name = nameFromFilename(name)
+	}
+	applyServiceDefaults(&svc, g, md.IsDefined("reload_on_change"))
+	if errs := validateService(&svc); len(errs) > 0 {
+		return nil, errors.New(strings.Join(errs, "; "))
+	}
+	return &svc, nil
 }
 
 // ServiceFileInfo describes one service file found on disk, with its
@@ -411,85 +436,17 @@ func validate(cfg *Config) error {
 		errs = append(errs, fmt.Sprintf("[resources].scale_down_after must be >= 0"))
 	}
 
+	// Cross-service checks operate only on services that survived
+	// per-file validation (validateService ran during load). A name
+	// collision is a genuine whole-config conflict, not a single bad
+	// file, so it stays fatal here.
 	nameToFile := map[string]string{}
 	for i := range cfg.Services {
 		s := &cfg.Services[i]
-		if !namePattern.MatchString(s.Name) {
-			errs = append(errs, fmt.Sprintf("%s: name %q must match %s", s.Filename, s.Name, namePattern))
-		}
 		if other, ok := nameToFile[s.Name]; ok {
 			errs = append(errs, fmt.Sprintf("name collision: %s and %s both resolve to %q", other, s.Filename, s.Name))
 		} else {
 			nameToFile[s.Name] = s.Filename
-		}
-		if len(s.Command) == 0 {
-			errs = append(errs, fmt.Sprintf("%s: command is required", s.Filename))
-		}
-		switch s.Restart {
-		case RestartAlways, RestartOnFailure, RestartNever:
-		default:
-			errs = append(errs, fmt.Sprintf("%s: restart must be 'always', 'on-failure', or 'never'; got %q", s.Filename, s.Restart))
-		}
-		if _, ok := ParseSignal(s.StopSignal); !ok {
-			errs = append(errs, fmt.Sprintf("%s: stop_signal %q is not a recognised signal name", s.Filename, s.StopSignal))
-		}
-		if s.Replicas.Auto {
-			if s.Restart == RestartNever {
-				errs = append(errs, fmt.Sprintf("%s: replicas = \"auto\" is incompatible with restart = \"never\"", s.Filename))
-			}
-			if s.ReplicasMin < 0 {
-				errs = append(errs, fmt.Sprintf("%s: replicas_min must be >= 0, got %d", s.Filename, s.ReplicasMin))
-			}
-			if s.ReplicasMax < 0 {
-				errs = append(errs, fmt.Sprintf("%s: replicas_max must be >= 0, got %d", s.Filename, s.ReplicasMax))
-			}
-			if s.ReplicasMin > 0 && s.ReplicasMax > 0 && s.ReplicasMin > s.ReplicasMax {
-				errs = append(errs, fmt.Sprintf("%s: replicas_min (%d) must be <= replicas_max (%d)", s.Filename, s.ReplicasMin, s.ReplicasMax))
-			}
-			if s.ReplicasMax > MaxReplicas {
-				errs = append(errs, fmt.Sprintf("%s: replicas_max must be <= %d, got %d", s.Filename, MaxReplicas, s.ReplicasMax))
-			}
-		} else {
-			if s.Replicas.N < 1 {
-				errs = append(errs, fmt.Sprintf("%s: replicas must be >= 1", s.Filename))
-			}
-			if s.Replicas.N > MaxReplicas {
-				errs = append(errs, fmt.Sprintf("%s: replicas must be <= %d (got %d)", s.Filename, MaxReplicas, s.Replicas.N))
-			}
-			if s.ReplicasMin != 0 || s.ReplicasMax != 0 {
-				errs = append(errs, fmt.Sprintf("%s: replicas_min / replicas_max only apply when replicas = \"auto\"", s.Filename))
-			}
-		}
-		if s.ReloadSignal != "" && len(s.ReloadCommand) > 0 {
-			errs = append(errs, fmt.Sprintf("%s: reload_signal and reload_command are mutually exclusive", s.Filename))
-		}
-		if s.ReloadSignal != "" {
-			if _, ok := ParseSignal(s.ReloadSignal); !ok {
-				errs = append(errs, fmt.Sprintf("%s: reload_signal %q is not a recognised signal name", s.Filename, s.ReloadSignal))
-			}
-		}
-		for _, dim := range s.ReloadOnChange {
-			if dim != resources.DimCPU && dim != resources.DimMemory {
-				errs = append(errs, fmt.Sprintf("%s: reload_on_change entry %q must be %q or %q", s.Filename, dim, resources.DimCPU, resources.DimMemory))
-			}
-		}
-		for k := range s.Env {
-			if !envKeyPattern.MatchString(k) {
-				errs = append(errs, fmt.Sprintf("%s: env key %q must match %s", s.Filename, k, envKeyPattern))
-			}
-			if isReservedEnvKey(k) {
-				errs = append(errs, fmt.Sprintf("%s: env key %q is reserved (managed by the supervisor)", s.Filename, k))
-			}
-		}
-		if s.Ready != nil {
-			if len(s.Ready.Command) == 0 {
-				errs = append(errs, fmt.Sprintf("%s: [ready].command is required when [ready] is set", s.Filename))
-			}
-			switch s.Ready.OnTimeout {
-			case ReadyFail, ReadyContinue:
-			default:
-				errs = append(errs, fmt.Sprintf("%s: [ready].on_timeout must be 'fail' or 'continue'; got %q", s.Filename, s.Ready.OnTimeout))
-			}
 		}
 	}
 
@@ -517,6 +474,89 @@ func validate(cfg *Config) error {
 		return fmt.Errorf("config validation failed:\n  - %s", strings.Join(errs, "\n  - "))
 	}
 	return nil
+}
+
+// validateService checks a single, already-defaulted service in
+// isolation and returns every problem it finds (so the caller can
+// report them all at once). It deliberately excludes cross-service
+// concerns (name collisions, exit_code_from) which validate() handles
+// against the full surviving set. Run per-file during load so an
+// invalid service file is skipped rather than aborting the batch.
+func validateService(s *Service) []string {
+	var errs []string
+	if !namePattern.MatchString(s.Name) {
+		errs = append(errs, fmt.Sprintf("name %q must match %s", s.Name, namePattern))
+	}
+	if len(s.Command) == 0 {
+		errs = append(errs, "command is required")
+	}
+	switch s.Restart {
+	case RestartAlways, RestartOnFailure, RestartNever:
+	default:
+		errs = append(errs, fmt.Sprintf("restart must be 'always', 'on-failure', or 'never'; got %q", s.Restart))
+	}
+	if _, ok := ParseSignal(s.StopSignal); !ok {
+		errs = append(errs, fmt.Sprintf("stop_signal %q is not a recognised signal name", s.StopSignal))
+	}
+	if s.Replicas.Auto {
+		if s.Restart == RestartNever {
+			errs = append(errs, "replicas = \"auto\" is incompatible with restart = \"never\"")
+		}
+		if s.ReplicasMin < 0 {
+			errs = append(errs, fmt.Sprintf("replicas_min must be >= 0, got %d", s.ReplicasMin))
+		}
+		if s.ReplicasMax < 0 {
+			errs = append(errs, fmt.Sprintf("replicas_max must be >= 0, got %d", s.ReplicasMax))
+		}
+		if s.ReplicasMin > 0 && s.ReplicasMax > 0 && s.ReplicasMin > s.ReplicasMax {
+			errs = append(errs, fmt.Sprintf("replicas_min (%d) must be <= replicas_max (%d)", s.ReplicasMin, s.ReplicasMax))
+		}
+		if s.ReplicasMax > MaxReplicas {
+			errs = append(errs, fmt.Sprintf("replicas_max must be <= %d, got %d", MaxReplicas, s.ReplicasMax))
+		}
+	} else {
+		if s.Replicas.N < 1 {
+			errs = append(errs, "replicas must be >= 1")
+		}
+		if s.Replicas.N > MaxReplicas {
+			errs = append(errs, fmt.Sprintf("replicas must be <= %d (got %d)", MaxReplicas, s.Replicas.N))
+		}
+		if s.ReplicasMin != 0 || s.ReplicasMax != 0 {
+			errs = append(errs, "replicas_min / replicas_max only apply when replicas = \"auto\"")
+		}
+	}
+	if s.ReloadSignal != "" && len(s.ReloadCommand) > 0 {
+		errs = append(errs, "reload_signal and reload_command are mutually exclusive")
+	}
+	if s.ReloadSignal != "" {
+		if _, ok := ParseSignal(s.ReloadSignal); !ok {
+			errs = append(errs, fmt.Sprintf("reload_signal %q is not a recognised signal name", s.ReloadSignal))
+		}
+	}
+	for _, dim := range s.ReloadOnChange {
+		if dim != resources.DimCPU && dim != resources.DimMemory {
+			errs = append(errs, fmt.Sprintf("reload_on_change entry %q must be %q or %q", dim, resources.DimCPU, resources.DimMemory))
+		}
+	}
+	for k := range s.Env {
+		if !envKeyPattern.MatchString(k) {
+			errs = append(errs, fmt.Sprintf("env key %q must match %s", k, envKeyPattern))
+		}
+		if isReservedEnvKey(k) {
+			errs = append(errs, fmt.Sprintf("env key %q is reserved (managed by the supervisor)", k))
+		}
+	}
+	if s.Ready != nil {
+		if len(s.Ready.Command) == 0 {
+			errs = append(errs, "[ready].command is required when [ready] is set")
+		}
+		switch s.Ready.OnTimeout {
+		case ReadyFail, ReadyContinue:
+		default:
+			errs = append(errs, fmt.Sprintf("[ready].on_timeout must be 'fail' or 'continue'; got %q", s.Ready.OnTimeout))
+		}
+	}
+	return errs
 }
 
 func joinKeys(keys []toml.Key) string {
