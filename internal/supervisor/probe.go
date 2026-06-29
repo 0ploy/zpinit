@@ -135,14 +135,10 @@ func waitReady(ctx context.Context, ready *config.Ready, env []string, cwd strin
 		} else {
 			log.Debug("probe failed; retrying", "err", err)
 		}
-		// Reset for the next interval. Drain a stale tick if Stop
-		// reports the timer had already fired (rare but possible).
-		if !intervalTimer.Stop() {
-			select {
-			case <-intervalTimer.C:
-			default:
-			}
-		}
+		// Reset for the next interval. Since go 1.23 (go.mod declares
+		// 1.26) Reset synchronizes the channel itself, so no stale tick
+		// can be delivered after it returns; the old Stop-then-drain
+		// dance is unnecessary.
 		intervalTimer.Reset(ready.Interval.Std())
 		select {
 		case <-intervalTimer.C:

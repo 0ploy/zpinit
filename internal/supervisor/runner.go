@@ -10,7 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"strconv"
 	"sync"
 	"syscall"
@@ -190,7 +190,11 @@ func NewRunner(cfg config.Service, baseEnv []string, replicaIndex int, spawn Spa
 		log:          log,
 		cmds:         make(chan command, 4),
 		state:        StatePending,
-		jitterRand:   rand.New(rand.NewSource(int64(replicaIndex))),
+		// math/rand/v2 PCG, seeded per replica so each gets a
+		// deterministic-but-distinct jitter sequence. The second seed
+		// word is a fixed nonzero constant so replica 0 (index 0) still
+		// starts from a well-mixed state rather than all-zero.
+		jitterRand: rand.New(rand.NewPCG(uint64(replicaIndex), 0x9E3779B97F4A7C15)),
 	}
 }
 
