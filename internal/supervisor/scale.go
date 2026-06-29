@@ -7,32 +7,37 @@ import (
 	"github.com/0ploy/zpinit/internal/resources"
 )
 
-// scaleAutoServices walks every service declared replicas="auto"
-// and brings the live runner count up or down to match the new
-// target computed from snap. Scale-up boots additional replicas
-// through the reload-boot serialization (one at a time, in
-// filename order); scale-down stops the highest-indexed extras in
-// parallel via removeServiceGroup. The live cfg's per-service
-// Replicas.N is updated so subsequent reload diffs and zpctl
-// status reflect the current target.
-//
-// Called from OnResourceChange after SetResourceEnv. Errors are
-// logged; we don't propagate them because there's no client to
-// receive them.
-func (o *Orchestrator) scaleAutoServices(ctx context.Context, snap resources.Snapshot) {
-	type action struct {
-		spec    config.Service
-		running []*Runner
-		target  int
-	}
-	var actions []action
+// autoScaleAction is one replicas="auto" service's planned rebalance:
+// bring its `running` replicas to `target`. Produced by planAutoScale
+// (which holds o.mu) and consumed by applyAutoScale (which holds
+// neither o.mu nor reloadMu).
+type autoScaleAction struct {
+	spec    config.Service
+	running []*Runner
+	target  int
+}
 
+// planAutoScale walks every replicas="auto" service, computes the new
+// target from snap, commits it to the live cfg's per-service
+// Replicas.N (so subsequent reload diffs and `zpctl status` reflect
+// the current target), and returns the actions needed to reach it plus
+// the current baseEnv.
+//
+// The caller holds reloadMu across SetCurrentSnapshot AND this call so
+// a concurrent Reload observes the (snapshot, Replicas.N) pair
+// atomically: Reload resolves auto N from currentSnapshot, and a
+// half-updated pair would make it compute a stale target. The returned
+// actions are applied OUTSIDE reloadMu (see applyAutoScale) — only the
+// planning needs the lock, not the teardown.
+func (o *Orchestrator) planAutoScale(snap resources.Snapshot) ([]autoScaleAction, []string) {
 	o.mu.Lock()
+	defer o.mu.Unlock()
 	byFile := map[string][]*Runner{}
 	for _, r := range o.runners {
 		fn := r.Cfg().Filename
 		byFile[fn] = append(byFile[fn], r)
 	}
+	var actions []autoScaleAction
 	for i, svc := range o.cfg.Services {
 		if !svc.Replicas.Auto {
 			continue
@@ -42,18 +47,30 @@ func (o *Orchestrator) scaleAutoServices(ctx context.Context, snap resources.Sna
 		if target == len(running) {
 			continue
 		}
-		// Update the live cfg's N so future reload diffs and the
-		// `zpctl status` / update output reflect the current target.
 		o.cfg.Services[i].Replicas.N = target
-		actions = append(actions, action{
+		actions = append(actions, autoScaleAction{
 			spec:    o.cfg.Services[i],
 			running: running,
 			target:  target,
 		})
 	}
-	baseEnv := o.baseEnv
-	o.mu.Unlock()
+	return actions, o.baseEnv
+}
 
+// applyAutoScale executes planned scale actions. Scale-up boots
+// additional replicas through the reload-boot serialization (one at a
+// time, in filename order, detached); scale-down stops the
+// highest-indexed extras in parallel via removeServiceGroup.
+//
+// Runs OUTSIDE reloadMu by design: scale-down's removeServiceGroup
+// blocks on StopCtx + WaitTerminal for up to stop_timeout + reapGrace
+// per group, and holding reloadMu across that would freeze every
+// SIGHUP / `zpctl update` reload for the stop window on a slow-to-die
+// replica. Releasing the lock between plan and apply is safe because
+// Reload never diffs an auto service's replica count (servicesEqual
+// ignores auto N; the scaler owns it), so a Reload that interleaves
+// here can't race the scaler over the same runners.
+func (o *Orchestrator) applyAutoScale(ctx context.Context, actions []autoScaleAction, baseEnv []string) {
 	for _, a := range actions {
 		if a.target > len(a.running) {
 			o.scaleUp(a.spec, len(a.running), a.target, baseEnv)
@@ -67,7 +84,7 @@ func (o *Orchestrator) scaleAutoServices(ctx context.Context, snap resources.Sna
 // and the detached, reloadBootMu-serialized boot are handled by
 // registerAndBoot (shared with reload); commitCfg is nil because
 // autoscale only adds replicas to the already-committed config (the
-// new Replicas.N was written by scaleAutoServices).
+// new Replicas.N was written by planAutoScale).
 func (o *Orchestrator) scaleUp(spec config.Service, from, to int, baseEnv []string) {
 	if to <= from {
 		return

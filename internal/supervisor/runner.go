@@ -619,6 +619,16 @@ func (r *Runner) SignalGroup(sig syscall.Signal) error {
 // diffs, and signal dispatch. Cfg is otherwise immutable for a
 // Runner's lifetime (set at construction; never reassigned), so the
 // shared references are safe to read without holding r.mu.
+//
+// Lock-free correctness depends on a system-wide invariant: the
+// orchestrator must never mutate a registered Runner's cfg backing
+// data in place. Autoscale only writes o.cfg.Services[i].Replicas.N
+// (a value field on a *different* struct from the runner's copy) under
+// o.mu, and Reload swaps o.cfg wholesale rather than editing shared
+// maps/slices — so no writer ever touches the references a live
+// Cfg() reader sees. If a future change starts mutating a runner's
+// Env/Command in place, this method must take r.mu. Covered by the
+// race detector in CI.
 func (r *Runner) Cfg() config.Service {
 	return r.cfg
 }

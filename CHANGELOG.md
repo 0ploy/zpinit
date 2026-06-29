@@ -12,6 +12,13 @@
   constrained containers. This is separate from the per-service CPU
   budget zpinit already exposes to children via `ZPINIT_CPU_*`.
 
+### Fixed
+
+- **`zpinit --doctor` no longer hangs on a misconfigured runtime.** The
+  Node/Bun/Deno `--version` probes now time out after 5 seconds and
+  report a warning, instead of blocking the audit indefinitely when a
+  service's `command[0]` points at a binary that never exits.
+
 ## v0.5.1
 
 ### Fixed

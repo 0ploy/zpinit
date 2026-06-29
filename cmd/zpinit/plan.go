@@ -195,7 +195,11 @@ func printSortedMap(w io.Writer, prefix string, m map[string]string) {
 
 func dedupStrings(in []string) []string {
 	seen := make(map[string]struct{}, len(in))
-	out := in[:0]
+	// Fresh slice rather than in[:0]: aliasing the caller's backing
+	// array and overwriting it in place is a footgun if the caller ever
+	// reads `in` afterward. The cost is one small allocation on a
+	// non-hot path (plan rendering).
+	out := make([]string, 0, len(in))
 	for _, s := range in {
 		if _, ok := seen[s]; ok {
 			continue

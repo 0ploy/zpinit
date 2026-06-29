@@ -15,6 +15,7 @@
 package doctor
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -29,6 +30,26 @@ import (
 
 	"github.com/0ploy/zpinit/internal/config"
 )
+
+// versionProbeTimeout bounds each runtime `--version` probe. doctor is
+// advertised as a fast pre-flight and runs in CI/healthcheck contexts;
+// without a timeout a misconfigured runtime path (a wrapper that reads
+// stdin, an interpreter that drops into a REPL, a stalled network
+// mount) would hang the whole audit indefinitely.
+const versionProbeTimeout = 5 * time.Second
+
+// probeVersion runs `<bin> --version` with a hard timeout. A timeout is
+// surfaced as a distinct error so callers can WARN with a clear cause
+// rather than a generic exec failure.
+func probeVersion(bin string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), versionProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("version probe timed out after %s", versionProbeTimeout)
+	}
+	return out, err
+}
 
 // Status is the verdict of one Check.
 type Status int
@@ -335,7 +356,7 @@ func nodeRuntimeCheckPath(configured, resolved string, replicaServices int) Chec
 	if resolved == "" {
 		return Check{"runtimes", label, StatusFail, fmt.Sprintf("%s not found", configured)}
 	}
-	out, err := exec.Command(resolved, "--version").CombinedOutput()
+	out, err := probeVersion(resolved)
 	if err != nil {
 		return Check{"runtimes", label, StatusWarn, fmt.Sprintf("`%s --version` failed: %v", resolved, err)}
 	}
@@ -365,7 +386,7 @@ func runtimeVersionCheckPath(name, configured, resolved string) Check {
 	if resolved == "" {
 		return Check{"runtimes", label, StatusFail, fmt.Sprintf("%s not found", configured)}
 	}
-	out, err := exec.Command(resolved, "--version").CombinedOutput()
+	out, err := probeVersion(resolved)
 	if err != nil {
 		return Check{"runtimes", label, StatusWarn, fmt.Sprintf("`%s --version` failed: %v", resolved, err)}
 	}

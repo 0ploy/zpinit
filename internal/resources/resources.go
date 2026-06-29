@@ -13,6 +13,7 @@
 package resources
 
 import (
+	"bufio"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -206,13 +207,21 @@ func readCgroupV1(root string) (float64, uint64) {
 	return cpu, mem
 }
 
+// procCPUCount counts the "processor" lines in /proc/cpuinfo. Scanned
+// line-by-line rather than ReadFile + strings.Split: this runs on
+// every watcher poll (default 1s) for the daemon's whole life, and on
+// a high-core host the split would allocate a large []string (plus the
+// whole-file string) each tick. The scanner reuses one buffer.
 func procCPUCount(procRoot string) int {
-	data, err := os.ReadFile(filepath.Join(procRoot, "cpuinfo"))
+	f, err := os.Open(filepath.Join(procRoot, "cpuinfo"))
 	if err != nil {
 		return 0
 	}
+	defer f.Close()
 	n := 0
-	for _, line := range strings.Split(string(data), "\n") {
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
 		if strings.HasPrefix(line, "processor") && strings.Contains(line, ":") {
 			n++
 		}
@@ -220,12 +229,17 @@ func procCPUCount(procRoot string) int {
 	return n
 }
 
+// procMemoryBytes reads MemTotal from /proc/meminfo. Line-by-line scan
+// for the same per-poll allocation reason as procCPUCount.
 func procMemoryBytes(procRoot string) uint64 {
-	data, err := os.ReadFile(filepath.Join(procRoot, "meminfo"))
+	f, err := os.Open(filepath.Join(procRoot, "meminfo"))
 	if err != nil {
 		return 0
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
 		if !strings.HasPrefix(line, "MemTotal:") {
 			continue
 		}

@@ -41,6 +41,12 @@ type ControlServer struct {
 	orch     *Orchestrator
 	shutdown func() // called by `zpctl shutdown` to trigger orderly exit
 	log      *slog.Logger
+	// listenCtx is the context passed to Listen; it is canceled when
+	// the supervisor shuts down. Streaming handlers (tail --follow)
+	// derive their context from it so a parked follow goroutine is
+	// torn down on shutdown instead of surviving to process exit. Set
+	// once in Listen before any connection goroutine is spawned.
+	listenCtx context.Context
 }
 
 // readRequestTimeout caps how long a client may take to send the
@@ -75,6 +81,11 @@ func NewControlServer(orch *Orchestrator, shutdownFn func(), log *slog.Logger) *
 // runner goroutines are spawned later by the orchestrator), so the
 // flip is safe. The chmod is kept as belt-and-braces.
 func (s *ControlServer) Listen(ctx context.Context, path string) error {
+	// Recorded before the accept loop so streaming handlers can derive
+	// a context that is canceled on shutdown. Safe to store without a
+	// lock: this write happens-before any handleConn goroutine, which
+	// are only spawned below in this same goroutine.
+	s.listenCtx = ctx
 	_ = os.Remove(path)
 	old := syscall.Umask(0o077)
 	l, err := net.Listen("unix", path)
@@ -156,10 +167,14 @@ func (s *ControlServer) handleConn(conn net.Conn) {
 	// open-ended follow). Read deadline is cleared because there's
 	// no further client-driven I/O to time-bound; the goroutine
 	// exits when the client closes the connection (write error) or
-	// the supervisor shuts down.
+	// the supervisor shuts down (listenCtx cancel).
 	if isStreamingRequest(req) {
 		_ = conn.SetReadDeadline(time.Time{})
-		streamCtx, streamCancel := context.WithCancel(context.Background())
+		parent := s.listenCtx
+		if parent == nil {
+			parent = context.Background()
+		}
+		streamCtx, streamCancel := context.WithCancel(parent)
 		defer streamCancel()
 		s.handleStream(streamCtx, conn, pc, req)
 		return

@@ -26,4 +26,11 @@ func (realClock) NewTimer(d time.Duration) Timer { return &realTimer{t: time.New
 type realTimer struct{ t *time.Timer }
 
 func (rt *realTimer) Chan() <-chan time.Time { return rt.t.C }
-func (rt *realTimer) Stop()                  { rt.t.Stop() }
+
+// Stop does not drain rt.t.C. That is safe ONLY because realTimer is
+// used single-shot: the Run loop nils its timer slot before handling a
+// fire and recomputes the channel each iteration, so a stale tick can
+// never be re-selected. (Under the go.mod 1.26 floor, Go 1.23+ timer
+// semantics also mean Stop needs no manual drain.) Do not Stop() then
+// re-read Chan() on the same realTimer; construct a new one instead.
+func (rt *realTimer) Stop() { rt.t.Stop() }

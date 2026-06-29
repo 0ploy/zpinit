@@ -430,10 +430,10 @@ func validate(cfg *Config) error {
 		errs = append(errs, fmt.Sprintf("[resources].reserve_cpu must be >= 0, got %v", cfg.Globals.Resources.ReserveCPU))
 	}
 	if cfg.Globals.Resources.ScaleUpAfter < 0 {
-		errs = append(errs, fmt.Sprintf("[resources].scale_up_after must be >= 0"))
+		errs = append(errs, "[resources].scale_up_after must be >= 0")
 	}
 	if cfg.Globals.Resources.ScaleDownAfter < 0 {
-		errs = append(errs, fmt.Sprintf("[resources].scale_down_after must be >= 0"))
+		errs = append(errs, "[resources].scale_down_after must be >= 0")
 	}
 
 	// Cross-service checks operate only on services that survived

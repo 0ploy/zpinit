@@ -112,6 +112,16 @@ func (o *Orchestrator) reloadOne(ctx context.Context, r *Runner) error {
 			}
 			return nil
 		case <-wctx.Done():
+			// Timeout policy: we abandon the wait but deliberately do
+			// NOT kill the overrunning reload_command. Killing a
+			// half-finished reload (e.g. `nginx -s reload` mid-apply)
+			// can be worse than letting it complete, and the supervised
+			// service itself is untouched. The abandoned child is not
+			// leaked: it stays registered with the central reaper, which
+			// reaps it when it eventually exits; its exit lands in the
+			// cap-1 exitCh buffer (never read, GC'd with the channel),
+			// so the reaper never blocks. One overrun process per
+			// timed-out reload, bounded.
 			return fmt.Errorf("%s: reload_command did not finish within %s", name, reloadCommandTimeout)
 		}
 
@@ -151,18 +161,26 @@ func (o *Orchestrator) reloadByRestart(ctx context.Context, r *Runner) error {
 // to.
 func (o *Orchestrator) OnResourceChange(change resources.Change) {
 	// reloadMu serializes the SetResourceEnv → SetCurrentSnapshot →
-	// scaleAutoServices triad against any concurrent Reload. Without
-	// this, a SIGHUP or `zpctl update` racing with a watcher commit
-	// could observe a half-updated o.cfg (snapshot already advanced,
+	// planAutoScale triad against any concurrent Reload. Without this,
+	// a SIGHUP or `zpctl update` racing with a watcher commit could
+	// observe a half-updated o.cfg (snapshot already advanced,
 	// per-service Replicas.N still being written) or overwrite the
 	// scaler's Replicas.N mutation with a stale disk-loaded value.
-	// Held only across the cfg-mutating triad; the reload-on-change
-	// fanout below runs outside the lock because each per-runner
-	// reload only touches that runner's state.
+	//
+	// Only the PLANNING is under the lock. The teardown/boot
+	// (applyAutoScale) runs outside reloadMu: scale-down blocks on
+	// stop_timeout + reapGrace per group, and holding reloadMu across
+	// that would freeze every operator reload for the stop window on a
+	// slow-to-die replica. The split is safe because the (snapshot,
+	// Replicas.N) pair is already consistent once planAutoScale
+	// returns, and Reload never diffs an auto service's replica count
+	// (servicesEqual ignores auto N — the scaler owns it).
 	o.reloadMu.Lock()
 	newEnv := change.Snapshot.EnvVars()
 	o.SetResourceEnv(newEnv)
 	o.SetCurrentSnapshot(change.Snapshot)
+	actions, baseEnv := o.planAutoScale(change.Snapshot)
+	o.reloadMu.Unlock()
 
 	// Auto-replicated services rebalance to the new target before
 	// reload-on-change fans out. Existing replicas that survive the
@@ -171,8 +189,7 @@ func (o *Orchestrator) OnResourceChange(change resources.Change) {
 	// get reloaded again as well, which is wasteful but keeps the
 	// dispatch logic simple. v1 trade-off; we can teach the fanout
 	// to exempt fresh replicas later.
-	o.scaleAutoServices(context.Background(), change.Snapshot)
-	o.reloadMu.Unlock()
+	o.applyAutoScale(context.Background(), actions, baseEnv)
 
 	dimset := map[string]struct{}{}
 	for _, d := range change.Dimensions {

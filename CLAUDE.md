@@ -145,11 +145,18 @@ commit", no phase numbers. Internal refactors and CI tweaks live in
   `.watcherCancel`, and `.watcherGen` are protected by `o.mu`
   (RWMutex). `o.reloadMu` serializes Reload-vs-Reload AND
   Reload-vs-watcher-driven autoscale: `OnResourceChange` holds it
-  across the `SetResourceEnv → SetCurrentSnapshot → scaleAutoServices`
+  across the `SetResourceEnv → SetCurrentSnapshot → planAutoScale`
   triad so a SIGHUP racing with a watcher commit can't observe a
   half-updated `o.cfg` or overwrite the scaler's `Replicas.N` with a
-  stale disk-loaded value. The fanout reload runs outside `reloadMu`
-  because per-runner reloads only touch that runner's state. External
+  stale disk-loaded value. Only the planning is under the lock; the
+  actual scale teardown/boot (`applyAutoScale`) runs OUTSIDE `reloadMu`
+  because scale-down blocks on `stop_timeout` and would otherwise
+  freeze every operator reload for that window. The split is safe
+  because the `(snapshot, Replicas.N)` pair is consistent once
+  `planAutoScale` returns and `Reload` never diffs an auto service's
+  replica count (`servicesEqual` ignores auto `N`; the scaler owns it).
+  The fanout reload runs outside `reloadMu` because per-runner reloads
+  only touch that runner's state. External
   readers must use `snapshotRunners()`; iterating the live slice while
   Reload mutates it is a data race confirmed by `go test -race`.
 
@@ -185,6 +192,15 @@ commit", no phase numbers. Internal refactors and CI tweaks live in
   process under PID 1 with no zpctl handle. `runCancel` is called only
   on successful removal so the Run loop stays alive while the child
   is.
+
+- A service file that fails to parse or validate is skipped into
+  `cfg.SkippedFiles`, never fatal to the batch: the other valid files
+  still load. `computeDiffLocked` excludes skipped filenames from the
+  remove set, so a reload over a now-broken file leaves the running
+  service untouched instead of tearing it down. Don't let a skipped
+  file fall through to removal, and don't make per-file parse/validate
+  errors abort `Load` (only dir-level problems and cross-service
+  conflicts like name collisions / `exit_code_from` are fatal).
 
 - `stopAll` schedules teardown per filename group: reverse filename
   order BETWEEN groups (filename encodes dependency order so dependents

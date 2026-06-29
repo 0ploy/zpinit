@@ -166,7 +166,12 @@ func runOne(ctx context.Context, cfg Config, path string, env []string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start: %w", err)
 	}
-	pgid := cmd.Process.Pid
+	// The child is a new process-group leader (Setpgid above with no
+	// explicit Pgid), so its PID equals its PGID. Negating it in the
+	// Kill calls below signals the whole group, reaching forked
+	// grandchildren. Named `pid` to avoid implying a separately-derived
+	// pgid; it would be wrong if anyone later set an explicit Pgid.
+	pid := cmd.Process.Pid
 
 	// cmd.Wait() runs in its own goroutine. If the kernel can't deliver
 	// SIGKILL (process pinned in uninterruptible sleep — e.g. wedged
@@ -189,9 +194,9 @@ func runOne(ctx context.Context, cfg Config, path string, env []string) error {
 		return err
 	case <-timeoutCh:
 		cfg.Logger.Warn("entrypoint script timed out", "name", filepath.Base(path), "timeout", cfg.ScriptTimeout)
-		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		_ = syscall.Kill(-pid, syscall.SIGTERM)
 	case <-ctx.Done():
-		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		_ = syscall.Kill(-pid, syscall.SIGTERM)
 	}
 
 	graceTimer := time.NewTimer(cfg.KillGrace)
@@ -200,12 +205,12 @@ func runOne(ctx context.Context, cfg Config, path string, env []string) error {
 	case err := <-done:
 		return err
 	case <-graceTimer.C:
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		select {
 		case <-done:
 		case <-time.After(scriptReapGiveUp):
 			cfg.Logger.Error("script reap timed out; abandoning child",
-				"name", filepath.Base(path), "pgid", pgid, "give_up", scriptReapGiveUp)
+				"name", filepath.Base(path), "pgid", pid, "give_up", scriptReapGiveUp)
 		}
 		return errors.New("script killed after timeout / cancellation")
 	}
