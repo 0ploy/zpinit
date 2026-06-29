@@ -10,6 +10,15 @@ CGO is disabled and the build uses `-trimpath` plus `-s -w`, producing
 a ~3 MB static binary. The version string is set from
 `git describe --tags --always --dirty`.
 
+Requires Go >= 1.26 (the `go` directive in `go.mod`). CI and the
+release pipeline both install it via `setup-go` with
+`go-version-file: go.mod`, so bumping that one line moves every build.
+The runtime floor matters: zpinit relies on the Go 1.25+ container-
+aware `GOMAXPROCS` (its own scheduler tracks the cgroup CPU quota
+instead of the host core count), and the test suite uses
+`testing/synctest` (1.25+) for deterministic virtual-time concurrency
+tests.
+
 ## Test
 
 ```sh

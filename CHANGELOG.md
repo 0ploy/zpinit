@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **zpinit now respects the container's CPU limit for its own
+  scheduling.** Built on Go 1.26, the supervisor's runtime sizes
+  `GOMAXPROCS` from the cgroup CPU quota instead of the host core
+  count, so a PID 1 pinned to 1-2 CPUs no longer spins up dozens of
+  scheduler threads. No configuration change; purely lower overhead in
+  constrained containers. This is separate from the per-service CPU
+  budget zpinit already exposes to children via `ZPINIT_CPU_*`.
+
 ## v0.5.1
 
 ### Fixed
