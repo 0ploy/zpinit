@@ -57,6 +57,18 @@ func main() {
 		return
 	}
 
+	// supervisord group:process targets (e.g. `restart worker:*`) are
+	// rewritten to native zpinit targets here, client-side, so the
+	// daemon only ever sees native syntax and migrating fleets keep
+	// working against any daemon version. Done before dialing so a
+	// malformed target fails locally without a socket round-trip.
+	translated, err := translateTargets(args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "zpctl: %v\n", err)
+		os.Exit(ctlproto.CodeUnknownService)
+	}
+	args = append(args[:1], translated...)
+
 	conn, err := net.DialTimeout("unix", socket, 5*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "zpctl: connect %s: %v\n", socket, err)
@@ -208,8 +220,8 @@ Common commands:
 NAME refers to a service; for services with replicas > 1, NAME selects
 every replica and NAME/N selects replica N (0..replicas-1).
 
-supervisord group:process targets are accepted for migration: NAME:*
-(and NAME:NAME) select every replica, and NAME:NAME_N selects replica N.
+supervisord group:process targets are also accepted: NAME:* (and
+NAME:NAME) select every replica, and NAME:NAME_N selects replica N.
 
 Socket resolution: --socket PATH, else $ZPINIT_SOCKET, else %s.
 

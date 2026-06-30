@@ -1,17 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **supervisord `name:*` targets now work against an already-running
+  zpinit.** The `group:process` translation added in v0.5.3 ran inside
+  the daemon, so it only took effect once a container was recreated
+  with the new PID 1; existing containers still rejected
+  `zpctl stop worker:*` until then. Translation now happens in `zpctl`
+  itself, before the request is sent, so an updated `zpctl` honors
+  `worker:*` against any running daemon version. No need to recreate
+  long-lived containers to pick up the compatibility shim.
+
 ## v0.5.3
 
 ### Added
 
-- **`zpctl` accepts supervisord `group:process` targets.** For fleets
-  migrating off supervisord, `restart worker:*` (and `worker:worker`)
-  now selects every replica of `worker`, and `worker:worker_N` selects
-  replica `N`, alongside the native `worker` and `worker/N` forms.
-  Symlink `supervisorctl` to `zpctl` and existing `supervisorctl
-  restart name:*` calls keep working unchanged. An unrecognized
-  process suffix is rejected with a clear error rather than silently
-  restarting the whole group.
+- **`zpctl` accepts supervisord `group:process` targets.** `restart
+  worker:*` (and `worker:worker`) now selects every replica of
+  `worker`, and `worker:worker_N` selects replica `N`, alongside the
+  native `worker` and `worker/N` forms. An unrecognized process suffix
+  is rejected with a clear error rather than silently restarting the
+  whole group.
 
 ## v0.5.2
 

@@ -911,55 +911,15 @@ func (s *ControlServer) expandTargets(args []string, allOnEmpty bool) ([]*Runner
 	return out, nil
 }
 
-// translateSupervisorTarget rewrites a supervisord group:process target
-// into zpinit's native form so operators migrating from supervisord can
-// keep their `supervisorctl restart name:*` muscle memory and scripts.
-// A supervisord program maps onto a zpinit service name; its processes
-// map onto replicas. Args without a ':' pass through unchanged.
-//
-//	name:*      -> name      (all replicas; the common "restart the group")
-//	name:name   -> name      (all replicas; the numprocs=1 default where
-//	                          the single process is named after the group)
-//	name:name_N -> name/N     (replica N; the default numprocs>1 naming
-//	                          %(program_name)s_%(process_num)0Nd)
-//
-// Any other process suffix is rejected with a clear error rather than
-// silently widening to the whole group, so a typo or a customized
-// supervisord process_name surfaces instead of restarting everything.
-func translateSupervisorTarget(arg string) (string, error) {
-	group, proc, ok := strings.Cut(arg, ":")
-	if !ok {
-		return arg, nil
-	}
-	switch {
-	case proc == "*", proc == group:
-		return group, nil
-	case strings.HasPrefix(proc, group+"_"):
-		suffix := strings.TrimPrefix(proc, group+"_")
-		idx, err := strconv.Atoi(suffix)
-		if err != nil || idx < 0 {
-			return "", fmt.Errorf("unrecognized supervisord target %q: expected %s:* or %s:%s_<index>", arg, group, group, group)
-		}
-		return group + "/" + strconv.Itoa(idx), nil
-	default:
-		return "", fmt.Errorf("unrecognized supervisord target %q: use %s:* to address every replica", arg, group)
-	}
-}
-
 // resolveTarget interprets a single zpctl arg ("svc" or "svc/N")
 // against the runner snapshot and returns the matching runners.
 // Returns an error on unknown names or out-of-range replica indices.
 //
-// supervisord group:process targets are accepted for migration
-// compatibility and translated to the native forms before resolution
-// (see translateSupervisorTarget). Service names are constrained to
-// [a-zA-Z0-9_-]+, so a ':' in arg is always supervisord syntax and can
-// never collide with a real name.
+// Targets are always native here. supervisord group:process syntax is
+// translated to these forms client-side in zpctl (see
+// translateSupervisorTarget there), so the daemon never sees a ':' and
+// the compatibility shim works against any daemon version.
 func resolveTarget(snap []*Runner, arg string) ([]*Runner, error) {
-	arg, err := translateSupervisorTarget(arg)
-	if err != nil {
-		return nil, err
-	}
 	name, replicaArg, hasSlash := strings.Cut(arg, "/")
 	if hasSlash {
 		idx, err := strconv.Atoi(replicaArg)

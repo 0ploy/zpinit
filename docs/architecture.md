@@ -179,16 +179,20 @@ with `nc` or `socat`.
 State names match supervisorctl exactly (`RUNNING`, `STOPPED`,
 `BACKOFF`, `FATAL`, ...) so existing muscle memory transfers.
 
-Target syntax transfers too. Every verb resolves its service argument
-through `resolveTarget`, whose native forms are `NAME` (all replicas)
-and `NAME/N` (one replica). Before resolution `translateSupervisorTarget`
-rewrites supervisord `group:process` targets so a fleet migrating off
-supervisord keeps working: `NAME:*` and `NAME:NAME` map to all replicas,
-`NAME:NAME_N` (the default `%(program_name)s_%(process_num)0Nd` naming)
-maps to `NAME/N`. Service names are constrained to `[a-zA-Z0-9_-]+`, so a
-`:` is always supervisord syntax and never collides with a real name; an
-unrecognized process suffix is rejected rather than silently widening to
-the whole group.
+Target syntax transfers too. The daemon resolves every verb's service
+argument through `resolveTarget`, which only understands the native
+forms `NAME` (all replicas) and `NAME/N` (one replica). supervisord's
+`group:process` targets are translated to those forms **client-side in
+`zpctl`** (`translateSupervisorTarget`), before the request leaves the
+client: `NAME:*` and `NAME:NAME` map to all replicas, `NAME:NAME_N` (the
+default `%(program_name)s_%(process_num)0Nd` naming) maps to `NAME/N`.
+Service names are constrained to `[a-zA-Z0-9_-]+`, so a `:` is always
+supervisord syntax and never collides with a real name; an unrecognized
+process suffix is rejected client-side rather than silently widening to
+the whole group. Keeping the shim in the client (not the daemon) means
+it works against any daemon version: PID 1 cannot be hot-swapped, so a
+container running an older `zpinit` still honors `worker:*` from an
+updated `zpctl`.
 
 The response status-line `code` maps 1:1 to `zpctl`'s process exit
 status, and the taxonomy is stable for machine consumers: `0` success,

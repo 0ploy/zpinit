@@ -297,11 +297,11 @@ zpctl help
 ```
 
 `NAME` selects a service (all its replicas if `replicas > 1`); `NAME/N`
-selects replica `N`. For migration off supervisord, supervisorctl's
-`group:process` targets are also accepted: `NAME:*` (and `NAME:NAME`)
-select every replica, and `NAME:NAME_N` selects replica `N`. So an
-existing `supervisorctl restart worker:*` keeps working once
-`supervisorctl` is symlinked to `zpctl`.
+selects replica `N`. supervisord's `group:process` target syntax is also
+accepted: `NAME:*` (and `NAME:NAME`) select every replica, and
+`NAME:NAME_N` selects replica `N`. `zpctl` translates these to the
+native forms client-side, so they work against any running `zpinit`
+version.
 
 The socket is resolved from `--socket PATH`, else the `ZPINIT_SOCKET`
 environment variable, else `/run/zpinit.sock`. Set `ZPINIT_SOCKET` once
