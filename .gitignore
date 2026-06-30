@@ -1,4 +1,8 @@
 /bin/
+# Cross-compiled release binaries built at repo root (release assets;
+# the pipeline produces these, they are never committed).
+/zpinit-linux-*
+/zpctl-linux-*
 *.test
 *.out
 *.prof
