@@ -179,6 +179,17 @@ with `nc` or `socat`.
 State names match supervisorctl exactly (`RUNNING`, `STOPPED`,
 `BACKOFF`, `FATAL`, ...) so existing muscle memory transfers.
 
+Target syntax transfers too. Every verb resolves its service argument
+through `resolveTarget`, whose native forms are `NAME` (all replicas)
+and `NAME/N` (one replica). Before resolution `translateSupervisorTarget`
+rewrites supervisord `group:process` targets so a fleet migrating off
+supervisord keeps working: `NAME:*` and `NAME:NAME` map to all replicas,
+`NAME:NAME_N` (the default `%(program_name)s_%(process_num)0Nd` naming)
+maps to `NAME/N`. Service names are constrained to `[a-zA-Z0-9_-]+`, so a
+`:` is always supervisord syntax and never collides with a real name; an
+unrecognized process suffix is rejected rather than silently widening to
+the whole group.
+
 The response status-line `code` maps 1:1 to `zpctl`'s process exit
 status, and the taxonomy is stable for machine consumers: `0` success,
 `1` operation failed, `2` daemon unreachable (set by `zpctl` itself on

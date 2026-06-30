@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -179,6 +180,93 @@ func TestResolveTarget_BadIndex(t *testing.T) {
 	_, err := resolveTarget(snap, "consumer/abc")
 	if err == nil || !strings.Contains(err.Error(), "invalid replica index") {
 		t.Errorf("expected parse error, got %v", err)
+	}
+}
+
+func TestTranslateSupervisorTarget(t *testing.T) {
+	cases := []struct {
+		in, want string
+		wantErr  bool
+	}{
+		// No colon: pass through untouched.
+		{in: "consumer", want: "consumer"},
+		{in: "consumer/2", want: "consumer/2"},
+		{in: "all", want: "all"},
+		// group:* -> all replicas of the group.
+		{in: "consumer:*", want: "consumer"},
+		// group:group (numprocs=1 default) -> all replicas.
+		{in: "consumer:consumer", want: "consumer"},
+		// group:group_N (default numprocs>1 naming) -> replica N.
+		{in: "consumer:consumer_2", want: "consumer/2"},
+		{in: "consumer:consumer_02", want: "consumer/2"},
+		// Group names may contain underscores; anchoring on the group
+		// from the left of the colon keeps the index unambiguous.
+		{in: "my_worker:my_worker_3", want: "my_worker/3"},
+		// Unrecognized process suffix: reject, don't widen to the group.
+		{in: "consumer:other", wantErr: true},
+		{in: "consumer:consumer_x", wantErr: true},
+		{in: "consumer:", wantErr: true},
+	}
+	for _, c := range cases {
+		got, err := translateSupervisorTarget(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("%q: expected error, got %q", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%q: unexpected error %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("%q: got %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestResolveTarget_SupervisorGlobAllReplicas(t *testing.T) {
+	snap := resolveTargetFixture(t)
+	rs, err := resolveTarget(snap, "consumer:*")
+	if err != nil {
+		t.Fatalf("consumer:*: %v", err)
+	}
+	want := []string{"consumer/0", "consumer/1", "consumer/2"}
+	if got := runnerNames(rs); !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestResolveTarget_SupervisorGlobNonReplicated(t *testing.T) {
+	// A single-process service is a supervisord group of one: foo, foo:*
+	// and foo:foo must all resolve to the one runner.
+	snap := resolveTargetFixture(t) // api has no replicas
+	for _, arg := range []string{"api:*", "api:api"} {
+		rs, err := resolveTarget(snap, arg)
+		if err != nil {
+			t.Fatalf("%s: %v", arg, err)
+		}
+		if len(rs) != 1 || rs[0].DisplayName() != "api" {
+			t.Errorf("%s: got %v, want [api]", arg, runnerNames(rs))
+		}
+	}
+}
+
+func TestResolveTarget_SupervisorProcessIndex(t *testing.T) {
+	snap := resolveTargetFixture(t)
+	rs, err := resolveTarget(snap, "consumer:consumer_1")
+	if err != nil {
+		t.Fatalf("consumer:consumer_1: %v", err)
+	}
+	if len(rs) != 1 || rs[0].DisplayName() != "consumer/1" {
+		t.Errorf("got %v", runnerNames(rs))
+	}
+}
+
+func TestResolveTarget_SupervisorUnknownProcess(t *testing.T) {
+	snap := resolveTargetFixture(t)
+	if _, err := resolveTarget(snap, "consumer:bogus"); err == nil || !strings.Contains(err.Error(), "unrecognized supervisord target") {
+		t.Errorf("expected unrecognized-target error, got %v", err)
 	}
 }
 

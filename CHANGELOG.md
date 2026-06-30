@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`zpctl` accepts supervisord `group:process` targets.** For fleets
+  migrating off supervisord, `restart worker:*` (and `worker:worker`)
+  now selects every replica of `worker`, and `worker:worker_N` selects
+  replica `N`, alongside the native `worker` and `worker/N` forms.
+  Symlink `supervisorctl` to `zpctl` and existing `supervisorctl
+  restart name:*` calls keep working unchanged. An unrecognized
+  process suffix is rejected with a clear error rather than silently
+  restarting the whole group.
+
 ## v0.5.2
 
 ### Changed

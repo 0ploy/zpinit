@@ -208,6 +208,9 @@ Common commands:
 NAME refers to a service; for services with replicas > 1, NAME selects
 every replica and NAME/N selects replica N (0..replicas-1).
 
+supervisord group:process targets are accepted for migration: NAME:*
+(and NAME:NAME) select every replica, and NAME:NAME_N selects replica N.
+
 Socket resolution: --socket PATH, else $ZPINIT_SOCKET, else %s.
 
 Exit codes: 0 ok, 1 operation failed, 2 daemon unreachable,
