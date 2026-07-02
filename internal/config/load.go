@@ -13,6 +13,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/0ploy/zpinit/internal/entrypoint"
 	"github.com/0ploy/zpinit/internal/resources"
 )
 
@@ -373,32 +374,20 @@ func applyServiceDefaults(s *Service, g *Globals, reloadOnChangeSet bool) {
 	}
 }
 
-// scanEntrypoint inspects entrypoint.d/ and warns about non-executable files;
-// the file list itself is regenerated at run time, but we want to surface
-// likely mistakes during --check-config.
+// scanEntrypoint inspects entrypoint.d/ and warns about non-executable
+// files; the file list itself is regenerated at run time, but we want to
+// surface likely mistakes during --check-config. Filtering (hidden /
+// .disabled) is delegated to entrypoint.ScanDir so --check-config, --plan,
+// and the runtime agree on which files count.
 func scanEntrypoint(dir string, cfg *Config) error {
-	entries, err := os.ReadDir(dir)
+	entries, err := entrypoint.ScanDir(dir)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("read %s: %w", dir, err)
+		return err
 	}
 	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".disabled") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			return fmt.Errorf("stat %s: %w", filepath.Join(dir, name), err)
-		}
-		if info.Mode()&0o111 == 0 {
+		if !e.Executable {
 			cfg.Warnings = append(cfg.Warnings,
-				fmt.Sprintf("entrypoint.d/%s is not executable; will be skipped at runtime", name))
+				fmt.Sprintf("entrypoint.d/%s is not executable; will be skipped at runtime", e.Name))
 		}
 	}
 	return nil

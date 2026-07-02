@@ -161,7 +161,7 @@ func (o *Orchestrator) scaleUp(filename string, baseEnv []string) {
 		// level config for reload-diff equality; cfg carries the
 		// per-replica log/env rewrites used at spawn time.
 		r := NewRunnerForReplica(perReplica, spec, env, idx, o.spawner, o.clock, o.log)
-		jobs = append(jobs, reloadBootJob{cfg: r.Cfg(), runner: r})
+		jobs = append(jobs, reloadBootJob{runner: r})
 	}
 	if err := o.registerAndBoot(jobs, nil, nil); err != nil {
 		o.log.Warn("autoscale: scale-up refused", "service", spec.Name, "err", err)

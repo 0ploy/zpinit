@@ -104,8 +104,27 @@ Entries lead with a **bold headline** stating what changed (or broke,
 for fixes) followed by 2-4 lines on *what it does now* and *why the
 user cares*. No implementation details (file/lock/function names)
 unless load-bearing for an operator. No marketing language, no "this
-commit", no phase numbers. Internal refactors and CI tweaks live in
-`git log`, not here.
+commit", no phase numbers.
+
+**Not every change earns an entry.** The changelog is the operator's
+release note, not a commit log: it answers "what changed for me?" Be
+selective. When unsure, ask "would an operator running zpinit in
+production want to know this before upgrading?" — if not, it's quiet
+cleanup and belongs in `git log` only.
+
+- *Worth an entry:* new or changed config keys / CLI flags / zpctl
+  verbs; changed default behavior; bug fixes an operator could have
+  hit; anything that changes boot, reload, shutdown, or exit-code
+  semantics; security-relevant changes; new supported platforms or
+  runtimes.
+- *Quiet cleanup (no entry):* internal refactors and dedup that leave
+  behavior identical, test-only changes, comment/doc wording, CI and
+  build-tooling tweaks, dependency bumps with no user-visible effect,
+  performance work with no observable behavior change.
+
+A batch of quiet cleanups does not accumulate into an entry; several
+invisible refactors are still invisible. If a "cleanup" turns out to
+change observable behavior, it was never quiet — give it an entry.
 
 **Cutting a release** (when asked):
 

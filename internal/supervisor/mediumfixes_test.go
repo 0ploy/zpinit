@@ -114,7 +114,7 @@ func TestRunReloadBoots_SkipsRemovedJob(t *testing.T) {
 
 	rA := NewRunner(mustService("a", "10_a.toml", nil), nil, 0, spawn, o.clock, o.log)
 	rB := NewRunner(mustService("b", "20_b.toml", nil), nil, 0, spawn, o.clock, o.log)
-	jobs := []reloadBootJob{{cfg: rA.Cfg(), runner: rA}, {cfg: rB.Cfg(), runner: rB}}
+	jobs := []reloadBootJob{{runner: rA}, {runner: rB}}
 
 	// Hold reloadBootMu so the detached runReloadBoots parks before
 	// job A; that is the window in which a follow-up reload removes A.

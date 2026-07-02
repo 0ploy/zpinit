@@ -48,7 +48,7 @@ func formatStatusJSON(r *Runner, verbose bool) string {
 		State:       mapToSupervisordState(snap.State, snap.Manual),
 		TotalSpawns: snap.TotalSpawns,
 	}
-	if cfg.Replicas.N > 1 || cfg.Replicas.Auto {
+	if cfg.Replicas.IsReplicated() {
 		idx := r.ReplicaIndex()
 		out.ReplicaIndex = &idx
 	}

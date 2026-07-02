@@ -88,7 +88,7 @@ func expandServiceToRunners(svc config.Service, baseEnv []string, spawner Spawne
 	if n < 1 {
 		n = 1
 	}
-	replicated := svc.Replicas.Auto || n > 1
+	replicated := svc.Replicas.IsReplicated()
 	out := make([]*Runner, n)
 	for i := 0; i < n; i++ {
 		perReplica := svc

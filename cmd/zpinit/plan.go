@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/0ploy/zpinit/internal/config"
+	"github.com/0ploy/zpinit/internal/entrypoint"
 	"github.com/0ploy/zpinit/internal/resources"
 	"github.com/0ploy/zpinit/internal/supervisor"
 )
@@ -147,7 +148,7 @@ func printServicePlan(w io.Writer, s config.Service) {
 	// Expanded per-replica log paths. {index} expansion happens here
 	// so the operator sees what they would have seen in /var/log/.
 	if s.Log.Stdout != "" && s.Log.Stdout != "inherit" {
-		if n > 1 || s.Replicas.Auto {
+		if s.Replicas.IsReplicated() {
 			paths := make([]string, 0, n)
 			for i := 0; i < n; i++ {
 				paths = append(paths, config.ReplicaLogPath(s.Log.Stdout, i, true))
@@ -158,7 +159,7 @@ func printServicePlan(w io.Writer, s config.Service) {
 		}
 	}
 	if s.Log.Stderr != "" && s.Log.Stderr != "inherit" {
-		if n > 1 || s.Replicas.Auto {
+		if s.Replicas.IsReplicated() {
 			paths := make([]string, 0, n)
 			for i := 0; i < n; i++ {
 				paths = append(paths, config.ReplicaLogPath(s.Log.Stderr, i, true))
@@ -215,29 +216,17 @@ func dedupStrings(in []string) []string {
 // hidden/disabled/non-executable filtering the entrypoint package
 // itself uses at boot. Pure read; never executes anything.
 func listEntrypointScripts(configDir string) []string {
-	entries, err := os.ReadDir(configDir + "/entrypoint.d")
+	entries, err := entrypoint.ScanDir(configDir + "/entrypoint.d")
 	if err != nil {
 		return nil
 	}
 	var out []string
 	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		n := e.Name()
-		if strings.HasPrefix(n, ".") || strings.HasSuffix(n, ".disabled") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
 		marker := ""
-		if info.Mode()&0o111 == 0 {
+		if !e.Executable {
 			marker = " (NOT EXECUTABLE, would be skipped at runtime)"
 		}
-		out = append(out, n+marker)
+		out = append(out, e.Name+marker)
 	}
-	sort.Strings(out)
 	return out
 }

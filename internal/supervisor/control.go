@@ -474,19 +474,11 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 	// in parallel, mirroring stopAll's parallel-within-group / serial-
 	// between-groups schedule. expandTargets returns replicas of one
 	// service consecutively (resolveTarget walks them in 0..N-1 order),
-	// so simple linear grouping suffices. Without this, `zpctl restart
-	// all` on a service with replicas = 64 took ≈ 64 × stop_timeout
-	// sequentially even though SIGTERM-driven shutdown finishes in one
-	// stop_timeout.
-	for i := 0; i < len(targets); {
-		fn := targets[i].Cfg().Filename
-		j := i
-		for j < len(targets) && targets[j].Cfg().Filename == fn {
-			j++
-		}
-		group := targets[i:j]
-		i = j
-
+	// so groupByFilename yields one group per logical service. Without
+	// this, `zpctl restart all` on a service with replicas = 64 took
+	// ≈ 64 × stop_timeout sequentially even though SIGTERM-driven
+	// shutdown finishes in one stop_timeout.
+	for _, group := range groupByFilename(targets) {
 		bodies := make([]string, len(group))
 		errs := make([]error, len(group))
 		var wg sync.WaitGroup

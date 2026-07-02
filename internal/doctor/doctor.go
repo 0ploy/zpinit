@@ -176,7 +176,7 @@ func checkConfig(configDir string) (*config.Config, []Check) {
 		// via the {index} placeholder) so the operator can confirm
 		// what they get before boot.
 		n := s.Replicas.N
-		if (n > 1 || s.Replicas.Auto) && s.Log.Stdout != "" && s.Log.Stdout != "inherit" {
+		if s.Replicas.IsReplicated() && s.Log.Stdout != "" && s.Log.Stdout != "inherit" {
 			rep := replicasDisplay(s.Replicas)
 			if strings.Contains(s.Log.Stdout, "{index}") {
 				if n > 0 {
@@ -274,7 +274,7 @@ func checkRuntimes(cfg *config.Config) []Check {
 				u = &nodeUsage{configured: cmd, resolved: resolved}
 				nodeUsages[key] = u
 			}
-			if s.Replicas.N > 1 || s.Replicas.Auto {
+			if s.Replicas.IsReplicated() {
 				u.replicaServices++
 			}
 		case "bun":

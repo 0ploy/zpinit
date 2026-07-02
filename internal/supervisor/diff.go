@@ -235,6 +235,31 @@ func envMapsEqual(a, b map[string]string) bool {
 	return true
 }
 
+// groupByFilename splits runners into consecutive same-filename groups,
+// preserving the input order. Input must already be sorted so each
+// service's replicas are adjacent — snapshotRunners (sorted via
+// sortRunners), diff.remove (built filename-sorted by computeDiffLocked),
+// and expandTargets (resolveTarget walks replicas in 0..N-1 order per
+// arg) all satisfy this. It is the single home for the
+// parallel-within-group / serial-between-groups walk that stopAll,
+// applyReloadDiff, and cmdStartStopRestart share; iterate the returned
+// groups forward for boot order or in reverse for dependency-respecting
+// teardown (dependents at higher filenames drain before the dependencies
+// they sit on top of).
+func groupByFilename(rs []*Runner) [][]*Runner {
+	var groups [][]*Runner
+	for i := 0; i < len(rs); {
+		fn := rs[i].Cfg().Filename
+		j := i
+		for j < len(rs) && rs[j].Cfg().Filename == fn {
+			j++
+		}
+		groups = append(groups, rs[i:j])
+		i = j
+	}
+	return groups
+}
+
 // sortRunners orders runners by (Filename, replicaIndex). Filename is
 // the primary boot-order key; replicaIndex is the tiebreaker for
 // services declared with replicas > 1 so `zpctl status` shows

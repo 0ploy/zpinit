@@ -564,19 +564,14 @@ func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, com
 	// deletes both 10_redis and 20_php-fpm the dependent (20_*) drains
 	// before its dependency (10_*) is signaled. Within a group all
 	// replicas are removed in parallel within their stop_timeout.
-	for i := len(diff.remove); i > 0; {
-		fn := diff.remove[i-1].Cfg().Filename
-		j := i
-		for j > 0 && diff.remove[j-1].Cfg().Filename == fn {
-			j--
-		}
-		for _, err := range o.removeServiceGroup(ctx, diff.remove[j:i]) {
+	removeGroups := groupByFilename(diff.remove)
+	for i := len(removeGroups) - 1; i >= 0; i-- {
+		for _, err := range o.removeServiceGroup(ctx, removeGroups[i]) {
 			if err != nil {
 				o.log.Error("reload: remove failed; runner kept registered", "err", err)
 				errs = append(errs, err)
 			}
 		}
-		i = j
 	}
 
 	// Pair restart-new specs with successful removals. p.old already
@@ -619,7 +614,7 @@ func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, com
 	for _, s := range addSpecs {
 		runners := expandServiceToRunners(s, newBaseEnv, o.spawner, o.clock, o.log)
 		for _, r := range runners {
-			jobs = append(jobs, reloadBootJob{cfg: r.Cfg(), runner: r})
+			jobs = append(jobs, reloadBootJob{runner: r})
 		}
 	}
 
@@ -700,11 +695,11 @@ func (o *Orchestrator) registerAndBoot(jobs []reloadBootJob, commitCfg *config.C
 	return nil
 }
 
-// reloadBootJob carries the pre-built runner and its config through
-// Reload's serial boot phase. Built synchronously inside Reload and
-// drained one at a time by runReloadBoots in filename order.
+// reloadBootJob carries a pre-built runner through Reload's serial boot
+// phase. Built synchronously inside Reload and drained one at a time by
+// runReloadBoots in filename order. (The runner already holds its own
+// Cfg(); bootReloadJob reads it from there.)
 type reloadBootJob struct {
-	cfg    config.Service
 	runner *Runner
 }
 
@@ -748,7 +743,6 @@ func (o *Orchestrator) runReloadBoots(root context.Context, jobs []reloadBootJob
 }
 
 func (o *Orchestrator) bootReloadJob(ctx context.Context, j reloadBootJob) {
-	cfg := j.cfg
 	r := j.runner
 	name := r.DisplayName()
 	o.log.Info("reload: booting", "service", name)
@@ -767,24 +761,12 @@ func (o *Orchestrator) bootReloadJob(ctx context.Context, j reloadBootJob) {
 		o.log.Error("reload: added service failed to boot", "service", name, "err", err)
 		return
 	}
-	if cfg.Ready != nil {
-		env := service.MergeEnv(r.BaseEnv(), cfg.Env)
-		if err := waitReady(ctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
-			if cfg.Ready.OnTimeout == config.ReadyContinue {
-				// See bootOne: on_timeout=continue counts as ready
-				// for `zpctl ready` purposes since the operator
-				// declared the probe non-blocking.
-				r.MarkReady()
-				o.log.Warn("reload: readiness failed; continuing per on_timeout",
-					"service", name, "err", err)
-			} else {
-				o.log.Error("reload: added service readiness failed",
-					"service", name, "err", err)
-			}
-		} else {
-			r.MarkReady()
-		}
-	} else {
-		r.MarkReady()
+	// finishReadiness handles the no-probe / probe-pass / on_timeout
+	// paths (and their MarkReady calls) identically to initial boot; the
+	// only reload-specific bit is how a hard readiness failure is
+	// surfaced, which here is a log (the per-runner restart loop handles
+	// recovery) rather than an error return.
+	if err := o.finishReadiness(ctx, r); err != nil {
+		o.log.Error("reload: added service readiness failed", "service", name, "err", err)
 	}
 }

@@ -32,7 +32,7 @@ func TestShutdownLatch_RefusesMutations(t *testing.T) {
 
 	r := NewRunner(config.Service{Name: "late", Filename: "10_late.toml", Command: []string{"true"}},
 		nil, 0, nil, newFakeClock(time.Now()), testLog())
-	err := o.registerAndBoot([]reloadBootJob{{cfg: r.Cfg(), runner: r}}, nil, nil)
+	err := o.registerAndBoot([]reloadBootJob{{runner: r}}, nil, nil)
 	if !errors.Is(err, errShuttingDown) {
 		t.Errorf("registerAndBoot during shutdown: err = %v, want errShuttingDown", err)
 	}

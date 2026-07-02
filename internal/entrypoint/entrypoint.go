@@ -134,7 +134,25 @@ func Run(ctx context.Context, cfg Config) (map[string]string, error) {
 	return env, nil
 }
 
-func listScripts(dir string) ([]string, error) {
+// Entry is one entrypoint.d file that survived the run-parts filtering
+// (dotfiles and *.disabled dropped). Executable reports whether the
+// file has any execute bit set: Run executes only the executable ones,
+// while --check-config and --plan surface the non-executable ones so
+// operators notice a forgotten chmod.
+type Entry struct {
+	Name       string // basename, e.g. "10_migrate.sh"
+	Path       string // dir/name
+	Executable bool
+}
+
+// ScanDir lists a directory's entrypoint.d entries in run order (sorted
+// by name), applying the hidden/.disabled skip. A missing directory is
+// not an error (returns nil, nil). It is the single home for the
+// run-parts filtering rule shared by the runtime (listScripts),
+// --check-config (config.scanEntrypoint), and --plan
+// (listEntrypointScripts) so the three can never disagree on which
+// files would run.
+func ScanDir(dir string) ([]Entry, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -142,7 +160,7 @@ func listScripts(dir string) ([]string, error) {
 		}
 		return nil, fmt.Errorf("read %s: %w", dir, err)
 	}
-	var out []string
+	var out []Entry
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -155,14 +173,30 @@ func listScripts(dir string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		if info.Mode()&0o111 == 0 {
-			// run-parts(8) convention: silently skip non-executable files.
-			// --check-config emits a warning so users notice.
-			continue
-		}
-		out = append(out, filepath.Join(dir, n))
+		out = append(out, Entry{
+			Name:       n,
+			Path:       filepath.Join(dir, n),
+			Executable: info.Mode()&0o111 != 0,
+		})
 	}
-	sort.Strings(out)
+	// Names share the same dir, so name order == path order.
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func listScripts(dir string) ([]string, error) {
+	entries, err := ScanDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		// run-parts(8) convention: silently skip non-executable files.
+		// --check-config emits a warning so users notice.
+		if e.Executable {
+			out = append(out, e.Path)
+		}
+	}
 	return out, nil
 }
 

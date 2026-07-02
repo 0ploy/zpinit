@@ -336,6 +336,41 @@ func (o *Orchestrator) isRegistered(r *Runner) bool {
 	return false
 }
 
+// finishReadiness runs r's [ready] probe (if configured) and marks the
+// runner ready per its on_timeout policy. Called once WaitBootResult has
+// reported Running. Returns nil when the service counts as ready (no
+// probe, probe passed, or on_timeout=continue) and a "readiness:"-wrapped
+// error only when the probe failed under on_timeout=fail.
+//
+// Single home for the env-build + waitReady + MarkReady sequence shared
+// by initial boot (bootOne), `start --wait` (WaitUntilReady), and
+// reload-added services (bootReloadJob): the probe env MUST come through
+// r.BaseEnv() (SetResourceEnv can fire mid-boot) and the on_timeout
+// contract must not drift between the three call sites.
+func (o *Orchestrator) finishReadiness(ctx context.Context, r *Runner) error {
+	cfg := r.Cfg()
+	if cfg.Ready == nil {
+		// No probe: ready as soon as Running, so `zpctl ready` doesn't
+		// have to special-case "no probe" everywhere.
+		r.MarkReady()
+		return nil
+	}
+	env := service.MergeEnv(r.BaseEnv(), cfg.Env)
+	if err := waitReady(ctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
+		if cfg.Ready.OnTimeout == config.ReadyContinue {
+			// The operator opted into "best effort"; count it as ready so
+			// boot / `zpctl ready` don't block forever on a probe the
+			// service explicitly tolerates timing out.
+			r.MarkReady()
+			o.log.Warn("readiness failed; continuing per on_timeout", "service", r.DisplayName(), "err", err)
+			return nil
+		}
+		return fmt.Errorf("readiness: %w", err)
+	}
+	r.MarkReady()
+	return nil
+}
+
 func (o *Orchestrator) bootOne(ctx context.Context, r *Runner) error {
 	cfg := r.Cfg()
 	name := r.DisplayName()
@@ -357,29 +392,11 @@ func (o *Orchestrator) bootOne(ctx context.Context, r *Runner) error {
 		return fmt.Errorf("waiting for running: %w", err)
 	}
 
+	if err := o.finishReadiness(ctx, r); err != nil {
+		return err
+	}
 	if cfg.Ready != nil {
-		env := service.MergeEnv(r.BaseEnv(), cfg.Env)
-		if err := waitReady(ctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
-			if cfg.Ready.OnTimeout == config.ReadyContinue {
-				// Boot proceeds; from a `zpctl ready` standpoint the
-				// operator opted into "best effort" so we count this
-				// as ready (the alternative would block ready forever
-				// on a service that explicitly tolerates probe
-				// timeout).
-				r.MarkReady()
-				o.log.Warn("readiness failed; continuing per on_timeout", "service", name, "err", err)
-				return nil
-			}
-			return fmt.Errorf("readiness: %w", err)
-		}
-		r.MarkReady()
 		o.log.Info("boot: ready", "service", name)
-	} else {
-		// No [ready] configured: the service is considered ready as
-		// soon as it reaches Running, so mark it immediately after
-		// WaitBootResult so `zpctl ready` doesn't have to special-case
-		// "no probe" everywhere.
-		r.MarkReady()
 	}
 	return nil
 }
@@ -411,21 +428,7 @@ func (o *Orchestrator) WaitUntilReady(ctx context.Context, r *Runner) error {
 		return err
 	}
 
-	cfg := r.Cfg()
-	if cfg.Ready == nil {
-		r.MarkReady()
-		return nil
-	}
-	env := service.MergeEnv(r.BaseEnv(), cfg.Env)
-	if err := waitReady(ctx, cfg.Ready, env, cfg.Cwd, o.prober, o.log); err != nil {
-		if cfg.Ready.OnTimeout == config.ReadyContinue {
-			r.MarkReady()
-			return nil
-		}
-		return fmt.Errorf("readiness: %w", err)
-	}
-	r.MarkReady()
-	return nil
+	return o.finishReadiness(ctx, r)
 }
 
 // installExitCodeWatcher (re)installs the watcher goroutine for the
@@ -521,17 +524,12 @@ func (o *Orchestrator) stopAll() {
 	snap := append([]*Runner(nil), o.runners...)
 	o.mu.Unlock()
 
-	// snap is sorted by (filename, replicaIndex). Walk it in reverse,
-	// peeling off groups of consecutive same-filename entries and
-	// stopping each group in parallel.
-	for i := len(snap); i > 0; {
-		fn := snap[i-1].Cfg().Filename
-		j := i
-		for j > 0 && snap[j-1].Cfg().Filename == fn {
-			j--
-		}
-		o.stopRunnerGroup(context.Background(), snap[j:i])
-		i = j
+	// snap is sorted by (filename, replicaIndex). Tear groups down in
+	// reverse filename order so dependents drain before the dependencies
+	// they sit on top of; replicas within a group stop in parallel.
+	groups := groupByFilename(snap)
+	for i := len(groups) - 1; i >= 0; i-- {
+		o.stopRunnerGroup(context.Background(), groups[i])
 	}
 }
 

@@ -43,6 +43,15 @@ func (r *Replicas) UnmarshalTOML(v interface{}) error {
 	return fmt.Errorf("replicas: must be integer or \"auto\", got %T", v)
 }
 
+// IsReplicated reports whether this service expands into per-replica
+// runners: multiple static copies, or any auto service. Auto is always
+// treated as replicated even at a resolved N of 1 (see
+// expandServiceToRunners), so replica 0's env and {index} log paths
+// look the same before and after a 1-to-N scale-up. Value receiver,
+// mirroring Service.IsReloadable, so callers holding a Replicas by
+// value can call it directly.
+func (r Replicas) IsReplicated() bool { return r.Auto || r.N > 1 }
+
 // MarshalText lets the type round-trip through toml encoding for
 // human-readable output (zpctl status / --check-config diff). Not
 // load-bearing for production decode; we keep it tiny.
