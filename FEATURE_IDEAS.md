@@ -4,7 +4,8 @@ Brainstorm of features that would expand zpinit's value across all three
 modes. Items 1-10 started life as "what could mode 1 (Single Process Mode)
 offer beyond fleet uniformity and config validation"; many turn out to apply
 in modes 2 and 3 too. Items 11+ are a deeper pass on mode 2 (Setup, then
-Run Mode) specifically.
+Run Mode) specifically. Items 31-35 came out of the 2026-07 deep
+reliability review (operator and fleet ergonomics).
 
 Status of every entry: under discussion. None are committed. The purpose of
 this file is to have a written record so we can come back, sharpen, accept,
@@ -1047,6 +1048,179 @@ Open questions:
   `[[log_forward]]` to be container-scope (in `zpinit.toml`) rather
   than service-scope, applied across modes.
 
+## 31. Reload dry-run: `zpctl update --dry-run`
+
+Show what a reload would do without applying it: which services would be
+added, removed, restarted, or left untouched, plus which files would be
+skipped as invalid.
+
+```
+$ zpctl update --dry-run
+add      40_worker        (services/40_worker.toml)
+restart  20_php-fpm       (command changed)
+remove   30_cron
+skip     50_broken.toml   (invalid TOML: line 12: expected key)
+no-op    10_redis
+```
+
+The reload diff engine already computes exactly these sets; this exposes
+the plan without executing it. Complements the shipped `zpinit --plan`
+(item 18), which is the boot-time resolved plan; this is its runtime
+reload counterpart.
+
+Fleet value: preview a config rollout on one shop container before
+pushing it to 130. Today the only way to learn what a reload will do is
+to run it.
+
+Open questions:
+
+- Output format: human table plus `--json` NDJSON, mirroring
+  `zpctl status`?
+- The plan is advisory: state can change between dry-run and the real
+  `update`. Take a read-only snapshot (no `reloadMu` hold) and document
+  the race, or hold the lock briefly for a consistent view?
+- Restart reasons ("command changed") require the diff to report which
+  field differed; today it only reports that specs differ. Worth the
+  extra plumbing for operator clarity?
+
+## 32. OOM-kill attribution
+
+When the kernel OOM-kills a child, zpinit today sees an anonymous
+SIGKILL: `exit code=137 signal=KILL` with no indication the kernel did
+it. As PID 1, zpinit can check the container cgroup's `memory.events`
+(v2) or `memory.oom_control` (v1) counters at reap time and attribute
+the kill:
+
+```
+[zpinit] service php-fpm/3 exit signal=KILL oom_killed=true lifetime=2h4m
+```
+
+Surfaced in logs, `zpctl status --verbose`, the status `--json` output,
+and the audit trail (item 23) once that exists.
+
+Why: for memory-heavy PHP and Node shop workloads, "was that crash an
+OOM kill or something else" is the first triage question, and today it
+requires host-level dmesg access the operator usually doesn't have.
+supervisord and PM2 can't answer it either; PID 1 with cgroup access is
+uniquely placed to.
+
+Related: the mid-tier "RSS-growth warnings" idea is the early-warning
+side of the same story; this item is the post-mortem side.
+
+Open questions:
+
+- cgroup v2 `memory.events` vs. v1 `memory.oom_control`: support both,
+  or v2 only (document the v1 gap)?
+- Attribution is a heuristic when several children die near-simultaneously:
+  the counter is cgroup-wide, not per-PID. Delta plus SIGKILL plus
+  timing is usually enough; expose as `oom_killed=likely` when
+  ambiguous, or keep a boolean and accept rare misattribution?
+- Kernel logs (`/dev/kmsg`) name the exact victim PID but need
+  CAP_SYSLOG and parsing; worth it as a refinement, or stick to
+  counters?
+
+## 33. Live event stream: `zpctl events`
+
+Stream supervisor events (spawn, ready, exit, backoff, fatal, scale
+up/down, reload applied, shutdown begun) over the control socket as
+they happen, one NDJSON object per line:
+
+```
+$ zpctl events
+{"ts":"...","service":"redis","event":"exit","pid":42,"code":137,"oom_killed":true}
+{"ts":"...","service":"redis","event":"spawn","pid":51,"attempt":2}
+{"ts":"...","service":"redis","event":"ready","pid":51,"duration_ms":420}
+```
+
+Reuses the streaming protocol extension shipped for `zpctl tail
+--follow` (read deadline cleared, per-drain write deadline, terminator
+written by `handleStream`). Stays inside the no-metrics-endpoint
+non-goal: same root-only socket, pull-based, no listener.
+
+Why: fleet monitoring for 130+ shops currently has to poll
+`zpctl status` per container. A push stream turns "notice the crash
+loop within the polling interval" into "see it as it happens", with
+restart reasons attached.
+
+Relation to item 23 (audit trail): audit is the historical query
+surface, events is the live push surface. They should share one event
+bus internally; item 23's ring buffer is what a `--since` replay flag
+would read from.
+
+Open questions:
+
+- Slow-consumer policy: never block the supervisor. Drop events and
+  emit a gap marker (`{"event":"gap","dropped":12}`), sized by a small
+  per-connection buffer?
+- Event schema stability: version field from day one, or document
+  best-effort until it settles?
+- Filtering (`zpctl events redis`, `--type=exit`): v1 or later? Server-
+  side filtering is cheap and saves fleet-tooling parsing.
+
+## 34. TCP readiness probe: `[ready] connect`
+
+Today `[ready]` only supports exec probes, so answering "is the port
+open yet" requires `redis-cli`, `curl`, or `nc` inside the image. A
+TCP connect probe removes that dependency:
+
+```toml
+[ready]
+connect  = "127.0.0.1:6379"
+interval = "500ms"
+timeout  = "30s"
+```
+
+Stdlib-only (`net.DialTimeout`), a few dozen lines, and it kills a
+whole class of "install a client tool just for the healthcheck" image
+bloat in minimal images.
+
+Shares the probe package that item 1 (`[[wait]]`) and item 20
+(`[live]`) define, so `connect` becomes available in all three probe
+surfaces for one implementation cost.
+
+Deliberately skipping HTTP probes: more surface (status codes, TLS,
+redirects, headers), and exec-with-curl covers the rare case where TCP
+accept isn't enough.
+
+Open questions:
+
+- TCP accept can succeed before the app is truly ready (listener up,
+  worker pool not). Good enough as an opt-in, or add optional
+  `send`/`expect` bytes? v1: connect-only; document the limitation.
+- `connect` and `command` in the same `[ready]` block: refuse at
+  validation (exactly one), or run both? Refusing is simpler and
+  clearer.
+- Hostname resolution: allow names or restrict to IP:port? Names pull
+  in resolver behavior inside the probe loop; IP-only is more
+  predictable for a localhost-oriented check.
+
+## 35. Operator troubleshooting runbook: `docs/troubleshooting.md`
+
+Not a code feature: a symptom-to-cause runbook for operators debugging
+a live container. Much of this knowledge exists today only in
+`CLAUDE.md` gotchas (agent-facing) or in heads. Candidate entries:
+
+- Service crash-loops to FATAL with EADDRINUSE: listener replicas
+  without app-level `SO_REUSEPORT` opt-in; run `zpinit --doctor`.
+- Service won't die on stop: child in uninterruptible kernel sleep
+  (D state); what the bounded post-SIGKILL reap wait does and what to
+  check on the host.
+- Whole container exits after a reload: the `exit_code_from`-watched
+  service was removed by that reload.
+- Reload appears to ignore a file: it failed parse/validation and was
+  skipped; where the skip is reported.
+- Boot hangs on one service: `[ready]` probe never passes; how
+  `boot_timeout` and `on_timeout` interact.
+- `zpctl` gets connection refused / permission denied: socket perms
+  and the peer-cred gate; must be same UID as the daemon.
+
+Open questions:
+
+- Sync discipline: several entries restate `CLAUDE.md` gotchas in
+  operator language. Add a convention that a new gotcha with operator-
+  visible symptoms gets a runbook entry in the same commit?
+- Structure: one symptom-indexed page, or per-mode sections?
+
 ## Mid-tier mode-3 ideas (no dedicated section)
 
 - **Service groups** (`group = "web"`) plus `zpctl restart --group web`.
@@ -1206,3 +1380,18 @@ to the in-config-interpolation discussion. Best shipped after both are
 settled.
 
 Mid-tier mode-3 items: ship opportunistically; none are blockers.
+
+Within the reliability-review cluster (items 31-35):
+
+- (32) OOM-kill attribution: highest operator value per line of code
+  for memory-heavy shop workloads; answers the first triage question
+  after a crash. Small surface (cgroup counter read at reap time).
+- (31) reload dry-run: the diff engine already exists; this is mostly
+  an output surface. High fleet-rollout value.
+- (35) troubleshooting runbook: pure docs, cheap, do anytime.
+- (34) TCP ready probe: small and useful on its own, but best shipped
+  together with the shared probe package that items 1 and 20 need, so
+  the `connect` type lands in all three probe surfaces at once.
+- (33) `zpctl events`: high fleet value but should share an event bus
+  with (23) audit/crashlog; design the two together rather than
+  bolting one onto the other.
