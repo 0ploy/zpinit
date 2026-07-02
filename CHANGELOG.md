@@ -1,5 +1,90 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Services can no longer be spawned into a shutdown.** A reload
+  boot, autoscale commit, or `zpctl start` that landed while zpinit
+  was tearing down could spawn a child after its service group had
+  already been stopped; nothing stopped it again and it was
+  hard-killed when PID 1 exited, skipping its graceful stop. All
+  mutating operations are now refused once shutdown begins (`zpctl`
+  reports "supervisor is shutting down"), and the control socket
+  closes as soon as the shutdown signal arrives. Also removes a rare
+  crash window when a resource change coincided with shutdown.
+
+- **Config validation catches more values that explode at runtime.**
+  Negative durations (`stop_timeout = "-5s"`, `boot_timeout = "-1s"`
+  and friends) previously passed `--check-config` and then caused
+  instant SIGKILL escalation or guaranteed boot failures; they are
+  now rejected at load. An explicit `replicas = 0` was silently
+  coerced to one running copy; it is now an error (park a service by
+  renaming its file to `*.disabled`).
+
+- **Autoscale can no longer corrupt the replica set when it races a
+  config reload.** A reload restarting or removing an auto-scaled
+  service in the window between the scaler planning a rebalance and
+  applying it could register stale-spec replicas with duplicate
+  replica indices; the extra replicas served traffic indefinitely
+  because index-based scale-down could never select them. Scale
+  actions now re-validate against the live config before applying,
+  and new replicas take the lowest free index instead of assuming a
+  gap-free sequence.
+
+- **`docker stop` during entrypoint.d now aborts provisioning
+  promptly and honestly.** Previously each remaining script was
+  still started (and immediately signaled), serially burning the
+  stop grace period, and a script that trapped SIGTERM and exited 0
+  let the boot carry on in a container that was told to stop. A
+  timed-out script that exits 0 after SIGTERM also counted as
+  success, so `entrypoint_on_failure = "fail"` never fired; timeouts
+  are now failures regardless of the script's exit code.
+
+- **A config reload during initial boot can no longer kill the
+  container.** `zpctl update` or SIGHUP removing a service that the
+  boot sequence had not reached yet made boot fail on the stale
+  entry and exit the whole container with code 1. Removed services
+  are now skipped during boot, and reload-added services wait until
+  initial boot finishes before booting themselves, preserving the
+  boot-order guarantee.
+
+- **SIGQUIT now shuts down gracefully; SIGUSR1/SIGUSR2 no longer
+  kill the container.** `docker kill -s QUIT` (the supervisord habit
+  for graceful shutdown) previously hit the Go runtime default: a
+  goroutine dump and immediate death with every service hard-killed.
+  It now behaves exactly like SIGTERM. Stray SIGUSR1/SIGUSR2 are
+  discarded instead of fatal, and a SIGHUP arriving while
+  entrypoint.d scripts are still running is ignored instead of
+  killing PID 1 mid-provisioning.
+
+- **`replicas = "auto"` now honors the 64-replica safety cap.** The
+  documented fork-bomb guard was only enforced for static replica
+  counts; an auto service without `replicas_max` in a container
+  without a CPU quota on a large host (96+ cores) booted one replica
+  per host core. Auto targets are now clamped to 64, and a
+  `replicas_min` above the cap is rejected at config load instead of
+  being silently reduced.
+
+- **Fast-finishing one-off workers no longer fail container
+  startup.** A `restart = "never"` service (the documented pattern
+  for migrations and one-off tasks) that exited cleanly within
+  milliseconds could be seen by the boot sequence as "stopped before
+  boot completed", failing the whole container with exit 1 instead
+  of propagating the worker's exit code. Whether a fast one-off
+  booted or killed the container was a scheduling coin flip; a clean
+  early exit now counts as a successful boot. Crashes (non-zero
+  exit) during boot still fail as before.
+
+- **`zpctl tail --follow` no longer leaks resources in PID 1.** A
+  follower that disconnected while the tailed log was idle was never
+  noticed; the server kept its stream goroutine and file descriptors
+  alive until shutdown, and repeated follows (cron wrappers, watchdog
+  scripts) could exhaust PID 1's descriptor limit over weeks of
+  uptime. Disconnects now end the stream within milliseconds. A
+  second leak of one log descriptor per follow that spanned a log
+  rotation is fixed as well.
+
 ## v0.5.4
 
 ### Fixed

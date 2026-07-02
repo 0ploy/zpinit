@@ -31,6 +31,13 @@ func ComputeAutoTarget(s config.Service, snap resources.Snapshot) int {
 	if s.ReplicasMax > 0 && target > s.ReplicasMax {
 		target = s.ReplicasMax
 	}
+	// The fork-bomb guard applies to auto mode too: without a
+	// replicas_max, an unquota'd container on a 96-core host would
+	// otherwise boot 96 replicas per auto service. replicas_min is
+	// validated <= MaxReplicas at load time, so clamping last is safe.
+	if target > config.MaxReplicas {
+		target = config.MaxReplicas
+	}
 	if target < 1 {
 		target = 1
 	}

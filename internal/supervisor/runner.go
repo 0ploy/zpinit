@@ -498,6 +498,33 @@ func (r *Runner) LastExit() reaper.ExitInfo {
 	return r.lastExit
 }
 
+// CompletedCleanly reports whether the runner reached Stopped by its
+// child exiting cleanly (exit 0, not signaled) under a restart policy
+// that does not restart clean exits, without an operator Stop. The
+// boot paths use it to count a fast-finishing one-off (the blessed
+// `restart = "never"` + `exit_code_from` worker pattern) as boot
+// success: such a worker can reach Stopped before WaitBootResult
+// looks, and treating that as "stopped before boot completed" made
+// container startup a scheduling coin flip.
+func (r *Runner) CompletedCleanly() bool {
+	if r.State() != StateStopped {
+		return false
+	}
+	if r.cfg.Restart == config.RestartAlways {
+		// A clean exit under restart=always never settles in Stopped;
+		// a Stopped always-service was stopped some other way.
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stoppedManually {
+		return false
+	}
+	// PID != 0 proves a real reaped exit: the zero-value lastExit of a
+	// never-spawned runner must not read as a clean completion.
+	return r.lastExit.PID != 0 && !r.lastExit.Signaled && r.lastExit.ExitCode == 0
+}
+
 // Status is a tear-free snapshot of a Runner's externally-observable
 // state at one instant. Every field is read under a single r.mu
 // critical section, so callers rendering a status line never see a

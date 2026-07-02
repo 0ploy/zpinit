@@ -396,6 +396,65 @@ control_socket = "%s"
 	}
 }
 
+// SIGQUIT is graceful shutdown (supervisord parity), and stray
+// SIGUSR1/SIGUSR2 must not kill PID 1 (the Go default for un-notified
+// signals is process death).
+func TestSuperviseSignalDispositions(t *testing.T) {
+	cfg := t.TempDir()
+	// Short MkdirTemp path, not t.TempDir(): the test name would push
+	// the socket path past macOS's 104-char sun_path limit.
+	sockDir, err := os.MkdirTemp("", "zp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	socket := filepath.Join(sockDir, "zpinit.sock")
+	writeFile(t, filepath.Join(cfg, "zpinit.toml"), fmt.Sprintf(`
+control_socket = "%s"
+`, socket))
+
+	envFile := filepath.Join(t.TempDir(), "env")
+	cmd := exec.Command(zpinitBin, "--config", cfg)
+	cmd.Env = append(os.Environ(), "ZPINIT_ENV_FILE="+envFile)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(syscall.SIGKILL)
+		_ = cmd.Wait()
+	})
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(socket); err == nil {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if _, err := os.Stat(socket); err != nil {
+		t.Fatalf("control socket never appeared; stderr:\n%s", stderr.String())
+	}
+
+	// USR1/USR2 are discarded, not fatal.
+	_ = cmd.Process.Signal(syscall.SIGUSR1)
+	_ = cmd.Process.Signal(syscall.SIGUSR2)
+	time.Sleep(200 * time.Millisecond)
+	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("zpinit died on SIGUSR1/SIGUSR2: %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	// SIGQUIT shuts down gracefully (exit 0, no goroutine dump).
+	_ = cmd.Process.Signal(syscall.SIGQUIT)
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("zpinit exit on SIGQUIT: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "goroutine ") {
+		t.Errorf("SIGQUIT produced a goroutine dump; want graceful shutdown:\n%s", stderr.String())
+	}
+}
+
 // #20: supervise mode actually runs services in filename order, stays
 // alive as PID 1's stand-in, and shuts them down cleanly on SIGTERM.
 func TestSuperviseMode(t *testing.T) {

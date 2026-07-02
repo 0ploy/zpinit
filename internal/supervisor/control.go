@@ -176,6 +176,20 @@ func (s *ControlServer) handleConn(conn net.Conn) {
 		}
 		streamCtx, streamCancel := context.WithCancel(parent)
 		defer streamCancel()
+		// Disconnect watcher. The protocol is one request per
+		// connection, so any read result (EOF on client close, stray
+		// data, error) means the stream is over. Without this, a
+		// client that disconnects while the tailed file is idle is
+		// never noticed: disconnect is otherwise only visible through
+		// a failed body write, and writes happen only when the file
+		// grows, so the stream goroutine and its socket + log FDs
+		// would live until supervisor shutdown. The blocking Read is
+		// unblocked by the deferred conn.Close above, so the watcher
+		// cannot outlive the connection.
+		go func() {
+			_, _ = conn.Read(make([]byte, 1))
+			streamCancel()
+		}()
 		s.handleStream(streamCtx, conn, pc, req)
 		return
 	}
@@ -442,6 +456,12 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 	if wait && action == "stop" {
 		return errResp("--wait is only valid for start and restart")
 	}
+	// Verbs that bring services up are refused once teardown has
+	// begun: a start landing during stopAll would spawn a child the
+	// teardown never revisits. stop stays allowed; it can only help.
+	if action != "stop" && s.orch.isStopping() {
+		return errRespFor(errShuttingDown)
+	}
 	targets, err := s.expandTargets(args, false)
 	if err != nil {
 		return errRespFor(err)
@@ -473,6 +493,7 @@ func (s *ControlServer) cmdStartStopRestart(ctx context.Context, args []string, 
 		for k, r := range group {
 			wg.Add(1)
 			go func(k int, r *Runner) {
+				defer recoverLog(s.log, "control "+action)
 				defer wg.Done()
 				name := r.DisplayName()
 				switch action {

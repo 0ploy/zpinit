@@ -207,6 +207,58 @@ echo "OVERRIDE=from-script" >> "`+envFile+`"
 	}
 }
 
+// A script that traps TERM and exits 0 must not convert a timeout
+// into success: on_failure = "fail" has to fire anyway.
+func TestRun_TimeoutWithCleanTrapExitStillFails(t *testing.T) {
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "ep")
+	writeExec(t, filepath.Join(dir, "10-trap.sh"), "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 30\n")
+
+	_, err := Run(context.Background(), Config{
+		Dir:           dir,
+		OnFailure:     Fail,
+		ScriptTimeout: 200 * time.Millisecond,
+		KillGrace:     2 * time.Second,
+		Logger:        discardLogger(),
+	})
+	if err == nil {
+		t.Fatal("expected timeout error despite trap exiting 0")
+	}
+	if !strings.Contains(err.Error(), "timeout") {
+		t.Errorf("error should name the timeout, got: %v", err)
+	}
+}
+
+// Cancellation (docker stop during provisioning) aborts the whole
+// sequence: remaining scripts must not run, even when the signaled
+// script exits 0 and on_failure is "continue".
+func TestRun_CancelAbortsSequence(t *testing.T) {
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "ep")
+	marker := filepath.Join(tmp, "marker")
+	writeExec(t, filepath.Join(dir, "10-trap.sh"), "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 30\n")
+	writeExec(t, filepath.Join(dir, "20-after.sh"), "#!/bin/sh\ntouch "+marker+"\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(300 * time.Millisecond) // let 10-trap.sh start
+		cancel()
+	}()
+	_, err := Run(ctx, Config{
+		Dir:           dir,
+		OnFailure:     Continue, // must NOT override the stop request
+		ScriptTimeout: 30 * time.Second,
+		KillGrace:     2 * time.Second,
+		Logger:        discardLogger(),
+	})
+	if err == nil {
+		t.Fatal("expected cancellation error")
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Error("20-after.sh ran after cancellation; sequence must abort")
+	}
+}
+
 func TestRun_TimeoutKills(t *testing.T) {
 	tmp := t.TempDir()
 	dir := filepath.Join(tmp, "ep")

@@ -84,7 +84,10 @@ func streamFile(ctx context.Context, conn net.Conn, pc *ctlproto.Conn, path stri
 		_ = pc.WriteBodyLine(fmt.Sprintf("zpinit: %v", err))
 		return
 	}
-	defer f.Close()
+	// Late-bound close: the rotation branch below reassigns f, and a
+	// plain `defer f.Close()` would pin the pre-rotation handle,
+	// leaking the reopened file's FD on every return after a rotation.
+	defer func() { f.Close() }()
 
 	// Emit the last initialTail bytes as the snapshot, just like
 	// one-shot `tail`. Pin the offset to the start of the first

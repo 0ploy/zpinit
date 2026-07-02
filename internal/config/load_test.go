@@ -513,8 +513,44 @@ command = ["x"]
 replicas = -1
 `)
 	msg := loadExpectSkip(t, dir)
-	if !strings.Contains(msg, "replicas") || !strings.Contains(msg, "non-negative") {
-		t.Errorf("skip error should mention replicas non-negative: %v", msg)
+	if !strings.Contains(msg, "replicas") || !strings.Contains(msg, ">= 1") {
+		t.Errorf("skip error should mention replicas >= 1: %v", msg)
+	}
+}
+
+// An explicit `replicas = 0` must be rejected, not silently coerced
+// to 1 by applyServiceDefaults: an operator writing 0 to park a
+// service would otherwise get one running copy.
+func TestLoad_ReplicasZeroRejected(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `
+command = ["x"]
+replicas = 0
+`)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "replicas") || !strings.Contains(msg, ">= 1") {
+		t.Errorf("skip error should mention replicas >= 1: %v", msg)
+	}
+}
+
+// Negative durations parse ("-5s") but are born-expired contexts or
+// instant SIGKILL escalations at runtime; --check-config must reject
+// them.
+func TestLoad_NegativeDurationsRejected(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_a.toml"), `
+command = ["x"]
+stop_timeout = "-5s"
+`)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "stop_timeout") {
+		t.Errorf("skip error should mention stop_timeout: %v", msg)
+	}
+
+	dir2 := t.TempDir()
+	write(t, filepath.Join(dir2, "zpinit.toml"), `boot_timeout = "-1s"`)
+	if _, err := Load(dir2); err == nil || !strings.Contains(err.Error(), "boot_timeout") {
+		t.Errorf("Load should fail on negative boot_timeout, got: %v", err)
 	}
 }
 
@@ -764,6 +800,19 @@ command = ["x"]
 replicas = "auto"
 replicas_min = 8
 replicas_max = 4
+`)
+	msg := loadExpectSkip(t, dir)
+	if !strings.Contains(msg, "replicas_min") {
+		t.Errorf("skip error should mention replicas_min: %v", msg)
+	}
+}
+
+func TestLoad_ReplicasAutoMinOverGlobalCap(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "services", "10_w.toml"), `
+command = ["x"]
+replicas = "auto"
+replicas_min = 100
 `)
 	msg := loadExpectSkip(t, dir)
 	if !strings.Contains(msg, "replicas_min") {

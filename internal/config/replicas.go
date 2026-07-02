@@ -24,8 +24,12 @@ type Replicas struct {
 func (r *Replicas) UnmarshalTOML(v interface{}) error {
 	switch x := v.(type) {
 	case int64:
-		if x < 0 {
-			return fmt.Errorf("replicas: must be non-negative, got %d", x)
+		// 0 is rejected here rather than in validation because
+		// applyServiceDefaults turns an unset (zero) N into 1: an
+		// explicit `replicas = 0` would silently become one running
+		// copy, the opposite of what the operator asked for.
+		if x < 1 {
+			return fmt.Errorf("replicas: must be >= 1 (got %d); to park a service, rename the file to *.disabled", x)
 		}
 		r.N = int(x)
 		return nil

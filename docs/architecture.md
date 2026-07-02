@@ -46,12 +46,16 @@ consecutive crashes (FATAL). The retry budget is hardcoded
    `ZPINIT_CPU_COUNT`, `ZPINIT_CPU_QUOTA`, and `ZPINIT_MEMORY_BYTES`
    at the top of the env precedence chain so neither container env
    nor entrypoint scripts can shadow the detected values. Validation
-   rejects the keys in any operator `[env]` table. Detection is
-   one-shot at boot; live updates land in a later release.
+   rejects the keys in any operator `[env]` table. A resource watcher
+   keeps polling after boot and commits debounced deltas (env
+   updates, `reload_on_change` fanout, `replicas = "auto"`
+   rebalancing). The `[resources]` reservation values themselves are
+   read once at boot; changing them requires a container restart.
 4. **Service boot.** In supervise mode, services start in filename
-   order. Each readiness probe blocks the next service's start. The
-   `boot_timeout` budget covers the whole phase, starting when this
-   step begins (not at zpinit launch).
+   order. Each readiness probe blocks the next service's start.
+   `boot_timeout` is a per-service budget: each service gets its own
+   window, so a legitimately slow first service cannot starve later
+   services of their probe time.
 
 ## Reload
 
@@ -130,7 +134,16 @@ arguments stays a backwards-compatible alias for `update`
 
 ## Shutdown
 
-`SIGTERM` or `SIGINT` to PID 1 triggers `stopAll`. Services are
+`SIGTERM`, `SIGINT`, or `SIGQUIT` to PID 1 triggers `stopAll`
+(`SIGQUIT` for supervisord parity: operators use `kill -QUIT` there
+for graceful shutdown). `SIGUSR1`/`SIGUSR2` are discarded rather than
+left at the Go default of killing the process; `SIGHUP` during the
+entrypoint phase is discarded too (reload only makes sense once
+services are supervised). Once shutdown begins, mutating control
+verbs (`start`, `restart`, `update`, reloads, autoscale commits) are
+refused and the control socket stops accepting connections, so no
+service can be spawned into a teardown that would never stop it
+gracefully. Services are
 teardown'd by filename group, in reverse filename order. Between
 groups the teardown is sequential: filename order encodes dependency
 order during boot, so reverse-serial between groups lets dependents

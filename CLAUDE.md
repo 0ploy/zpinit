@@ -142,8 +142,8 @@ commit", no phase numbers. Internal refactors and CI tweaks live in
 
 - **Orchestrator lock discipline.** `o.runners`, `.cfg`, `.baseEnv`,
   `.runnerCtx`, `.wg`, `.earlyShutdownCh`, `.shutdownOnce`,
-  `.watcherCancel`, and `.watcherGen` are protected by `o.mu`
-  (RWMutex). `o.reloadMu` serializes Reload-vs-Reload AND
+  `.watcherCancel`, `.watcherGen`, and `.stopping` are protected by
+  `o.mu` (RWMutex). `o.reloadMu` serializes Reload-vs-Reload AND
   Reload-vs-watcher-driven autoscale: `OnResourceChange` holds it
   across the `SetResourceEnv → SetCurrentSnapshot → planAutoScale`
   triad so a SIGHUP racing with a watcher commit can't observe a
@@ -152,13 +152,39 @@ commit", no phase numbers. Internal refactors and CI tweaks live in
   actual scale teardown/boot (`applyAutoScale`) runs OUTSIDE `reloadMu`
   because scale-down blocks on `stop_timeout` and would otherwise
   freeze every operator reload for that window. The split is safe
-  because the `(snapshot, Replicas.N)` pair is consistent once
-  `planAutoScale` returns and `Reload` never diffs an auto service's
-  replica count (`servicesEqual` ignores auto `N`; the scaler owns it).
+  because both directions RE-VALIDATE against the live
+  `(o.cfg, o.runners)` pair instead of trusting the planned action:
+  `scaleUp` re-acquires `reloadMu` for its (cheap, non-blocking)
+  registration and re-reads spec/target/running via
+  `currentAutoState`; `scaleDown` re-snapshots victims the same way.
+  Don't revert to applying the planned `(spec, running, target)`
+  verbatim: a Reload restarting the service between plan and apply
+  would then register old-spec runners with duplicate replica
+  indices, a state the `index >= target` victim selection can never
+  undo. `scaleUp` allocates the smallest FREE indices (a partial
+  scale-down failure leaves holes; `len(running)`-based allocation
+  mints a still-live index). `Reload` also never diffs an auto
+  service's replica count (`servicesEqual` ignores auto `N`; the
+  scaler owns it).
   The fanout reload runs outside `reloadMu` because per-runner reloads
   only touch that runner's state. External
   readers must use `snapshotRunners()`; iterating the live slice while
   Reload mutates it is a data race confirmed by `go test -race`.
+
+- **Shutdown latch.** `stopAll` sets `o.stopping` (under `o.mu`, in
+  the same critical section as its teardown snapshot) and the next
+  `Run` resets it. Every path that can register or start a runner
+  checks it: `Reload`/`ReloadScoped` at entry, `registerAndBoot`
+  under the registration lock, `runReloadBoots` per job, the control
+  `start`/`restart` verbs, and `OnResourceChange`. A runner
+  registered after stopAll's snapshot is never stopped gracefully
+  (Pdeathsig SIGKILL at PID-1 exit), so refusal is the only safe
+  answer. `OnResourceChange` must do its `wg.Add` inside the same
+  `o.mu` section as the stopping check: an unlocked Add can race
+  Run's deferred `wg.Wait` at zero counter, which panics.
+  `stopRunnerGroup` deliberately does NOT skip Pending runners: a
+  queued `cmdStart` (cmds is buffered) can still spawn one, and the
+  FIFO queued stop is what tears that child down again.
 
 - Boot paths that need a runner's current baseEnv (readiness probe env
   in `bootOne` / `bootReloadJob`) MUST go through `r.BaseEnv()`, not a

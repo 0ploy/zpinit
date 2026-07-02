@@ -435,6 +435,15 @@ func validate(cfg *Config) error {
 	if cfg.Globals.Resources.ScaleDownAfter < 0 {
 		errs = append(errs, "[resources].scale_down_after must be >= 0")
 	}
+	// Negative durations parse fine ("-5s") but are born-expired
+	// contexts or instant SIGKILL escalations at runtime; a config
+	// that passes --check-config must not fail every boot.
+	if cfg.Globals.BootTimeout < 0 {
+		errs = append(errs, "boot_timeout must be >= 0")
+	}
+	if cfg.Globals.EntrypointScriptTimeout < 0 {
+		errs = append(errs, "entrypoint_script_timeout must be >= 0")
+	}
 
 	// Cross-service checks operate only on services that survived
 	// per-file validation (validateService ran during load). A name
@@ -514,6 +523,9 @@ func validateService(s *Service) []string {
 		if s.ReplicasMax > MaxReplicas {
 			errs = append(errs, fmt.Sprintf("replicas_max must be <= %d, got %d", MaxReplicas, s.ReplicasMax))
 		}
+		if s.ReplicasMin > MaxReplicas {
+			errs = append(errs, fmt.Sprintf("replicas_min must be <= %d, got %d", MaxReplicas, s.ReplicasMin))
+		}
 	} else {
 		if s.Replicas.N < 1 {
 			errs = append(errs, "replicas must be >= 1")
@@ -554,6 +566,28 @@ func validateService(s *Service) []string {
 		case ReadyFail, ReadyContinue:
 		default:
 			errs = append(errs, fmt.Sprintf("[ready].on_timeout must be 'fail' or 'continue'; got %q", s.Ready.OnTimeout))
+		}
+		if s.Ready.Interval < 0 {
+			errs = append(errs, "[ready].interval must be >= 0")
+		}
+		if s.Ready.Timeout < 0 {
+			errs = append(errs, "[ready].timeout must be >= 0")
+		}
+	}
+	// Negative durations parse fine ("-5s") but mean instant SIGKILL
+	// escalation or busy-looping backoff at runtime; reject them at
+	// --check-config time instead.
+	for _, d := range []struct {
+		name string
+		v    Duration
+	}{
+		{"stop_timeout", s.StopTimeout},
+		{"backoff_initial", s.BackoffInitial},
+		{"backoff_max", s.BackoffMax},
+		{"backoff_reset_after", s.BackoffResetAfter},
+	} {
+		if d.v < 0 {
+			errs = append(errs, fmt.Sprintf("%s must be >= 0", d.name))
 		}
 	}
 	return errs

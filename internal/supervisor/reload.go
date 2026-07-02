@@ -49,6 +49,7 @@ func (o *Orchestrator) ReloadService(ctx context.Context, group []*Runner) []err
 	for i, r := range group {
 		wg.Add(1)
 		go func(i int, r *Runner) {
+			defer recoverLog(o.log, "reload dispatch")
 			defer wg.Done()
 			errs[i] = o.reloadOne(ctx, r)
 		}(i, r)
@@ -175,6 +176,11 @@ func (o *Orchestrator) OnResourceChange(change resources.Change) {
 	// Replicas.N) pair is already consistent once planAutoScale
 	// returns, and Reload never diffs an auto service's replica count
 	// (servicesEqual ignores auto N — the scaler owns it).
+	if o.isStopping() {
+		o.log.Info("resource change ignored; supervisor shutting down")
+		return
+	}
+
 	o.reloadMu.Lock()
 	newEnv := change.Snapshot.EnvVars()
 	o.SetResourceEnv(newEnv)
@@ -211,7 +217,6 @@ func (o *Orchestrator) OnResourceChange(change resources.Change) {
 		}
 	}
 	parent := o.runnerCtx
-	wg := o.wg
 	o.mu.RUnlock()
 
 	if len(affected) == 0 {
@@ -232,10 +237,27 @@ func (o *Orchestrator) OnResourceChange(change resources.Change) {
 	// outside a real Run (tests construct an Orchestrator directly
 	// and drive reloadOne / OnResourceChange without Run), so guard
 	// the Add accordingly.
-	if wg != nil {
+	//
+	// The Add happens under the same lock as the stopping check:
+	// stopAll flips the flag under mu strictly before Run's deferred
+	// wg.Wait can begin, so this either Adds before Wait starts (Wait
+	// then blocks for us) or observes stopping and skips the fanout.
+	// An unlocked Add could land while Wait drains a zero counter,
+	// which is the documented WaitGroup misuse panic; in PID 1 that
+	// panic would kill the container mid-shutdown.
+	o.mu.RLock()
+	stopping := o.stopping
+	wg := o.wg
+	if !stopping && wg != nil {
 		wg.Add(1)
 	}
+	o.mu.RUnlock()
+	if stopping {
+		o.log.Info("resource change: fanout skipped; supervisor shutting down")
+		return
+	}
 	go func() {
+		defer recoverLog(o.log, "reload-on-change fanout")
 		if wg != nil {
 			defer wg.Done()
 		}
@@ -332,6 +354,10 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) (reloa
 	o.reloadMu.Lock()
 	defer o.reloadMu.Unlock()
 
+	if o.isStopping() {
+		return reloadDiff{}, errShuttingDown
+	}
+
 	o.mu.RLock()
 	snap := o.currentSnapshot
 	o.mu.RUnlock()
@@ -388,6 +414,10 @@ func (o *Orchestrator) Reload(ctx context.Context, newCfg *config.Config) (reloa
 func (o *Orchestrator) ReloadScoped(ctx context.Context, newCfg *config.Config, names []string) (reloadDiff, error) {
 	o.reloadMu.Lock()
 	defer o.reloadMu.Unlock()
+
+	if o.isStopping() {
+		return reloadDiff{}, errShuttingDown
+	}
 
 	o.mu.RLock()
 	snap := o.currentSnapshot
@@ -572,7 +602,9 @@ func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, com
 	// registration, then boot the adds. registerAndBoot owns the lock
 	// discipline and the detached serial-boot handoff shared with
 	// autoscale's scaleUp.
-	o.registerAndBoot(jobs, commitCfg, newBaseEnv)
+	if err := o.registerAndBoot(jobs, commitCfg, newBaseEnv); err != nil {
+		errs = append(errs, err)
+	}
 
 	// Rebind the exit_code_from watcher: the watched service may have
 	// been added in this reload, or the target name may have changed.
@@ -596,11 +628,23 @@ func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, com
 // come from main.go which never cancels its ctx, and the control
 // server's per-request deadline is too tight for a multi-service boot.
 // Tying boots to runnerCtx ties their lifetime to the supervisor.
-func (o *Orchestrator) registerAndBoot(jobs []reloadBootJob, commitCfg *config.Config, newBaseEnv []string) {
+//
+// Returns errShuttingDown without registering anything when stopAll
+// has already begun: runners registered after stopAll's snapshot are
+// never stopped gracefully, so refusing is the only safe answer. The
+// entry points (Reload, ReloadScoped, OnResourceChange, control
+// start) are gated too; this check closes the window where shutdown
+// begins mid-reload.
+func (o *Orchestrator) registerAndBoot(jobs []reloadBootJob, commitCfg *config.Config, newBaseEnv []string) error {
 	// Capture runnerCtx under the same lock as the registration so the
 	// detached boot goroutine reads a properly-published value (Run is
 	// the sole writer of runnerCtx; the pairing keeps it race-clean).
 	o.mu.Lock()
+	if o.stopping {
+		o.mu.Unlock()
+		o.log.Warn("service registration refused; supervisor shutting down", "jobs", len(jobs))
+		return errShuttingDown
+	}
 	for _, j := range jobs {
 		o.runners = append(o.runners, j.runner)
 	}
@@ -628,6 +672,7 @@ func (o *Orchestrator) registerAndBoot(jobs []reloadBootJob, commitCfg *config.C
 		bootJobs := append([]reloadBootJob(nil), jobs...)
 		go o.runReloadBoots(bootRoot, bootJobs, globals)
 	}
+	return nil
 }
 
 // reloadBootJob carries the pre-built runner and its config through
@@ -650,10 +695,15 @@ type reloadBootJob struct {
 // waitgroup; on orchestrator shutdown they die with the process, so a
 // plain mutex without ctx-aware acquisition is sufficient.
 func (o *Orchestrator) runReloadBoots(root context.Context, jobs []reloadBootJob, globals config.Globals) {
+	defer recoverLog(o.log, "reload boot")
 	o.reloadBootMu.Lock()
 	defer o.reloadBootMu.Unlock()
 	for _, j := range jobs {
-		if root.Err() != nil {
+		// Both checks matter: root (runnerCtx) is canceled only after
+		// stopAll finishes, so a boot list in flight when SIGTERM
+		// lands must also honor the stopping latch or it would spawn
+		// services into a teardown that already passed them by.
+		if root.Err() != nil || o.isStopping() {
 			return
 		}
 		bctx, bcancel := context.WithTimeout(root, globals.BootTimeout.Std())
@@ -672,6 +722,13 @@ func (o *Orchestrator) bootReloadJob(ctx context.Context, j reloadBootJob) {
 		return
 	}
 	if err := r.WaitBootResult(ctx); err != nil {
+		// Same completion semantics as bootOne: a one-off that
+		// finished before the boot check is done, not broken.
+		if r.CompletedCleanly() {
+			r.MarkReady()
+			o.log.Info("reload: service completed cleanly before boot check; counting as booted", "service", name)
+			return
+		}
 		o.log.Error("reload: added service failed to boot", "service", name, "err", err)
 		return
 	}

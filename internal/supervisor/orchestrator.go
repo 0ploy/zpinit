@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -107,6 +108,36 @@ type Orchestrator struct {
 	// and watcherCancel being called by a retarget, and would then
 	// fire shutdown for a service the new config no longer cares about.
 	watcherGen uint64
+	// stopping is set (under mu) at the top of stopAll and reset by
+	// the next Run. Once teardown has begun, every path that could
+	// register or (re)start a runner must refuse: a reload boot,
+	// autoscale commit, or `zpctl start` landing during stopAll would
+	// otherwise spawn a child after its group was already stopped.
+	// Nobody signals that child again; it dies by Pdeathsig SIGKILL
+	// when PID 1 exits, skipping graceful stop entirely.
+	stopping bool
+}
+
+// errShuttingDown is returned by mutating entry points (Reload,
+// registerAndBoot, control start/restart) once stopAll has begun.
+var errShuttingDown = errors.New("supervisor is shutting down")
+
+// isStopping reports whether stopAll has begun teardown.
+func (o *Orchestrator) isStopping() bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.stopping
+}
+
+// recoverLog is a deferred panic backstop for goroutines spawned by
+// the control/reload/scale paths. A panic in any goroutine kills the
+// whole process; in PID 1 that takes the container down, so fanout
+// goroutines log and drop their work instead. Mirrors safeReap in
+// cmd/zpinit/main.go.
+func recoverLog(log *slog.Logger, where string) {
+	if p := recover(); p != nil {
+		log.Error("panic recovered; work dropped", "where", where, "panic", p)
+	}
 }
 
 // SetBaseEnvBuilder installs a function that recomposes the
@@ -218,6 +249,7 @@ func (o *Orchestrator) Run(ctx context.Context) int {
 	// today) can still fire early-shutdown. Pairing the reset with the
 	// fresh earlyShutdownCh keeps the two consistent.
 	o.shutdownOnce = sync.Once{}
+	o.stopping = false
 	runnersSnap := append([]*Runner(nil), o.runners...)
 	o.mu.Unlock()
 
@@ -231,7 +263,7 @@ func (o *Orchestrator) Run(ctx context.Context) int {
 		o.stopAll()
 		return 1
 	}
-	o.log.Info("boot complete", "services", len(o.runners))
+	o.log.Info("boot complete", "services", len(runnersSnap))
 
 	// Optional: watch the configured exit_code_from service for terminal
 	// state, which triggers an orderly shutdown of everything else.
@@ -256,6 +288,14 @@ func (o *Orchestrator) boot(ctx context.Context) error {
 	// slow first service can't eat the entire boot budget and starve
 	// later services of their probe window. This matches reload-boot's
 	// per-job timeout and the contract documented in CLAUDE.md.
+	// reloadBootMu is held across the whole initial boot: the control
+	// socket and SIGHUP are already live, so a reload can land mid-boot
+	// and register adds whose detached runReloadBoots must queue behind
+	// this loop. Without the lock those boots interleave with initial
+	// boot and break the readiness-blocks-next-service ordering.
+	o.reloadBootMu.Lock()
+	defer o.reloadBootMu.Unlock()
+
 	o.mu.RLock()
 	snap := append([]*Runner(nil), o.runners...)
 	bootTimeout := o.cfg.Globals.BootTimeout.Std()
@@ -265,10 +305,35 @@ func (o *Orchestrator) boot(ctx context.Context) error {
 		err := o.bootOne(bctx, r)
 		bcancel()
 		if err != nil {
+			// A reload that removed this service while boot was busy
+			// with an earlier one leaves a stale pointer in snap; its
+			// Run goroutine is gone, so bootOne fails. That is an
+			// operator action, not a boot failure: failing here would
+			// kill a healthy container over a legal config change.
+			if !o.isRegistered(r) {
+				o.log.Info("boot: service removed by reload during boot; skipping",
+					"service", r.DisplayName())
+				continue
+			}
 			return fmt.Errorf("%s: %w", r.DisplayName(), err)
 		}
 	}
 	return nil
+}
+
+// isRegistered reports whether r (pointer identity) is still in the
+// live runner set. A reload that removes or restarts a service
+// deregisters the old runner; boot uses this to tell "removed by
+// reload" apart from a real boot failure.
+func (o *Orchestrator) isRegistered(r *Runner) bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	for _, cur := range o.runners {
+		if cur == r {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *Orchestrator) bootOne(ctx context.Context, r *Runner) error {
@@ -280,6 +345,15 @@ func (o *Orchestrator) bootOne(ctx context.Context, r *Runner) error {
 	}
 
 	if err := r.WaitBootResult(ctx); err != nil {
+		// A one-off worker (restart = "never") can finish its whole
+		// job before this wait even starts. That is completion, not a
+		// boot failure; the readiness probe is skipped because there
+		// is nothing left to probe.
+		if r.CompletedCleanly() {
+			r.MarkReady()
+			o.log.Info("boot: service completed cleanly before boot check; counting as booted", "service", name)
+			return nil
+		}
 		return fmt.Errorf("waiting for running: %w", err)
 	}
 
@@ -328,6 +402,12 @@ func (o *Orchestrator) WaitUntilReady(ctx context.Context, r *Runner) error {
 	err := r.WaitBootResult(bctx)
 	bcancel()
 	if err != nil {
+		// Same completion semantics as bootOne: a fast-finishing
+		// one-off counts as up for `start --wait` purposes.
+		if r.CompletedCleanly() {
+			r.MarkReady()
+			return nil
+		}
 		return err
 	}
 
@@ -429,9 +509,17 @@ func (o *Orchestrator) installExitCodeWatcher() {
 // replica. ShutdownBudget reports a per-group conservative total so
 // the outer runSupervise wait covers stopAll exactly.
 func (o *Orchestrator) stopAll() {
-	o.mu.RLock()
+	// Latch shutdown and snapshot in one critical section: anything
+	// registered before the flag flipped is included in the snapshot
+	// and stopped below; anything arriving after sees o.stopping and
+	// refuses. Without the latch, a detached reload boot, autoscale
+	// commit, or `zpctl start` could spawn a child after its group
+	// was already processed here, and that child would never be
+	// stopped gracefully.
+	o.mu.Lock()
+	o.stopping = true
 	snap := append([]*Runner(nil), o.runners...)
-	o.mu.RUnlock()
+	o.mu.Unlock()
 
 	// snap is sorted by (filename, replicaIndex). Walk it in reverse,
 	// peeling off groups of consecutive same-filename entries and
@@ -462,8 +550,13 @@ func (o *Orchestrator) stopRunnerGroup(ctx context.Context, group []*Runner) {
 
 	var wg sync.WaitGroup
 	for _, r := range group {
+		// Pending is deliberately NOT skipped: a queued cmdStart (the
+		// cmds channel is buffered) can still spawn a Pending runner
+		// after this walk, and Stop on Pending is cheap. Because cmds
+		// is FIFO, a racing queued start is immediately followed by
+		// this stop, so the spawned child is still torn down.
 		switch r.State() {
-		case StateStopped, StateFatal, StatePending:
+		case StateStopped, StateFatal:
 			continue
 		}
 		wg.Add(1)

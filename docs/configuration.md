@@ -219,6 +219,10 @@ moved past the configured debounce. Sub-integer quota wobble that
 doesn't change `ZPINIT_CPU_COUNT` is invisible. Use
 `reload_on_change` on a service to subscribe to either dimension.
 
+The `[resources]` values themselves (reserves and debounce windows)
+are read once at boot; a `zpctl update` after editing them has no
+effect until the container restarts.
+
 ## `services/*.toml` (one per service)
 
 ```toml
@@ -350,6 +354,10 @@ on_timeout = "fail"  # "fail" aborts boot; "continue" proceeds anyway
 Plain executables (any language with a shebang). zpinit runs them in
 filename order, each with `entrypoint_script_timeout` applied. A
 non-zero exit is fatal unless `entrypoint_on_failure = "continue"`.
+A script that exceeds its timeout counts as failed even if it exits 0
+after receiving SIGTERM. A stop signal (`docker stop`) during the
+entrypoint phase aborts the remaining scripts; `entrypoint_on_failure
+= "continue"` does not override a stop request.
 
 Files matching `.*` (dotfiles) or ending in `.disabled` are skipped
 silently. Non-executable files are skipped with a warning at
@@ -382,7 +390,11 @@ collisions, `exit_code_from` to a missing service) abort the load.
 - `default_stop_signal` and per-service `stop_signal` are recognised.
 - `exit_code_from` references an existing service (or is `"default"`).
   Pointing it at a service with `replicas > 1` is rejected (ambiguous).
-- `replicas` is in `[1, 64]`.
+- `replicas` is in `[1, 64]`; the same 64 cap bounds auto targets,
+  `replicas_min`, and `replicas_max`.
+- All durations (`boot_timeout`, `stop_timeout`, backoff settings,
+  `[ready]` interval/timeout, entrypoint script timeout) are
+  non-negative.
 - `entrypoint.d/` files are executable (warning, not error).
 - `control_socket` is an absolute path.
 

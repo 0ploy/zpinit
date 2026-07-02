@@ -147,6 +147,18 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 
 	r := reaper.New(log)
 
+	// SIGHUP/SIGUSR1/SIGUSR2 must never kill PID 1: the Go default for
+	// un-notified signals is process death, so a "reload" habit sent
+	// during the entrypoint phase (or a stray USR1) would take the
+	// container down mid-provisioning. Route them to a channel nobody
+	// reads (buffered; overflow is silently dropped) instead of
+	// signal.Ignore: Ignore installs SIG_IGN, which survives the wrap-
+	// mode exec and would hand the CMD a polluted disposition table.
+	// runSupervise later Notifies SIGHUP onto its own channel for
+	// reload handling; duplicate delivery here is harmless.
+	sigDiscard := make(chan os.Signal, 4)
+	signal.Notify(sigDiscard, syscall.SIGHUP, syscall.SIGUSR1, syscall.SIGUSR2)
+
 	// Layered env composition: globals.Env (lowest) under container env.
 	// entrypoint.d scripts can write further overrides to /run/zpinit/env,
 	// which run on top. Container env beats globals.Env so an operator
@@ -323,7 +335,11 @@ func runEntrypoint(log *slog.Logger, configDir string, cfg *config.Config, skipF
 		envFile = v
 	}
 
-	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	// SIGQUIT is included for supervisord parity: `docker kill -s QUIT`
+	// means "graceful shutdown" to operators coming from there, and the
+	// Go default (goroutine dump + exit 2) would be the hardest possible
+	// kill instead.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
 	defer stopSignals()
 
 	return entrypoint.Run(ctx, entrypoint.Config{
@@ -352,8 +368,8 @@ func execCmd(log *slog.Logger, cmdline []string, env map[string]string) int {
 
 // runSupervise is the supervise-mode entry point. It splits signals
 // onto two channels: SIGCHLD goes to a dedicated reaper goroutine that
-// runs throughout shutdown, and SIGTERM/INT/HUP go to the user-signal
-// loop here. The split is load-bearing — if reaping shared a channel
+// runs throughout shutdown, and SIGTERM/INT/HUP/QUIT go to the
+// user-signal loop here. The split is load-bearing: if reaping shared a channel
 // with shutdown, the SIGTERM handler's wait for orchestrator exit would
 // block reading SIGCHLDs, the reaper would stop, and child Exit
 // channels would never fire (Phase 5 had this bug for one commit).
@@ -364,7 +380,7 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 	chldCh := make(chan os.Signal, 16)
 	signal.Notify(chldCh, syscall.SIGCHLD)
 	userCh := make(chan os.Signal, 8)
-	signal.Notify(userCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	signal.Notify(userCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
 
 	reaperStop := make(chan struct{})
 	reaperDone := make(chan struct{})
@@ -438,7 +454,18 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 			case <-watcherCtx.Done():
 				return
 			case change := <-sub:
-				orch.OnResourceChange(change)
+				// Recover per dispatch: a panic in the resource-change
+				// path would otherwise kill PID 1 (this goroutine has no
+				// other backstop), converting a config hiccup into a
+				// container death. Drop the delta and keep watching.
+				func() {
+					defer func() {
+						if p := recover(); p != nil {
+							log.Error("resource-change dispatch panic; delta dropped", "panic", p)
+						}
+					}()
+					orch.OnResourceChange(change)
+				}()
 			}
 		}
 	}()
@@ -470,7 +497,10 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 		select {
 		case sig := <-userCh:
 			switch sig {
-			case syscall.SIGTERM, syscall.SIGINT:
+			// SIGQUIT joins TERM/INT for supervisord parity: operators
+			// coming from there use `kill -QUIT` for graceful shutdown,
+			// and the Go default would be a goroutine dump + hard exit.
+			case syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT:
 				// Recompute the budget against the *current* runner
 				// set rather than reusing a boot-time snapshot —
 				// reload may have added services or bumped
@@ -478,6 +508,11 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 				// outer wait must cover stopAll's serial inner wait.
 				budget := orch.ShutdownBudget()
 				log.Info("shutdown signal", "signal", sig.String(), "budget", budget)
+				// Close the control socket before teardown begins so no
+				// new zpctl request lands mid-stopAll. The orchestrator's
+				// stopping latch is the second gate for requests already
+				// in flight.
+				ctrlCancel()
 				cancel()
 				shutdownTimer := time.NewTimer(budget)
 				select {

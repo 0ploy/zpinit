@@ -94,6 +94,16 @@ func Run(ctx context.Context, cfg Config) (map[string]string, error) {
 	}
 
 	for _, path := range scripts {
+		// Cancellation (docker stop during provisioning) aborts the
+		// whole sequence. Without this check, each remaining script
+		// would be started and immediately signaled, burning up to
+		// KillGrace apiece of the runtime's kill grace, and a
+		// TERM-trapping script exiting 0 would let the boot continue
+		// in a container that was told to stop.
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("entrypoint.d aborted: %w", ctx.Err())
+		}
+
 		if err := mergeEnvFile(env, cfg.EnvFile, cfg.Logger); err != nil {
 			return nil, fmt.Errorf("read env file: %w", err)
 		}
@@ -102,6 +112,12 @@ func Run(ctx context.Context, cfg Config) (map[string]string, error) {
 		fmt.Fprintln(os.Stderr, "[zpinit] entrypoint.d:", name)
 
 		if err := runOne(ctx, cfg, path, sliceFromEnviron(env)); err != nil {
+			// on_failure = "continue" covers script failures, not
+			// cancellation: an operator's continue policy must not
+			// override a stop request.
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("entrypoint.d/%s: %w", name, err)
+			}
 			if cfg.OnFailure == Continue {
 				cfg.Logger.Warn("entrypoint.d script failed; continuing", "name", name, "err", err)
 				fmt.Fprintf(os.Stderr, "[zpinit] entrypoint.d: %s failed: %v (continuing)\n", name, err)
@@ -189,13 +205,22 @@ func runOne(ctx context.Context, cfg Config, path string, env []string) error {
 		timeoutCh = t.C
 	}
 
+	// cause records WHY the script was signaled. Once the timeout or
+	// cancel branch is entered, the script's own exit status must not
+	// convert the outcome back into success: a script that traps TERM
+	// and exits 0 would otherwise mask the timeout (on_failure = "fail"
+	// never fires) or the cancellation (the boot keeps going in a
+	// container that was told to stop).
+	var cause error
 	select {
 	case err := <-done:
 		return err
 	case <-timeoutCh:
 		cfg.Logger.Warn("entrypoint script timed out", "name", filepath.Base(path), "timeout", cfg.ScriptTimeout)
+		cause = fmt.Errorf("script exceeded timeout %s", cfg.ScriptTimeout)
 		_ = syscall.Kill(-pid, syscall.SIGTERM)
 	case <-ctx.Done():
+		cause = fmt.Errorf("canceled: %w", ctx.Err())
 		_ = syscall.Kill(-pid, syscall.SIGTERM)
 	}
 
@@ -203,7 +228,10 @@ func runOne(ctx context.Context, cfg Config, path string, env []string) error {
 	defer graceTimer.Stop()
 	select {
 	case err := <-done:
-		return err
+		if err != nil {
+			return fmt.Errorf("%w (script exit: %v)", cause, err)
+		}
+		return cause
 	case <-graceTimer.C:
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		select {
@@ -212,7 +240,7 @@ func runOne(ctx context.Context, cfg Config, path string, env []string) error {
 			cfg.Logger.Error("script reap timed out; abandoning child",
 				"name", filepath.Base(path), "pgid", pid, "give_up", scriptReapGiveUp)
 		}
-		return errors.New("script killed after timeout / cancellation")
+		return fmt.Errorf("%w; script killed after grace period", cause)
 	}
 }
 
