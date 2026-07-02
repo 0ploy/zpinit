@@ -151,9 +151,12 @@ func (o *Orchestrator) scaleUp(filename string, baseEnv []string) {
 		}
 		used[idx] = true
 		perReplica := spec
-		perReplica.Log.Stdout = replicaLogPath(spec.Log.Stdout, idx, target)
-		perReplica.Log.Stderr = replicaLogPath(spec.Log.Stderr, idx, target)
-		env := composeReplicaEnv(baseEnv, idx, target)
+		// Always replicated: only auto services reach scaleUp, and auto
+		// replicas are expanded regardless of the current target (see
+		// expandServiceToRunners).
+		perReplica.Log.Stdout = replicaLogPath(spec.Log.Stdout, idx, true)
+		perReplica.Log.Stderr = replicaLogPath(spec.Log.Stderr, idx, true)
+		env := composeReplicaEnv(baseEnv, idx, true)
 		// NewRunnerForReplica keeps spec = the unmodified service-
 		// level config for reload-diff equality; cfg carries the
 		// per-replica log/env rewrites used at spawn time.

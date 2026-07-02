@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -59,7 +60,14 @@ func (b *ByteSize) UnmarshalText(text []byte) error {
 	default:
 		return fmt.Errorf("byte size %q: unknown unit %q", s, unit)
 	}
-	*b = ByteSize(n * float64(mult))
+	v := n * float64(mult)
+	// Bound the float path: converting a float at or beyond 2^64 to
+	// uint64 is undefined behavior in Go (platform-dependent garbage),
+	// so "20000000000GiB" must be rejected, not wrapped.
+	if math.IsInf(v, 0) || v >= float64(math.MaxUint64) {
+		return fmt.Errorf("byte size %q: value overflows 64 bits", s)
+	}
+	*b = ByteSize(v)
 	return nil
 }
 

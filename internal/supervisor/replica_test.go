@@ -10,25 +10,25 @@ import (
 )
 
 func TestReplicaLogPath_SingleReplicaNoRewrite(t *testing.T) {
-	if got := replicaLogPath("/var/log/x.log", 0, 1); got != "/var/log/x.log" {
-		t.Errorf("got %q, want unchanged path for total=1", got)
+	if got := replicaLogPath("/var/log/x.log", 0, false); got != "/var/log/x.log" {
+		t.Errorf("got %q, want unchanged path for non-replicated", got)
 	}
 }
 
 func TestReplicaLogPath_InheritUnchanged(t *testing.T) {
-	if got := replicaLogPath("inherit", 1, 3); got != "inherit" {
+	if got := replicaLogPath("inherit", 1, true); got != "inherit" {
 		t.Errorf("got %q, want inherit unchanged", got)
 	}
-	if got := replicaLogPath("", 1, 3); got != "" {
+	if got := replicaLogPath("", 1, true); got != "" {
 		t.Errorf("got %q, want empty unchanged", got)
 	}
 }
 
 func TestReplicaLogPath_ExplicitPlaceholder(t *testing.T) {
-	if got := replicaLogPath("/var/log/consumer-{index}.log", 2, 4); got != "/var/log/consumer-2.log" {
+	if got := replicaLogPath("/var/log/consumer-{index}.log", 2, true); got != "/var/log/consumer-2.log" {
 		t.Errorf("got %q, want /var/log/consumer-2.log", got)
 	}
-	if got := replicaLogPath("/logs/{index}/app.log", 0, 4); got != "/logs/0/app.log" {
+	if got := replicaLogPath("/logs/{index}/app.log", 0, true); got != "/logs/0/app.log" {
 		t.Errorf("got %q, want /logs/0/app.log", got)
 	}
 }
@@ -37,25 +37,25 @@ func TestReplicaLogPath_NoPlaceholderIsShared(t *testing.T) {
 	// All replicas share the same path when no {index} placeholder is
 	// present. Linux O_APPEND keeps concurrent line-sized writes from
 	// tearing.
-	if got := replicaLogPath("/var/log/consumer.log", 2, 4); got != "/var/log/consumer.log" {
+	if got := replicaLogPath("/var/log/consumer.log", 2, true); got != "/var/log/consumer.log" {
 		t.Errorf("got %q, want unchanged (shared file)", got)
 	}
-	if got := replicaLogPath("/var/log/consumer", 1, 3); got != "/var/log/consumer" {
+	if got := replicaLogPath("/var/log/consumer", 1, true); got != "/var/log/consumer" {
 		t.Errorf("got %q, want unchanged (shared file)", got)
 	}
 }
 
 func TestComposeReplicaEnv_NoInjectionForSingle(t *testing.T) {
 	base := []string{"PATH=/usr/bin", "FOO=bar"}
-	got := composeReplicaEnv(base, 0, 1)
+	got := composeReplicaEnv(base, 0, false)
 	if !reflect.DeepEqual(got, base) {
-		t.Errorf("got %v, want unchanged base for total=1", got)
+		t.Errorf("got %v, want unchanged base for non-replicated", got)
 	}
 }
 
 func TestComposeReplicaEnv_AppendsIndex(t *testing.T) {
 	base := []string{"PATH=/usr/bin", "FOO=bar"}
-	got := composeReplicaEnv(base, 2, 4)
+	got := composeReplicaEnv(base, 2, true)
 	want := []string{"PATH=/usr/bin", "FOO=bar", "ZPINIT_REPLICA_INDEX=2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
@@ -64,7 +64,7 @@ func TestComposeReplicaEnv_AppendsIndex(t *testing.T) {
 
 func TestComposeReplicaEnv_ReplacesExistingIndex(t *testing.T) {
 	base := []string{"PATH=/usr/bin", "ZPINIT_REPLICA_INDEX=99", "FOO=bar"}
-	got := composeReplicaEnv(base, 3, 4)
+	got := composeReplicaEnv(base, 3, true)
 	want := []string{"PATH=/usr/bin", "ZPINIT_REPLICA_INDEX=3", "FOO=bar"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
@@ -134,6 +134,35 @@ func TestExpandServiceToRunners_MultiReplicaSpawnsN(t *testing.T) {
 		if !envFound {
 			t.Errorf("[%d] missing ZPINIT_REPLICA_INDEX=%d in env: %v", i, i, r.baseEnv)
 		}
+	}
+}
+
+func TestExpandServiceToRunners_AutoSingleReplicaStillExpands(t *testing.T) {
+	// An auto service resolved to N=1 must behave exactly like any
+	// other replica set: index env injected, {index} expanded. A later
+	// 1 -> 4 scale-up otherwise leaves replica 0 with an index-less
+	// env and a literal {index} log path while 1..3 are correct.
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := config.Service{
+		Name:     "worker",
+		Filename: "40_worker.toml",
+		Replicas: config.Replicas{N: 1, Auto: true},
+		Log:      config.Logging{Stdout: "/var/log/worker-{index}.log", Stderr: "inherit"},
+	}
+	rs := expandServiceToRunners(svc, []string{"FOO=bar"}, nil, nil, log)
+	if len(rs) != 1 {
+		t.Fatalf("got %d runners, want 1", len(rs))
+	}
+	r := rs[0]
+	if got := r.Cfg().Log.Stdout; got != "/var/log/worker-0.log" {
+		t.Errorf("Log.Stdout = %q, want /var/log/worker-0.log", got)
+	}
+	want := []string{"FOO=bar", "ZPINIT_REPLICA_INDEX=0"}
+	if !reflect.DeepEqual(r.baseEnv, want) {
+		t.Errorf("baseEnv = %v, want %v", r.baseEnv, want)
+	}
+	if got := r.DisplayName(); got != "worker/0" {
+		t.Errorf("DisplayName = %q, want worker/0", got)
 	}
 }
 

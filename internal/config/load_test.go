@@ -958,6 +958,17 @@ func TestByteSize_UnknownUnit(t *testing.T) {
 	}
 }
 
+func TestByteSize_OverflowRejected(t *testing.T) {
+	// The float path must reject values at or beyond 2^64: converting
+	// such a float to uint64 is platform-dependent garbage in Go.
+	for _, s := range []string{"20000000000GiB", "1e30MB", "1e400"} {
+		var b ByteSize
+		if err := b.UnmarshalText([]byte(s)); err == nil {
+			t.Errorf("UnmarshalText(%q): expected overflow error, got %d", s, uint64(b))
+		}
+	}
+}
+
 // NewEmpty produces a Config that supervise mode would refuse (zero
 // services) but wrap mode runs fine on. Defaults must be populated
 // because runEntrypoint and the orchestrator both read them.

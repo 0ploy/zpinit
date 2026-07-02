@@ -217,7 +217,12 @@ commit", no phase numbers. Internal refactors and CI tweaks live in
   retries. Dropping a runner with a live child would leak an unmanaged
   process under PID 1 with no zpctl handle. `runCancel` is called only
   on successful removal so the Run loop stays alive while the child
-  is.
+  is. It also latches the runner (`markRemoving`) before stopping it;
+  `handleStart` refuses latched runners with `errBeingRemoved`. That
+  closes the other door to the same leak: a queued `zpctl start`
+  respawning the child between WaitTerminal success and
+  deregistration. Cleared on stop failure so the retained runner
+  stays operable for the retry.
 
 - A service file that fails to parse or validate is skipped into
   `cfg.SkippedFiles`, never fatal to the batch: the other valid files
@@ -283,6 +288,10 @@ commit", no phase numbers. Internal refactors and CI tweaks live in
   Linux `O_APPEND` is atomic below `PIPE_BUF` (typically 4096 bytes),
   so concurrent appends from N replicas don't tear line-sized log
   output. Operators wanting per-replica files opt in via `{index}`.
+  Auto services are ALWAYS treated as replicated (index env +
+  `{index}` expansion), even at a resolved target of 1: replica 0
+  must look the same before and after a 1-to-4 scale-up. Only static
+  `replicas = 1` keeps the pre-replica env/log footprint.
 
 - `findRunnerLocked(name)` matches by `cfg.Name` only and returns the
   first replica for replicated services. Control verbs use

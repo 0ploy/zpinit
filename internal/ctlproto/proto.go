@@ -241,6 +241,14 @@ func (c *Conn) readLine() (string, error) {
 		if err != nil && err != io.EOF {
 			return "", err
 		}
+		if err == io.EOF {
+			// Partial data followed by EOF: the peer died mid-line. A
+			// complete line always ends in \n on this protocol, so
+			// treating the fragment as a whole line is wrong; in the
+			// worst corner a truncated "." would read as a clean body
+			// terminator and a crashed-mid-stream follow would exit 0.
+			return "", io.ErrUnexpectedEOF
+		}
 		return strings.TrimRight(string(buf), "\r\n"), nil
 	}
 }

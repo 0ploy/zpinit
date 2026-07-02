@@ -165,9 +165,18 @@ mid-graceful-shutdown.
 
 The same parallel-within-group / serial-between-groups schedule
 applies to `Reload`'s remove and restart-stop paths via
-`removeServiceGroup`. Without that, `replicas = 64` with the default
-10s stop_timeout would burn ~16 minutes per logical service on stuck
-children during a reload.
+`removeServiceGroup`, including the reverse filename order between
+groups: deleting `10_redis.toml` and `20_php.toml` in one reload
+drains php through redis before redis is signaled, exactly like
+shutdown. Without the group parallelism, `replicas = 64` with the
+default 10s stop_timeout would burn ~16 minutes per logical service
+on stuck children during a reload.
+
+A second `SIGTERM`/`SIGINT`/`SIGQUIT` arriving while the shutdown
+wait is already running is deliberately ignored: graceful stop is
+already proceeding at full speed and per-runner `SIGKILL` escalation
+is the accelerator. For an immediate hard kill, use the runtime's
+(`docker stop -t 0`); Pdeathsig takes the children down with PID 1.
 
 ## Reaping
 
@@ -241,6 +250,15 @@ write deadline is refreshed per drain so a wedged client is still
 bounded. `zpctl` detects `--follow` (or `-f`) and switches its
 client-side read loop to read body lines as they arrive rather
 than buffering until the terminator.
+
+Body lines are complete log lines: a writer caught mid-line is held
+until its newline arrives instead of being delivered as two frames.
+A single line longer than 32KiB is split into chunks below the
+64KiB wire cap rather than aborting the client with a protocol
+error. The follow loop detects rotation by inode change (logrotate's
+default rename mode) and copytruncate rotation by the file shrinking
+below the consumed offset; either way it keeps following the path
+rather than the dead offset.
 
 ### Access control
 

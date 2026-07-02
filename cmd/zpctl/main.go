@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/0ploy/zpinit/internal/ctlproto"
@@ -68,6 +69,18 @@ func main() {
 		os.Exit(ctlproto.CodeUnknownService)
 	}
 	args = append(args[:1], translated...)
+
+	// The wire protocol is space-delimited, one request per line: an
+	// argument containing whitespace would silently re-split into
+	// several arguments (or truncate the request at an embedded
+	// newline) on the daemon side. No legal target or flag contains
+	// whitespace, so reject locally with a clear message.
+	for _, a := range args {
+		if strings.ContainsAny(a, " \t\r\n") {
+			fmt.Fprintf(os.Stderr, "zpctl: argument %q contains whitespace; not representable on the wire\n", a)
+			os.Exit(ctlproto.CodeFailed)
+		}
+	}
 
 	conn, err := net.DialTimeout("unix", socket, 5*time.Second)
 	if err != nil {
@@ -154,6 +167,12 @@ func isWaitCmd(args []string) bool {
 // socket and the server's write fails on the next body line,
 // stopping the follow loop cleanly.
 func runStreamingClient(conn net.Conn, pc *ctlproto.Conn) {
+	// The body may legitimately stream for hours, but the status line
+	// must arrive promptly. Without this deadline, a daemon that
+	// accepts the connection and then wedges before responding hangs
+	// zpctl forever; the per-line deadline below only starts once the
+	// status line is in.
+	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	code, msg, err := pc.ReadStatusLine()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "zpctl: read status: %v\n", err)

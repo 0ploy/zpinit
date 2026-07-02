@@ -20,7 +20,66 @@
   instant SIGKILL escalation or guaranteed boot failures; they are
   now rejected at load. An explicit `replicas = 0` was silently
   coerced to one running copy; it is now an error (park a service by
-  renaming its file to `*.disabled`).
+  renaming its file to `*.disabled`). Absurdly large byte sizes
+  (`reserve_memory = "20000000000GiB"`) no longer wrap to garbage.
+  When `exit_code_from` points at a service whose own file failed to
+  parse, the error now names the skipped file instead of claiming
+  the service is unknown.
+
+- **A `zpctl start` racing a service removal can no longer leak an
+  unmanaged process.** A start arriving while a reload or scale-down
+  was stopping that service could respawn the child just before it
+  was deregistered, leaving a live process under PID 1 with no
+  restart policy and no `zpctl` handle. Starts against a service
+  being removed are now refused with "service is being removed".
+
+- **Reload teardown and pipeline ordering fixes.** Deleting several
+  services in one reload now stops them in reverse filename order
+  (dependents drain before their dependencies), matching shutdown.
+  A service removed by a follow-up reload before it had booted no
+  longer stalls the boot queue for a full `boot_timeout`. And
+  `zpctl update NAME` after renaming a service's file now stops the
+  old copy instead of leaving two services with the same name.
+
+- **A new service file can no longer silently duplicate a running
+  service's name.** If a running service's file breaks (it is kept
+  running by design) and a new file claims the same service name,
+  the reload now refuses the new file with a clear error instead of
+  registering an ambiguous duplicate that `zpctl` targets and
+  `exit_code_from` resolve unpredictably.
+
+- **`zpctl tail --follow` streams whole lines and survives every
+  rotation mode.** A writer caught mid-line no longer has its line
+  delivered as two pieces; a single log line over 64KiB (large JSON
+  events) no longer kills the client with a misleading "unreachable"
+  error (it is split into chunks); and logrotate's `copytruncate`
+  mode no longer wedges the follow into permanent silence.
+
+- **Auto-scaled services behave identically at every replica count.**
+  A `replicas = "auto"` service that resolved to one replica got no
+  `ZPINIT_REPLICA_INDEX` and kept a literal `{index}` in its log
+  path; after scaling up, replica 0 stayed the odd one out. Auto
+  services now always get the replica env and `{index}` expansion,
+  as documented. Static `replicas = 1` services are unaffected.
+
+- **CPU detection honors `--cpuset-cpus`.** A container pinned to
+  specific cores without a CFS quota (`--cpuset-cpus=0-3` and no
+  `--cpus`) previously reported the host's full core count in
+  `ZPINIT_CPU_COUNT`, overshooting `replicas = "auto"` targets. The
+  cpuset now participates in the min across detection sources.
+
+- **Wrapped CMDs resolve through the provisioned PATH and fail with
+  shell-style exit codes.** A `PATH` exported from `entrypoint.d`
+  via `/run/zpinit/env` now affects how the CMD binary is found, and
+  an exec failure returns 126 (found but not runnable) / 127 (not
+  found) instead of a generic 1.
+
+- **`zpctl` edge-case robustness.** A daemon that accepts a
+  `tail --follow` connection but wedges before responding no longer
+  hangs the client forever; a server crash mid-stream can no longer
+  be mistaken for a clean end of stream; and arguments containing
+  whitespace are rejected locally instead of being silently re-split
+  by the wire protocol.
 
 - **Autoscale can no longer corrupt the replica set when it races a
   config reload.** A reload restarting or removing an auto-scaled

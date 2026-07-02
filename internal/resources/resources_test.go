@@ -55,6 +55,55 @@ func TestDetect_CgroupV2_Limited(t *testing.T) {
 	}
 }
 
+func TestDetect_CPUSetWithoutQuota(t *testing.T) {
+	// `docker run --cpuset-cpus=0-2` without `--cpus`: no CFS quota,
+	// so quota-based detection reports the host core count; the
+	// cpuset is the real budget.
+	cg := t.TempDir()
+	proc := t.TempDir()
+	writeFile(t, filepath.Join(cg, "cpu.max"), "max 100000\n")
+	writeFile(t, filepath.Join(cg, "cpuset.cpus.effective"), "0-2\n")
+	writeFile(t, filepath.Join(proc, "cpuinfo"), procCPUInfo(16))
+	withRoots(t, cg, proc)
+
+	s := Detect()
+	if s.CPUCount != 3 {
+		t.Errorf("CPUCount = %d, want 3 (cpuset 0-2)", s.CPUCount)
+	}
+}
+
+func TestDetect_CPUSetV1(t *testing.T) {
+	cg := t.TempDir()
+	proc := t.TempDir()
+	writeFile(t, filepath.Join(cg, "cpuset", "cpuset.effective_cpus"), "0,4-5\n")
+	writeFile(t, filepath.Join(proc, "cpuinfo"), procCPUInfo(16))
+	withRoots(t, cg, proc)
+
+	s := Detect()
+	if s.CPUCount != 3 {
+		t.Errorf("CPUCount = %d, want 3 (cpuset 0,4-5)", s.CPUCount)
+	}
+}
+
+func TestCountCPUList(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"0", 1},
+		{"0-3", 4},
+		{"0-3,8,10-11", 7},
+		{"", 0},
+		{"garbage", 0},
+		{"3-1", 0},
+	}
+	for _, c := range cases {
+		if got := countCPUList(c.in); got != c.want {
+			t.Errorf("countCPUList(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
 func TestDetect_CgroupV2_Unlimited_FallsBackToProc(t *testing.T) {
 	cg := t.TempDir()
 	proc := t.TempDir()

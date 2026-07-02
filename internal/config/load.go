@@ -461,7 +461,21 @@ func validate(cfg *Config) error {
 
 	if cfg.Globals.ExitCodeFrom != "default" {
 		if _, ok := nameToFile[cfg.Globals.ExitCodeFrom]; !ok {
-			errs = append(errs, fmt.Sprintf("exit_code_from = %q references unknown service", cfg.Globals.ExitCodeFrom))
+			// Deliberately fatal even though per-file failures normally
+			// only skip the file: exit_code_from names the service whose
+			// exit decides the container's fate, and booting without it
+			// would supervise a workload that can never exit correctly.
+			// If the target's own file is among the skipped ones, point
+			// the operator there instead of at a phantom typo.
+			msg := fmt.Sprintf("exit_code_from = %q references unknown service", cfg.Globals.ExitCodeFrom)
+			if len(cfg.SkippedFiles) > 0 {
+				files := make([]string, 0, len(cfg.SkippedFiles))
+				for _, fe := range cfg.SkippedFiles {
+					files = append(files, fe.File)
+				}
+				msg += fmt.Sprintf(" (service files were skipped due to errors: %s; if the target lives in one of them, fix that file)", strings.Join(files, ", "))
+			}
+			errs = append(errs, msg)
 		} else {
 			for _, s := range cfg.Services {
 				if s.Name != cfg.Globals.ExitCodeFrom {

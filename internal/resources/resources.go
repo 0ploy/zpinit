@@ -60,10 +60,17 @@ func Detect() Snapshot {
 	procCPU := procCPUCount(procRoot)
 	procMem := procMemoryBytes(procRoot)
 	cgCPU, cgMem := readCgroup(cgroupRoot)
+	csCPU := readCPUSetCount(cgroupRoot)
 
 	cpu := float64(procCPU)
 	if cgCPU > 0 && cgCPU < cpu {
 		cpu = cgCPU
+	}
+	// `--cpuset-cpus` without `--cpus` sets no CFS quota, so the
+	// quota-based sources above report the host's full core count;
+	// the cpuset is the real budget then. Min alongside the others.
+	if csCPU > 0 && float64(csCPU) < cpu {
+		cpu = float64(csCPU)
 	}
 	if cpu <= 0 {
 		// /proc was unreadable and cgroup said unlimited; fall back
@@ -205,6 +212,58 @@ func readCgroupV1(root string) (float64, uint64) {
 		mem = memRaw
 	}
 	return cpu, mem
+}
+
+// readCPUSetCount returns the number of CPUs in the container's
+// cpuset, or 0 if no cpuset file is readable. Checked v2 first
+// (unified hierarchy), then the v1 controller paths; the effective
+// files are preferred because they reflect what the kernel actually
+// granted after hierarchy constraints.
+func readCPUSetCount(root string) int {
+	for _, p := range []string{
+		filepath.Join(root, "cpuset.cpus.effective"),           // v2
+		filepath.Join(root, "cpuset", "cpuset.effective_cpus"), // v1
+		filepath.Join(root, "cpuset", "cpuset.cpus"),           // v1 fallback
+	} {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if n := countCPUList(strings.TrimSpace(string(data))); n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// countCPUList counts the CPUs in a kernel cpuset list string, e.g.
+// "0-3,8,10-11" -> 7. Returns 0 for empty or malformed input (caller
+// treats 0 as "no cpuset limit readable").
+func countCPUList(s string) int {
+	if s == "" {
+		return 0
+	}
+	total := 0
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if i := strings.IndexByte(part, '-'); i >= 0 {
+			lo, err1 := strconv.Atoi(part[:i])
+			hi, err2 := strconv.Atoi(part[i+1:])
+			if err1 != nil || err2 != nil || hi < lo {
+				return 0
+			}
+			total += hi - lo + 1
+		} else {
+			if _, err := strconv.Atoi(part); err != nil {
+				return 0
+			}
+			total++
+		}
+	}
+	return total
 }
 
 // procCPUCount counts the "processor" lines in /proc/cpuinfo. Scanned

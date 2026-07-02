@@ -182,7 +182,7 @@ func checkConfig(configDir string) (*config.Config, []Check) {
 				if n > 0 {
 					preview := make([]string, 0, n)
 					for i := 0; i < n; i++ {
-						preview = append(preview, config.ReplicaLogPath(s.Log.Stdout, i, n))
+						preview = append(preview, config.ReplicaLogPath(s.Log.Stdout, i, true))
 					}
 					out = append(out, Check{"config", s.Name + ": log paths", StatusOK,
 						fmt.Sprintf("replicas=%s, log.stdout expands to: %s", rep, strings.Join(preview, ", "))})

@@ -50,8 +50,18 @@ const (
 
 type command struct {
 	kind cmdKind
-	done chan struct{}
+	// done receives the handler's verdict (nil on success). Buffered
+	// cap 1 so Run's send never blocks on a caller that gave up.
+	done chan error
 }
+
+// errBeingRemoved is returned by StartCtx when the runner has been
+// latched for removal. A reload or scale-down that is stopping this
+// runner will deregister it the moment WaitTerminal succeeds; letting
+// a queued start respawn the child in that window would hand PID 1 a
+// live process with no registered runner: no restart policy, no zpctl
+// handle, not in stopAll's snapshot.
+var errBeingRemoved = errors.New("service is being removed")
 
 // Runner drives one service: spawn, wait, restart, retry, fatal. Run
 // holds the only goroutine that mutates state; external State() and
@@ -97,6 +107,15 @@ type Runner struct {
 	// (-> EXITED). Set true on Stop, cleared on Start.
 	stoppedManually bool
 
+	// removing latches the runner for deregistration. Set by
+	// removeServiceGroup before it stops the runner; handleStart
+	// refuses while it is set, closing the window where a queued
+	// `zpctl start` respawns the child between WaitTerminal success
+	// and deregistration, leaving PID 1 an unmanaged live process.
+	// Cleared again if the removal fails (the runner stays registered
+	// and must remain operable for the retry).
+	removing bool
+
 	// observers, if any, receive every state transition. Buffered; sends
 	// are non-blocking — observers that fall behind miss events.
 	observersMu sync.Mutex
@@ -140,6 +159,26 @@ type Runner struct {
 	// (orchestrator boot goroutine) and reader (control-socket
 	// handler) run concurrently.
 	readyPassed bool
+}
+
+// markRemoving latches the runner for removal: every subsequent
+// start command is refused with errBeingRemoved until clearRemoving.
+// Called by removeServiceGroup before it initiates the stop, so a
+// start racing the removal is refused no matter which side of the
+// stop it lands on.
+func (r *Runner) markRemoving() {
+	r.mu.Lock()
+	r.removing = true
+	r.mu.Unlock()
+}
+
+// clearRemoving lifts the removal latch. Called when a removal fails
+// and the runner stays registered: the next reload retries it, and an
+// operator start must work again in the meantime.
+func (r *Runner) clearRemoving() {
+	r.mu.Lock()
+	r.removing = false
+	r.mu.Unlock()
 }
 
 // setRunCancel stores the cancel function for the runner's own Run
@@ -287,14 +326,15 @@ func (r *Runner) Run(ctx context.Context) {
 			return
 
 		case cmd := <-r.cmds:
+			var err error
 			switch cmd.kind {
 			case cmdStart:
-				r.handleStart(timers)
+				err = r.handleStart(timers)
 			case cmdStop:
 				r.handleStop(timers)
 			}
 			if cmd.done != nil {
-				close(cmd.done)
+				cmd.done <- err
 			}
 
 		case info := <-exitCh:
@@ -309,7 +349,7 @@ func (r *Runner) Run(ctx context.Context) {
 
 		case <-stopKillCh:
 			timers.stopKill = nil
-			r.handleStopKillTimeout()
+			r.handleStopKillTimeout(timers)
 		}
 	}
 }
@@ -360,15 +400,15 @@ func (r *Runner) RestartCtx(ctx context.Context) error {
 }
 
 func (r *Runner) sendCtx(ctx context.Context, kind cmdKind) error {
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	select {
 	case r.cmds <- command{kind: kind, done: done}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 	select {
-	case <-done:
-		return nil
+	case err := <-done:
+		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -635,6 +675,12 @@ func (r *Runner) SignalGroup(sig syscall.Signal) error {
 	if p == nil {
 		return errors.New("not running")
 	}
+	// Non-consuming PID-reuse guard: an exit already sitting in the
+	// buffer means the child is reaped and its PID may be recycled.
+	// The exit itself belongs to the Run loop; only peek here.
+	if len(p.Exit()) > 0 {
+		return errors.New("not running (exit pending)")
+	}
 	return p.SignalGroup(sig)
 }
 
@@ -694,8 +740,12 @@ func (r *Runner) setProcess(p Process) {
 	r.mu.Unlock()
 }
 
-func (r *Runner) handleStart(timers *runnerTimers) {
+func (r *Runner) handleStart(timers *runnerTimers) error {
 	r.mu.Lock()
+	if r.removing {
+		r.mu.Unlock()
+		return errBeingRemoved
+	}
 	r.stoppedManually = false
 	r.mu.Unlock()
 	switch r.State() {
@@ -720,6 +770,7 @@ func (r *Runner) handleStart(timers *runnerTimers) {
 	default:
 		// Already starting/running/stopping — Start is a no-op.
 	}
+	return nil
 }
 
 // spawnNext spawns the configured command and transitions Starting->Running
@@ -858,16 +909,27 @@ func (r *Runner) handleStop(timers *runnerTimers) {
 	r.mu.Unlock()
 	switch r.State() {
 	case StateStarting, StateRunning:
-		sig, ok := config.ParseSignal(r.cfg.StopSignal)
-		if !ok {
-			sig = syscall.SIGTERM
-		}
+		r.setState(StateStopping)
 		if p := r.currentProcess(); p != nil {
+			// PID-reuse guard: if the child's exit is already buffered,
+			// it has been reaped and the kernel may have recycled its
+			// PID for an unrelated process. Consume the exit (we run in
+			// the Run goroutine, the channel's only reader) instead of
+			// signaling the recycled PID's group.
+			select {
+			case info := <-p.Exit():
+				r.handleExit(info, timers)
+				return
+			default:
+			}
+			sig, ok := config.ParseSignal(r.cfg.StopSignal)
+			if !ok {
+				sig = syscall.SIGTERM
+			}
 			if err := p.SignalGroup(sig); err != nil {
 				r.log.Warn("SignalGroup failed", "service", r.DisplayName(), "err", err)
 			}
 		}
-		r.setState(StateStopping)
 		// Schedule SIGKILL escalation if the process doesn't exit by
 		// stop_timeout. handleExit cancels the timer if the process
 		// dies on its own first.
@@ -891,13 +953,23 @@ func (r *Runner) handleStop(timers *runnerTimers) {
 // to Stopped. Stays in Stopping until that happens — SIGKILL is
 // uncatchable, so for any process not stuck in uninterruptible kernel
 // sleep this is a matter of milliseconds.
-func (r *Runner) handleStopKillTimeout() {
+func (r *Runner) handleStopKillTimeout(timers *runnerTimers) {
 	if r.State() != StateStopping {
 		return
 	}
 	p := r.currentProcess()
 	if p == nil {
 		return
+	}
+	// PID-reuse guard: the exit may already be buffered (Run's select
+	// can pick the timer over the exit channel when both are ready, or
+	// the reap landed just now). Consume it rather than SIGKILLing a
+	// PID the kernel may have recycled.
+	select {
+	case info := <-p.Exit():
+		r.handleExit(info, timers)
+		return
+	default:
 	}
 	r.log.Warn("stop_timeout exceeded; escalating to SIGKILL",
 		"service", r.DisplayName(), "pid", p.PID(), "stop_timeout", r.cfg.StopTimeout.Std())

@@ -62,15 +62,21 @@ func ResolveAutoReplicasAtBoot(services []config.Service, snap resources.Snapsho
 
 // replicaLogPath delegates to config.ReplicaLogPath so the supervisor
 // and doctor share one expansion rule.
-func replicaLogPath(spec string, idx, total int) string {
-	return config.ReplicaLogPath(spec, idx, total)
+func replicaLogPath(spec string, idx int, replicated bool) string {
+	return config.ReplicaLogPath(spec, idx, replicated)
 }
 
 // expandServiceToRunners turns a single config.Service spec into N
-// Runners, one per replica. For svc.Replicas <= 1 it returns a single
-// runner whose log paths and env are byte-for-byte what they would
-// have been before replicas existed (zero-regression contract for
-// non-replicated services).
+// Runners, one per replica. For a static `replicas = 1` (or absent)
+// it returns a single runner whose log paths and env are
+// byte-for-byte what they would have been before replicas existed
+// (zero-regression contract for non-replicated services).
+//
+// `replicas = "auto"` services are ALWAYS treated as replicated,
+// even when the resolved target is 1: replica 0 gets
+// ZPINIT_REPLICA_INDEX=0 and {index} expansion just like it would at
+// N=4, so a later scale-up doesn't leave replica 0 as the odd one
+// out with an index-less env and a literal `{index}` log path.
 //
 // Per-replica state lives on the Runner: the spec's log paths are
 // rewritten to per-replica files and ZPINIT_REPLICA_INDEX is injected
@@ -82,12 +88,13 @@ func expandServiceToRunners(svc config.Service, baseEnv []string, spawner Spawne
 	if n < 1 {
 		n = 1
 	}
+	replicated := svc.Replicas.Auto || n > 1
 	out := make([]*Runner, n)
 	for i := 0; i < n; i++ {
 		perReplica := svc
-		perReplica.Log.Stdout = replicaLogPath(svc.Log.Stdout, i, n)
-		perReplica.Log.Stderr = replicaLogPath(svc.Log.Stderr, i, n)
-		env := composeReplicaEnv(baseEnv, i, n)
+		perReplica.Log.Stdout = replicaLogPath(svc.Log.Stdout, i, replicated)
+		perReplica.Log.Stderr = replicaLogPath(svc.Log.Stderr, i, replicated)
+		env := composeReplicaEnv(baseEnv, i, replicated)
 		// NewRunnerForReplica keeps spec = svc (the unmodified
 		// service-level config) while cfg carries the per-replica
 		// log-path and env rewrites used at spawn time. servicesEqual
@@ -99,15 +106,17 @@ func expandServiceToRunners(svc config.Service, baseEnv []string, spawner Spawne
 }
 
 // composeReplicaEnv produces the env slice for replica idx of a
-// services with `total` replicas. For total <= 1 it returns base
-// unchanged (no ZPINIT_REPLICA_INDEX injection — keeps the env
-// footprint identical to today for non-replicated services).
+// replicated service. For non-replicated services (static
+// replicas <= 1) it returns base unchanged (no ZPINIT_REPLICA_INDEX
+// injection; keeps the env footprint identical to today).
+// Auto services pass replicated=true even at a resolved N of 1; see
+// expandServiceToRunners.
 //
 // If base already contains a ZPINIT_REPLICA_INDEX entry (e.g. an
 // operator put it in globals.Env), the slot is replaced with the
 // per-replica value rather than appended.
-func composeReplicaEnv(base []string, idx, total int) []string {
-	if total <= 1 {
+func composeReplicaEnv(base []string, idx int, replicated bool) []string {
+	if !replicated {
 		return base
 	}
 	out := make([]string, 0, len(base)+1)

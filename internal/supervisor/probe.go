@@ -98,6 +98,14 @@ func defaultProber(r *reaper.Reaper, log *slog.Logger) Prober {
 			}
 			return nil
 		case <-ctx.Done():
+			// PID-reuse guard: if the probe's exit is already buffered
+			// it has been reaped and the PGID may be recycled; report
+			// the cancellation without signaling anything.
+			select {
+			case <-exitCh:
+				return ctx.Err()
+			default:
+			}
 			_ = syscall.Kill(-proc.Pid, syscall.SIGKILL)
 			// Bounded wait: a D-state probe will not deliver SIGCHLD
 			// until its kernel I/O completes, which can be arbitrarily

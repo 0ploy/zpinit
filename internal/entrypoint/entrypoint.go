@@ -218,11 +218,21 @@ func runOne(ctx context.Context, cfg Config, path string, env []string) error {
 	case <-timeoutCh:
 		cfg.Logger.Warn("entrypoint script timed out", "name", filepath.Base(path), "timeout", cfg.ScriptTimeout)
 		cause = fmt.Errorf("script exceeded timeout %s", cfg.ScriptTimeout)
-		_ = syscall.Kill(-pid, syscall.SIGTERM)
 	case <-ctx.Done():
 		cause = fmt.Errorf("canceled: %w", ctx.Err())
-		_ = syscall.Kill(-pid, syscall.SIGTERM)
 	}
+	// PID-reuse guard: the script may have exited between the select
+	// decision above and this signal; its Wait-reaped PGID could be
+	// recycled. Consume the buffered result instead of signaling.
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("%w (script exit: %v)", cause, err)
+		}
+		return cause
+	default:
+	}
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
 
 	graceTimer := time.NewTimer(cfg.KillGrace)
 	defer graceTimer.Stop()
@@ -233,6 +243,15 @@ func runOne(ctx context.Context, cfg Config, path string, env []string) error {
 		}
 		return cause
 	case <-graceTimer.C:
+		// Same PID-reuse guard before the escalation.
+		select {
+		case err := <-done:
+			if err != nil {
+				return fmt.Errorf("%w (script exit: %v)", cause, err)
+			}
+			return cause
+		default:
+		}
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		select {
 		case <-done:

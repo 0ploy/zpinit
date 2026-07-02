@@ -353,15 +353,24 @@ func runEntrypoint(log *slog.Logger, configDir string, cfg *config.Config, skipF
 }
 
 func execCmd(log *slog.Logger, cmdline []string, env map[string]string) int {
+	// Resolve the binary against the MERGED env's PATH, not zpinit's
+	// inherited one: an entrypoint.d script that exports PATH via
+	// /run/zpinit/env expects it to affect binary resolution, exactly
+	// as it will affect the exec'd process. exec.LookPath consults the
+	// process env, so install the merged PATH first; the mutation is
+	// moot because Exec replaces the image (and on failure we exit).
+	if p, ok := env["PATH"]; ok {
+		_ = os.Setenv("PATH", p)
+	}
 	argv0, err := exec.LookPath(cmdline[0])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "zpinit:", err)
-		return 127
+		return 127 // shell convention: command not found
 	}
 	log.Info("exec", "cmd", cmdline)
 	if err := syscall.Exec(argv0, cmdline, entrypoint.SliceFromEnviron(env)); err != nil {
 		fmt.Fprintln(os.Stderr, "zpinit: exec:", err)
-		return 1
+		return 126 // shell convention: found but not executable
 	}
 	return 0 // unreachable; Exec replaces the process image
 }
@@ -515,6 +524,12 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 				ctrlCancel()
 				cancel()
 				shutdownTimer := time.NewTimer(budget)
+				// A second TERM/INT/QUIT during this wait is deliberately
+				// ignored (nothing reads userCh anymore): graceful stop is
+				// already running at full speed and per-runner SIGKILL
+				// escalation is the accelerator. Operators who want an
+				// immediate hard kill use the runtime's (docker stop -t 0);
+				// Pdeathsig takes the children down with PID 1.
 				select {
 				case code := <-exitCh:
 					shutdownTimer.Stop()

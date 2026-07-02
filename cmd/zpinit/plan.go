@@ -150,7 +150,7 @@ func printServicePlan(w io.Writer, s config.Service) {
 		if n > 1 || s.Replicas.Auto {
 			paths := make([]string, 0, n)
 			for i := 0; i < n; i++ {
-				paths = append(paths, config.ReplicaLogPath(s.Log.Stdout, i, n))
+				paths = append(paths, config.ReplicaLogPath(s.Log.Stdout, i, true))
 			}
 			fmt.Fprintf(w, "    log.stdout %s\n", strings.Join(dedupStrings(paths), ", "))
 		} else {
@@ -161,7 +161,7 @@ func printServicePlan(w io.Writer, s config.Service) {
 		if n > 1 || s.Replicas.Auto {
 			paths := make([]string, 0, n)
 			for i := 0; i < n; i++ {
-				paths = append(paths, config.ReplicaLogPath(s.Log.Stderr, i, n))
+				paths = append(paths, config.ReplicaLogPath(s.Log.Stderr, i, true))
 			}
 			fmt.Fprintf(w, "    log.stderr %s\n", strings.Join(dedupStrings(paths), ", "))
 		} else {

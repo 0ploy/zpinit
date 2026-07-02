@@ -72,15 +72,15 @@ func TestVersionAtLeast(t *testing.T) {
 }
 
 func TestReplicaLogPreview(t *testing.T) {
-	if got := config.ReplicaLogPath("/logs/{index}/x.log", 1, 3); got != "/logs/1/x.log" {
+	if got := config.ReplicaLogPath("/logs/{index}/x.log", 1, true); got != "/logs/1/x.log" {
 		t.Errorf("got %q", got)
 	}
-	if got := config.ReplicaLogPath("inherit", 0, 3); got != "inherit" {
+	if got := config.ReplicaLogPath("inherit", 0, true); got != "inherit" {
 		t.Errorf("inherit must be unchanged, got %q", got)
 	}
 	// Without {index}, the preview helper is a no-op; the doctor's
 	// upstream caller renders a "shared file" notice instead.
-	if got := config.ReplicaLogPath("/var/log/x.log", 2, 4); got != "/var/log/x.log" {
+	if got := config.ReplicaLogPath("/var/log/x.log", 2, true); got != "/var/log/x.log" {
 		t.Errorf("got %q, want path unchanged when no placeholder", got)
 	}
 }

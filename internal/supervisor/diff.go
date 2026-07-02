@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 
@@ -24,6 +25,16 @@ type reloadDiff struct {
 	// progress predictably.
 	remove  []*Runner
 	restart []reloadRestartPair
+	// conflicts holds human-readable descriptions of add/restart
+	// actions that were dropped because their service name collides
+	// with a retained running service from a different filename.
+	// Config-load validation only checks names among the files that
+	// parsed; a running service whose file is now broken (skipped,
+	// kept running) is invisible to it, so a new file reusing the
+	// name would otherwise register a runtime duplicate that
+	// resolveTarget and exit_code_from cannot disambiguate.
+	// applyReloadDiff surfaces each entry as an error.
+	conflicts []string
 }
 
 // computeDiff is the public-test entry point that takes the lock.
@@ -136,7 +147,14 @@ func (o *Orchestrator) computeDiffLocked(newCfg *config.Config) reloadDiff {
 		for _, p := range diff.restart {
 			inDiff[p.old[0].Cfg().Filename] = struct{}{}
 		}
-		for fn, runners := range existing {
+		// Walk the sorted filename list, not the map: map iteration
+		// order would make the restart list nondeterministic, and the
+		// apply side derives its teardown order from this list.
+		for _, fn := range ordered {
+			runners, hasRunners := existing[fn]
+			if !hasRunners {
+				continue
+			}
 			if _, skip := inDiff[fn]; skip {
 				continue
 			}
@@ -152,6 +170,52 @@ func (o *Orchestrator) computeDiffLocked(newCfg *config.Config) reloadDiff {
 			}
 			diff.restart = append(diff.restart, reloadRestartPair{old: runners, new: newSpec})
 		}
+	}
+
+	// Runtime duplicate-name guard: an add or restart whose new name
+	// matches a RETAINED running service from a different filename is
+	// dropped. Load-time validation can't see this case: the retained
+	// service's file may be skipped (broken) so its name is absent
+	// from the surviving-services uniqueness check, yet the runner
+	// keeps running. Registering the duplicate would leave
+	// findRunnerLocked and resolveTarget picking whichever copy sorts
+	// first, permanently ambiguous until an operator notices.
+	gone := map[string]struct{}{}
+	for _, r := range diff.remove {
+		gone[r.Cfg().Filename] = struct{}{}
+	}
+	for _, p := range diff.restart {
+		gone[p.old[0].Cfg().Filename] = struct{}{}
+	}
+	retained := map[string]string{}
+	for fn, runners := range existing {
+		if _, g := gone[fn]; g {
+			continue
+		}
+		retained[runners[0].Cfg().Name] = fn
+	}
+	if len(retained) > 0 {
+		keptAdd := diff.add[:0]
+		for _, s := range diff.add {
+			if rfn, dup := retained[s.Name]; dup && rfn != s.Filename {
+				diff.conflicts = append(diff.conflicts, fmt.Sprintf(
+					"add of %s refused: service name %q is already running from %s", s.Filename, s.Name, rfn))
+				continue
+			}
+			keptAdd = append(keptAdd, s)
+		}
+		diff.add = keptAdd
+		keptRestart := diff.restart[:0]
+		for _, p := range diff.restart {
+			if rfn, dup := retained[p.new.Name]; dup && rfn != p.new.Filename {
+				diff.conflicts = append(diff.conflicts, fmt.Sprintf(
+					"restart of %s refused: new service name %q is already running from %s; keeping old spec",
+					p.new.Filename, p.new.Name, rfn))
+				continue
+			}
+			keptRestart = append(keptRestart, p)
+		}
+		diff.restart = keptRestart
 	}
 	return diff
 }

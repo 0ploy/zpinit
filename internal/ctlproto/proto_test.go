@@ -2,6 +2,7 @@ package ctlproto
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 )
@@ -21,6 +22,27 @@ func TestRoundTrip_Request(t *testing.T) {
 	}
 	if len(got.Args) != 2 || got.Args[0] != "redis" || got.Args[1] != "nginx" {
 		t.Errorf("args = %v", got.Args)
+	}
+}
+
+func TestReadBodyLine_PartialLineAtEOFIsError(t *testing.T) {
+	// A peer that dies mid-line must not have the fragment accepted as
+	// a complete line: a truncated "." would otherwise read as a clean
+	// terminator and a crashed-mid-stream follow would exit 0.
+	var w bytes.Buffer
+	c := NewConn(struct {
+		io.Reader
+		io.Writer
+	}{strings.NewReader("0 ok\nbody\n."), &w})
+	if code, _, err := c.ReadStatusLine(); err != nil || code != 0 {
+		t.Fatalf("status: code=%d err=%v", code, err)
+	}
+	if line, done, err := c.ReadBodyLine(); err != nil || done || line != "body" {
+		t.Fatalf("body: line=%q done=%v err=%v", line, done, err)
+	}
+	// The trailing "." has no newline: EOF mid-line, must error.
+	if _, done, err := c.ReadBodyLine(); err == nil {
+		t.Fatalf("partial terminator at EOF: done=%v err=nil, want error", done)
 	}
 }
 

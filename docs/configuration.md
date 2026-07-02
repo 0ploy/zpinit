@@ -178,10 +178,12 @@ service):
 
 Detection takes the min of every source it can read: cgroup v2
 (`cpu.max`, `memory.max`), cgroup v1 (`cpu.cfs_quota_us` /
-`cpu.cfs_period_us`, `memory.limit_in_bytes`), and `/proc/cpuinfo` /
-`/proc/meminfo`. A container inside a VM is covered: cgroup limits
-and the VM's kernel view both apply, whichever is smaller wins. On
-bare metal or a microVM without cgroups, `/proc` is authoritative.
+`cpu.cfs_period_us`, `memory.limit_in_bytes`), the cpuset
+(`cpuset.cpus.effective`; covers `--cpuset-cpus` without `--cpus`,
+which sets no CFS quota), and `/proc/cpuinfo` / `/proc/meminfo`. A
+container inside a VM is covered: cgroup limits and the VM's kernel
+view both apply, whichever is smaller wins. On bare metal or a
+microVM without cgroups, `/proc` is authoritative.
 
 Apps decide whether to read the vars. nginx wrappers can map
 `ZPINIT_CPU_COUNT` onto `worker_processes`; the JVM onto `-Xmx`; a
@@ -364,8 +366,10 @@ silently. Non-executable files are skipped with a warning at
 `--check-config`.
 
 Scripts can write key=value lines to `/run/zpinit/env` to export env
-vars to all services. (Test-only: `ZPINIT_ENV_FILE` overrides the
-path.)
+vars to all services, and to a wrapped CMD. A `PATH` exported here
+also affects how the CMD binary is resolved in wrap mode, matching
+what the exec'd process will see. (Test-only: `ZPINIT_ENV_FILE`
+overrides the path.)
 
 ## Validation
 
@@ -390,11 +394,18 @@ collisions, `exit_code_from` to a missing service) abort the load.
 - `default_stop_signal` and per-service `stop_signal` are recognised.
 - `exit_code_from` references an existing service (or is `"default"`).
   Pointing it at a service with `replicas > 1` is rejected (ambiguous).
+  This check is deliberately fatal even when the target's own file is
+  merely skipped for a parse error: booting without the service whose
+  exit decides the container's fate would supervise a workload that
+  can never exit correctly, so the error names the skipped file(s)
+  and the whole config is refused until it is fixed.
 - `replicas` is in `[1, 64]`; the same 64 cap bounds auto targets,
   `replicas_min`, and `replicas_max`.
 - All durations (`boot_timeout`, `stop_timeout`, backoff settings,
   `[ready]` interval/timeout, entrypoint script timeout) are
   non-negative.
+- Byte sizes (`reserve_memory`) parse, use a known unit, and fit in
+  64 bits.
 - `entrypoint.d/` files are executable (warning, not error).
 - `control_socket` is an absolute path.
 

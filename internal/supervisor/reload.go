@@ -452,15 +452,24 @@ func (o *Orchestrator) ReloadScoped(ctx context.Context, newCfg *config.Config, 
 		if strings.Contains(n, "/") {
 			return reloadDiff{}, fmt.Errorf("update operates on whole services; drop the /N from %q", n)
 		}
-		if fn, ok := diskFiles[n]; ok {
-			wantFiles[fn] = struct{}{}
+		// A name can resolve in BOTH maps to different filenames: the
+		// operator renamed the file (10_a.toml -> 20_a.toml, same
+		// service name). Identity is by filename, so that is a remove
+		// of the old file plus an add of the new one; scoping to only
+		// the disk filename would add the new copy while leaving the
+		// old one running under the same name.
+		fnDisk, okDisk := diskFiles[n]
+		fnRun, okRun := runFiles[n]
+		if !okDisk && !okRun {
+			unknown = append(unknown, n)
 			continue
 		}
-		if fn, ok := runFiles[n]; ok {
-			wantFiles[fn] = struct{}{}
-			continue
+		if okDisk {
+			wantFiles[fnDisk] = struct{}{}
 		}
-		unknown = append(unknown, n)
+		if okRun {
+			wantFiles[fnRun] = struct{}{}
+		}
 	}
 	if len(unknown) > 0 {
 		return reloadDiff{}, fmt.Errorf("%w: %s", errUnknownService, strings.Join(unknown, ", "))
@@ -541,18 +550,27 @@ func (o *Orchestrator) ReloadScoped(ctx context.Context, newCfg *config.Config, 
 // retry.
 func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, commitCfg *config.Config, newBaseEnv []string) error {
 	var errs []error
+	// Name-collision conflicts detected by computeDiffLocked dropped
+	// their actions; surface each as an error so `zpctl update` /
+	// `reread` fail visibly instead of silently not applying a file.
+	for _, c := range diff.conflicts {
+		o.log.Warn("reload: " + c)
+		errs = append(errs, errors.New(c))
+	}
 	// diff.remove is built in filename-sorted order and packs every
 	// replica of a filename consecutively (see computeDiffLocked).
-	// Walk it as filename groups so all replicas of one logical
-	// service are removed in parallel within their stop_timeout
-	// rather than serially.
-	for i := 0; i < len(diff.remove); {
-		fn := diff.remove[i].Cfg().Filename
+	// Walk the groups in REVERSE filename order, mirroring stopAll:
+	// filename order encodes dependency order, so when one reload
+	// deletes both 10_redis and 20_php-fpm the dependent (20_*) drains
+	// before its dependency (10_*) is signaled. Within a group all
+	// replicas are removed in parallel within their stop_timeout.
+	for i := len(diff.remove); i > 0; {
+		fn := diff.remove[i-1].Cfg().Filename
 		j := i
-		for j < len(diff.remove) && diff.remove[j].Cfg().Filename == fn {
-			j++
+		for j > 0 && diff.remove[j-1].Cfg().Filename == fn {
+			j--
 		}
-		for _, err := range o.removeServiceGroup(ctx, diff.remove[i:j]) {
+		for _, err := range o.removeServiceGroup(ctx, diff.remove[j:i]) {
 			if err != nil {
 				o.log.Error("reload: remove failed; runner kept registered", "err", err)
 				errs = append(errs, err)
@@ -566,8 +584,15 @@ func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, com
 	// group form fits directly. If any old replica fails to stop the
 	// new spec is skipped for this reload (removeServiceGroup leaves
 	// failed runners registered so the next reload's diff retries).
+	// Stops run in reverse filename order for the same dependency
+	// reason as removals; the boot side (addSpecs) is sorted ascending
+	// below, so restarted services still come back up in boot order.
+	restarts := append([]reloadRestartPair(nil), diff.restart...)
+	sort.Slice(restarts, func(i, j int) bool {
+		return restarts[i].new.Filename > restarts[j].new.Filename
+	})
 	var addSpecs []config.Service
-	for _, p := range diff.restart {
+	for _, p := range restarts {
 		failed := false
 		for i, err := range o.removeServiceGroup(ctx, p.old) {
 			if err != nil {
@@ -705,6 +730,16 @@ func (o *Orchestrator) runReloadBoots(root context.Context, jobs []reloadBootJob
 		// services into a teardown that already passed them by.
 		if root.Err() != nil || o.isStopping() {
 			return
+		}
+		// A reload that landed after this job was queued may have
+		// removed its runner already (its Run goroutine is gone).
+		// Booting it anyway would park StartCtx for the full
+		// boot_timeout while holding reloadBootMu, stalling every
+		// legitimate boot queued behind this one.
+		if !o.isRegistered(j.runner) {
+			o.log.Info("reload: boot job skipped; service removed before boot",
+				"service", j.runner.DisplayName())
+			continue
 		}
 		bctx, bcancel := context.WithTimeout(root, globals.BootTimeout.Std())
 		o.bootReloadJob(bctx, j)

@@ -114,6 +114,166 @@ func TestStreamFile_RotationDoesNotLeakFD(t *testing.T) {
 	}
 }
 
+// followHarness starts streamFile on path and returns a channel of
+// received body lines plus a stop function. net.Pipe is synchronous,
+// so the reader goroutine must run for streamFile's writes to land.
+func followHarness(t *testing.T, path string) (<-chan string, func()) {
+	t.Helper()
+	client, srv := net.Pipe()
+	pc := ctlproto.NewConn(srv)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		streamFile(ctx, srv, pc, path, testLog())
+	}()
+	lines := make(chan string, 64)
+	go func() {
+		sc := bufio.NewScanner(client)
+		sc.Buffer(make([]byte, 0, 128*1024), 128*1024)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+		close(lines)
+	}()
+	stop := func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("streamFile did not return after ctx cancel")
+		}
+		srv.Close()
+		client.Close()
+	}
+	return lines, stop
+}
+
+func waitFollowLine(t *testing.T, lines <-chan string, want string) []string {
+	t.Helper()
+	var seen []string
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case l, ok := <-lines:
+			if !ok {
+				t.Fatalf("stream closed before %q arrived; saw %v", want, seen)
+			}
+			seen = append(seen, l)
+			if strings.Contains(l, want) {
+				return seen
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for line %q; saw %v", want, seen)
+		}
+	}
+}
+
+// TestStreamFile_NoTornLines pins line-based emission: a writer caught
+// mid-line must not have the prefix delivered as its own body frame.
+// The old byte-based drain emitted whatever was in the file at EOF, so
+// "par" and "tial" arrived as two separate lines.
+func TestStreamFile_NoTornLines(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	// "par" is a partial line: its writer is mid-write.
+	if err := os.WriteFile(path, []byte("one\npar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lines, stop := followHarness(t, path)
+	defer stop()
+
+	seen := waitFollowLine(t, lines, "one")
+	// Complete the line and expect it whole.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("tial\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	seen = append(seen, waitFollowLine(t, lines, "partial")...)
+	for _, l := range seen {
+		if l == "par" || l == "tial" {
+			t.Fatalf("torn line fragment %q was emitted as its own frame; lines: %v", l, seen)
+		}
+	}
+}
+
+// TestStreamFile_OversizedLineIsChunked pins the chunking cap: a line
+// longer than maxFollowChunk must arrive as several frames each below
+// the client's 64KiB wire cap, instead of one giant line that makes
+// the client abort with a misleading protocol failure.
+func TestStreamFile_OversizedLineIsChunked(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	if err := os.WriteFile(path, []byte("start\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lines, stop := followHarness(t, path)
+	defer stop()
+	waitFollowLine(t, lines, "start")
+
+	// Append the oversized line while the follow is live (the initial
+	// snapshot only covers the last 8KB, so it must arrive via the
+	// poll loop).
+	huge := strings.Repeat("a", 3*maxFollowChunk+17)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(huge + "\nend\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	seen := waitFollowLine(t, lines, "end")
+	var got strings.Builder
+	for _, l := range seen[:len(seen)-1] {
+		if len(l) > maxFollowChunk {
+			t.Fatalf("frame of %d bytes exceeds maxFollowChunk (%d)", len(l), maxFollowChunk)
+		}
+		got.WriteString(l)
+	}
+	if got.String() != huge {
+		t.Fatalf("reassembled %d bytes, want %d; chunking lost data", got.Len(), len(huge))
+	}
+}
+
+// TestStreamFile_CopytruncateRestartsFromTop pins truncation handling:
+// logrotate's copytruncate mode keeps the inode, so the inode-based
+// rotation check never fires. The follow loop must notice the file
+// shrank below its consumed offset and restart from the top instead of
+// going silent forever.
+func TestStreamFile_CopytruncateRestartsFromTop(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	if err := os.WriteFile(path, []byte("one\ntwo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lines, stop := followHarness(t, path)
+	defer stop()
+
+	waitFollowLine(t, lines, "two")
+
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("fresh\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	waitFollowLine(t, lines, "fresh")
+}
+
 // TestFollow_ClientDisconnectEndsStream pins the disconnect watcher:
 // a follow client that goes away while the tailed file is idle must
 // end the server-side stream promptly. Without the watcher the

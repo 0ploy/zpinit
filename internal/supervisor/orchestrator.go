@@ -676,14 +676,24 @@ func (o *Orchestrator) removeServiceGroup(ctx context.Context, group []*Runner) 
 			defer wg.Done()
 			name := r.DisplayName()
 			o.log.Info("reload: removing", "service", name)
+			// Latch first: a `zpctl start` racing this removal must be
+			// refused whether it lands before the stop (handleStart sees
+			// the latch), in the WaitTerminal window, or after cancelRun
+			// (Run's select can still drain a queued start before it
+			// observes cancellation). Without the latch, a start landing
+			// after WaitTerminal respawns the child and the deregistration
+			// below hands PID 1 a live unmanaged process.
+			r.markRemoving()
 			wctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			if err := r.StopCtx(wctx); err != nil {
 				errs[i] = fmt.Errorf("%s: stop send: %w", name, err)
+				r.clearRemoving()
 				return
 			}
 			if _, err := r.WaitTerminal(wctx); err != nil {
 				errs[i] = fmt.Errorf("%s did not terminate within stop_timeout (state=%s): %w", name, r.State(), err)
+				r.clearRemoving()
 				return
 			}
 			// Cancel the runner's Run goroutine so it exits and the
