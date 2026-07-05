@@ -109,7 +109,7 @@ listening fd before bind — no `LD_PRELOAD` shim for static Go binaries.
 | ----------------------------------- | ---------------------------- | --------------------------------- |
 | N workers across cores              | yes                          | yes                               |
 | auto-restart per worker             | yes                          | yes (each is a first-class child) |
-| per-worker logs                     | yes                          | yes (`{index}` template or `.N`)  |
+| per-worker logs                     | yes                          | yes (`{index}` template)          |
 | graceful shutdown                   | yes                          | yes (existing `stop_timeout` path) |
 | zero-drop rolling reload            | yes (master holds listener)  | best-effort (per-replica drain)   |
 | `cluster.worker.id`, `process.send` | yes                          | no (Node cluster IPC unavailable) |

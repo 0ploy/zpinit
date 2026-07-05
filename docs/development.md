@@ -31,8 +31,9 @@ Tests use the standard library only. No testify, gomock, or similar.
 The only approved external dependency is `github.com/BurntSushi/toml`;
 anything else needs explicit approval before `go get`.
 
-CI runs unit on every push (Linux + macOS) and integration on PRs
-and pushes to main. Both run with `go test -race -count=1` so the
+CI runs unit tests on every push and PR (Linux + macOS), then
+integration tests (Linux) once unit passes; there is no branch
+filter. Both run with `go test -race -count=1` so the
 data-race class the v0.3.x review surfaced can't regress unnoticed
 in the supervise / reload / autoscale fan-out.
 

@@ -89,12 +89,12 @@ entrypoint_on_failure = "fail"
 # burn this budget, not boot_timeout.
 entrypoint_script_timeout = "5m"
 
-# Time budget for the service-boot phase (start + readiness probe per
-# service, summed). Starts at the moment service-boot begins, not at
-# zpinit launch. Covers the WHOLE service list, not a per-service
-# budget: with many services or a slow late service, an early service
-# can be denied its share. Set generously relative to the sum of
-# expected boot times, or split into smaller images.
+# Per-service time budget for start + readiness probe. Each service
+# (and each replica) gets its own fresh window, both at initial boot
+# and when a reload boots added or restarted services, so a slow early
+# service cannot starve later services of their probe window. Size it
+# for the slowest single service, not the sum. entrypoint.d scripts
+# are covered separately by entrypoint_script_timeout.
 boot_timeout = "60s"
 
 # Default signal sent to services on graceful stop.
@@ -276,8 +276,9 @@ reloadable = true
 #     useful for I/O-bound queue workers ("16 sidekiqs even on a
 #     2-CPU box").
 #   - replicas_max caps the count from above.
-# Both are ignored for static replicas. min defaults to 1, max to
-# unbounded (subject to the 64 typo guard).
+# Setting either alongside a static (integer) replicas value is a
+# validation error. min defaults to 1, max to unbounded (subject to
+# the 64 typo guard).
 #
 # Replicas of an app that binds a port without SO_REUSEPORT support
 # will collide with EADDRINUSE on all but the first; `zpinit

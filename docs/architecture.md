@@ -90,8 +90,9 @@ A polling goroutine in `internal/resources.Watcher` re-runs
 `Detect` once a second. When the exposed integer (`ZPINIT_CPU_COUNT`)
 or uint64 (`ZPINIT_MEMORY_BYTES`) value differs from the last
 committed Snapshot, a per-direction debounce timer starts
-(`scale_up_after` for any upward move, `scale_down_after`
-otherwise). If the new value still holds when the timer fires, the
+(`scale_down_after` when any dimension moves down, including
+mixed-direction moves; `scale_up_after` only when everything moves
+up). If the new value still holds when the timer fires, the
 watcher commits and emits a `Change` carrying the new Snapshot and
 the list of dimensions (`"cpu"`, `"memory"`) that moved. A
 transient flip that returns to baseline within the debounce window
