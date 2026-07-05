@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Agent Skill for AI coding assistants.** `npx skills add
+  0ploy/zpinit` installs a skill (from `skills/zpinit/` in this repo)
+  that teaches Claude Code and other skills-compatible agents what
+  zpinit is, how to copy it into an image, the three modes, service
+  TOML basics, and the `zpctl` workflow.
+
 ## v0.5.5
 
 ### Fixed

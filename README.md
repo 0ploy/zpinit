@@ -26,6 +26,20 @@ Every container image needs the same three pieces of plumbing:
 
 Three tools, three config formats, three mental models. zpinit folds all three jobs into one static binary with one TOML schema.
 
+## Teach your AI agent zpinit
+
+zpinit ships an [Agent Skill](skills/zpinit/SKILL.md). One command
+installs it into Claude Code and other skills-compatible agents:
+
+```sh
+npx skills add 0ploy/zpinit
+```
+
+The skill teaches the agent what zpinit is, how to copy it into an
+image, when each of the three modes applies, how to write service
+TOML, and the `zpctl` workflow, so it writes correct Dockerfiles and
+configs without you pasting docs into the prompt.
+
 ## Try it in 30 seconds
 
 ```sh
@@ -140,7 +154,7 @@ backoff, applies live config reloads, and handles graceful shutdown.
 FROM ubuntu:24.04
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    nginx php8.4-fpm \
+    nginx php8.3-fpm \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=ghcr.io/0ploy/zpinit:latest /usr/local/bin/zpinit /usr/local/bin/
 COPY --from=ghcr.io/0ploy/zpinit:latest /usr/local/bin/zpctl  /usr/local/bin/
