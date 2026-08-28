@@ -143,6 +143,14 @@ change observable behavior, it was never quiet — give it an entry.
   Production always reads `/run/zpinit/env`. Don't expose it in
   `--help` or document it publicly.
 
+- Initial boot is fatal on failure unless the service opts out with
+  `on_boot_failure = "continue"` (per-service, default `"fail"`). Only
+  `Orchestrator.boot` consults it; reload-added services that fail to
+  boot have never been able to abort the container. Keep the default
+  fatal: an orchestrator needs a container that cannot start to say so,
+  and only an operator who needs `docker exec` to survive a broken app
+  (dev images) should trade that away.
+
 - `boot_timeout` is per-service, both at initial boot and reload: each
   service gets its own fresh `context.WithTimeout`. A legitimately slow
   first service can't starve later services of their probe window.
@@ -150,9 +158,22 @@ change observable behavior, it was never quiet — give it an entry.
   timeouts cover entrypoint.d separately, so a slow `composer install`
   doesn't eat the service-boot budget.
 
-- Reload-removing the `exit_code_from`-watched service shuts the whole
-  supervisor down: its terminal-state watcher fires and triggers
-  shutdown. Don't reload-remove the watched service.
+- The `exit_code_from` watcher fires only on a terminal state the
+  service reached ON ITS OWN (an exit under a non-restarting policy, or
+  FATAL). Operator-driven terminal states never fire it: `RestartCtx`
+  transits `Stopped` between its stop and start halves, so treating any
+  `WaitTerminal` return as terminal made `zpctl restart <target>` shut
+  the container down. `stoppedManually` is NOT usable for this
+  (`handleStart` clears it the moment the restart's start half runs, so
+  a watcher reading it after waking sees `false`); `setTerminal` latches
+  the reason into `lastTerminal` before the transition instead, and the
+  latch is never cleared by a later Start. The watcher LOOPS: on an
+  operator edge it parks in `WaitLeftTerminal` and resumes watching, so
+  a service restarted once can still end the container later. Don't
+  collapse it back to a single `WaitTerminal` and don't switch the
+  predicate to `CompletedCleanly` (that requires exit code 0, which
+  would stop a failing `restart = "never"` worker from propagating its
+  exit code, the whole point of the key).
 
 - Production code calls `Runner.StartCtx`/`StopCtx`, never bare
   `Start`/`Stop`. The bare versions block forever if the Run goroutine

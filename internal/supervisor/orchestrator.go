@@ -315,6 +315,18 @@ func (o *Orchestrator) boot(ctx context.Context) error {
 					"service", r.DisplayName())
 				continue
 			}
+			// on_boot_failure = "continue": keep PID 1 alive so
+			// operators can `docker exec` in and repair the image in
+			// place. The service is left in whatever state it reached
+			// (BACKOFF or FATAL under a restarting policy, STOPPED
+			// otherwise) and stays visible in `zpctl status`; later
+			// services still boot, because filename order is a start
+			// order and not a hard dependency graph.
+			if r.Cfg().OnBootFailure == config.BootContinue {
+				o.log.Error("boot: service failed to boot; continuing (on_boot_failure = continue)",
+					"service", r.DisplayName(), "err", err)
+				continue
+			}
 			return fmt.Errorf("%s: %w", r.DisplayName(), err)
 		}
 	}
@@ -473,28 +485,48 @@ func (o *Orchestrator) installExitCodeWatcher() {
 	o.mu.Unlock()
 
 	go func() {
-		state, err := target.WaitTerminal(wctx)
-		if err != nil {
-			// Watcher canceled (reload retarget or orchestrator shutdown);
-			// don't fire early-shutdown.
+		for {
+			state, err := target.WaitTerminal(wctx)
+			if err != nil {
+				// Watcher canceled (reload retarget or orchestrator shutdown);
+				// don't fire early-shutdown.
+				return
+			}
+			// Re-check under the lock that we're still the current
+			// installation. A reload that retargets exit_code_from cancels
+			// our wctx, but cancel does not synchronize with our progress:
+			// if the old target reached terminal state at the same instant,
+			// WaitTerminal can return nil here even though Reload has since
+			// installed a new watcher for a different service. Firing
+			// shutdown in that window would terminate the supervisor for
+			// the wrong reason.
+			o.mu.RLock()
+			stillCurrent := o.watcherGen == gen
+			o.mu.RUnlock()
+			if !stillCurrent {
+				return
+			}
+			// An operator Stop or Restart transits Stopped on its way;
+			// that is the operator managing a service, not the service
+			// this container exists for coming to an end, so it must
+			// not take the container down. Park until the runner leaves
+			// the terminal state (a Restart's start half, or a later
+			// `zpctl start`) and keep watching: it can still end on its
+			// own, or crash-loop to FATAL, afterwards. A target that is
+			// stopped and left stopped parks here for good, which is
+			// the point: the container outlives it.
+			if info := target.LastTerminal(); info.Valid && info.Manual {
+				o.log.Info("exit_code_from target reached terminal state by operator request; not shutting down",
+					"service", name, "state", state)
+				if err := target.WaitLeftTerminal(wctx); err != nil {
+					return
+				}
+				continue
+			}
+			o.log.Info("exit_code_from terminal", "service", name, "state", state)
+			once.Do(func() { close(earlyCh) })
 			return
 		}
-		// Re-check under the lock that we're still the current
-		// installation. A reload that retargets exit_code_from cancels
-		// our wctx, but cancel does not synchronize with our progress:
-		// if the old target reached terminal state at the same instant,
-		// WaitTerminal can return nil here even though Reload has since
-		// installed a new watcher for a different service. Firing
-		// shutdown in that window would terminate the supervisor for
-		// the wrong reason.
-		o.mu.RLock()
-		stillCurrent := o.watcherGen == gen
-		o.mu.RUnlock()
-		if !stillCurrent {
-			return
-		}
-		o.log.Info("exit_code_from terminal", "service", name, "state", state)
-		once.Do(func() { close(earlyCh) })
 	}()
 }
 

@@ -54,6 +54,21 @@ CMD; that combination does not exist. Express a foreground worker as a
 service with `restart = "never"` plus `exit_code_from = "<name>"` in
 `zpinit.toml` (the container then exits with that service's exit code).
 
+Only set `exit_code_from` when one service really does own the
+container's lifetime. Without it, once boot has completed nothing a
+service does ends the container: it crashes, goes FATAL, or gets
+stopped, and zpinit stays PID 1 until it is signaled or `zpctl
+shutdown` runs. That is what a dev or debug container wants, so
+`docker exec` and `zpctl restart` survive a dead app.
+
+With it, the container exits when that one service ends **on its own**:
+a clean or failing exit under `restart = "never"`, or a crash-loop into
+FATAL under a restarting policy (both policies are supported). Operator
+actions never count: `zpctl restart` and `zpctl stop` on the named
+service leave the container up. The other way a service can end the
+container is failing its INITIAL boot, which is independent of this key
+(see `on_boot_failure` below).
+
 ## Mode 1: single process
 
 zpinit validates config, then `syscall.Exec`s the CMD, which takes over
@@ -146,11 +161,16 @@ restart = "always"                          # or "on-failure" | "never"
 stop_signal  = "TERM"                       # default; "TERM" and "SIGTERM" both work
 stop_timeout = "10s"                        # default; then SIGKILL escalation
 
+on_boot_failure = "fail"                    # default: failing initial boot exits the
+                                            # container. "continue" keeps PID 1 alive
+
 [ready]                                     # optional; gates the NEXT service
 command    = ["sh", "-c", "test -S /run/php/php8.3-fpm.sock"]
 interval   = "200ms"                        # delay between attempts
 timeout    = "10s"                          # give up after this long
 on_timeout = "fail"                         # default: abort boot; "continue" proceeds
+                                            # (what an aborted boot DOES is
+                                            #  on_boot_failure's job, above)
 
 [env]                                       # per-service overrides
 LOG_LEVEL = "info"
@@ -173,7 +193,16 @@ Key facts when writing service files:
   the ordering mechanism. Each service gets its own `boot_timeout`
   window (default `"60s"`, global) for start plus readiness probe.
 - A crash restarts the service with exponential backoff; 5 consecutive
-  crashes put it in FATAL state.
+  crashes put it in FATAL state. Neither ends the container (unless
+  `exit_code_from` names that service, in which case FATAL does).
+- A service failing its INITIAL boot DOES end the container, exit 1,
+  whatever `exit_code_from` says. That is the default so an
+  orchestrator sees a container that could not start. Add
+  `on_boot_failure = "continue"` to a service to opt out: the failure
+  is logged, the service stays visible in `zpctl status`, later
+  services still boot, and PID 1 keeps running. Use it in dev images,
+  where the operator needs `docker exec` to get into a broken
+  container and repair it in place.
 - File log paths get their parent directory auto-created; a symlink at
   the file itself is rejected. zpinit does not create other runtime
   dirs (e.g. `/run/php` for a socket): do that in `entrypoint.d/`.
@@ -204,12 +233,13 @@ and `ZPINIT_MEMORY_BYTES` into every child.
 ```sh
 zpctl status [--verbose] [--json]   # states, per replica
 zpctl start|stop|restart NAME | all # --wait blocks until ready
+                                    # none of these ever end the container
 zpctl reload NAME                   # in-place: reload_signal/_command, else stop+start
 zpctl tail [-f] NAME                # last 8KB of a service log; -f streams
 zpctl reread                        # dry-run config diff
 zpctl update [NAME...]              # apply config changes (same as SIGHUP)
 zpctl ready                         # exit 0 iff all services running and ready
-zpctl shutdown
+zpctl shutdown                      # exit PID 1; ends the container
 ```
 
 `NAME/N` targets replica N. Editing files under `services/` then

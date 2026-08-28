@@ -107,6 +107,17 @@ type Runner struct {
 	// (-> EXITED). Set true on Stop, cleared on Start.
 	stoppedManually bool
 
+	// lastTerminal records the most recent transition into a terminal
+	// state and why. Deliberately separate from stoppedManually, which
+	// handleStart clears the instant an operator restart spawns the
+	// next child: a watcher woken by the Stopped edge and reading
+	// stoppedManually afterwards sees a value that has already been
+	// reset, which is exactly how `zpctl restart` on the
+	// exit_code_from target used to take the container down. Written
+	// only at terminal transitions, so a late reader still attributes
+	// the edge it woke on correctly.
+	lastTerminal TerminalInfo
+
 	// removing latches the runner for deregistration. Set by
 	// removeServiceGroup before it stops the runner; handleStart
 	// refuses while it is set, closing the window where a queued
@@ -529,6 +540,66 @@ func (r *Runner) WaitTerminal(ctx context.Context) (State, error) {
 	}
 }
 
+// TerminalInfo describes a runner's most recent transition into a
+// terminal state (Stopped or Fatal).
+type TerminalInfo struct {
+	// State is the terminal state that was entered.
+	State State
+	// Manual is true when the transition was caused by an operator
+	// Stop, which includes the stop half of a Restart. False when the
+	// child ended on its own or the crash budget was exhausted.
+	Manual bool
+	// Valid is false if the runner has never reached a terminal state.
+	Valid bool
+}
+
+// setTerminal latches why the runner is entering a terminal state and
+// then performs the transition. The latch is written BEFORE setState so
+// any observer woken by the transition already sees it: the
+// exit_code_from watcher wakes on the Stopped edge and immediately
+// reads LastTerminal to decide whether the container should follow the
+// service down.
+func (r *Runner) setTerminal(state State, manual bool) {
+	r.mu.Lock()
+	r.lastTerminal = TerminalInfo{State: state, Manual: manual, Valid: true}
+	r.mu.Unlock()
+	r.setState(state)
+}
+
+// LastTerminal returns the runner's most recent terminal transition.
+// Unlike StoppedManually it is not cleared by a subsequent Start, so a
+// caller that wakes on a terminal edge can still read why that edge
+// happened after the runner has moved on.
+func (r *Runner) LastTerminal() TerminalInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastTerminal
+}
+
+// WaitLeftTerminal blocks until the runner is no longer Stopped or
+// Fatal, or ctx expires. The exit_code_from watcher parks here after
+// declining an operator-driven terminal edge: WaitTerminal would
+// otherwise return immediately in a tight loop for as long as the
+// runner sits in Stopped. Subscribe-before-check for the same reason
+// as WaitTerminal: a Restart's start half can land between the two.
+func (r *Runner) WaitLeftTerminal(ctx context.Context) error {
+	ch, cancel := r.Observe()
+	defer cancel()
+	if s := r.State(); s != StateStopped && s != StateFatal {
+		return nil
+	}
+	for {
+		select {
+		case s := <-ch:
+			if s != StateStopped && s != StateFatal {
+				return nil
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 // LastExit returns the last reaped ExitInfo (zero value if the runner
 // has never seen an exit). Used by the orchestrator to compute the
 // supervisor exit code via exit_code_from.
@@ -803,7 +874,9 @@ func (r *Runner) handleExit(info reaper.ExitInfo, timers *runnerTimers) {
 	r.setProcess(nil)
 
 	if r.State() == StateStopping {
-		r.setState(StateStopped)
+		// Stopping is only ever entered from handleStop, so this edge
+		// belongs to an operator Stop (or the stop half of a Restart).
+		r.setTerminal(StateStopped, true)
 		return
 	}
 
@@ -820,7 +893,7 @@ func (r *Runner) handleExit(info reaper.ExitInfo, timers *runnerTimers) {
 	}
 
 	if !shouldRestart {
-		r.setState(StateStopped)
+		r.setTerminal(StateStopped, false)
 		return
 	}
 
@@ -851,7 +924,7 @@ func (r *Runner) recordFailure(timers *runnerTimers) {
 	r.mu.Unlock()
 	if crashes >= MaxConsecutiveCrashes {
 		r.log.Warn("retry budget exceeded; fatal", "service", r.DisplayName(), "crashes", crashes)
-		r.setState(StateFatal)
+		r.setTerminal(StateFatal, false)
 		return
 	}
 	delay := r.backoffStep()
@@ -937,10 +1010,10 @@ func (r *Runner) handleStop(timers *runnerTimers) {
 
 	case StateBackoff:
 		timers.cancelBackoff()
-		r.setState(StateStopped)
+		r.setTerminal(StateStopped, true)
 
 	case StatePending:
-		r.setState(StateStopped)
+		r.setTerminal(StateStopped, true)
 
 	default:
 		// stopping/stopped/fatal — no-op (SIGKILL timer, if any, keeps running)

@@ -95,6 +95,10 @@ entrypoint_script_timeout = "5m"
 # service cannot starve later services of their probe window. Size it
 # for the slowest single service, not the sum. entrypoint.d scripts
 # are covered separately by entrypoint_script_timeout.
+#
+# A service that doesn't make it inside its window has failed to boot,
+# which aborts zpinit with exit 1 unless that service sets
+# on_boot_failure = "continue".
 boot_timeout = "60s"
 
 # Default signal sent to services on graceful stop.
@@ -104,9 +108,24 @@ default_stop_signal = "TERM"
 # SIGKILL escalation.
 default_stop_timeout = "10s"
 
-# Foreground-worker pattern. "default" means "exit when all services
-# are done". Set to a service name to make zpinit exit with that
-# service's exit code when it terminates.
+# Foreground-worker pattern. "default" (the default) means no service
+# controls the container's lifetime: once boot has completed, zpinit
+# runs until it is signaled or `zpctl shutdown` is called, whatever the
+# services do (crash, go FATAL, get stopped). The one exception is
+# BOOT: a service that fails its initial boot aborts zpinit unless it
+# sets on_boot_failure = "continue" (see services/*.toml below).
+#
+# Set this to a service name and zpinit exits with that service's exit
+# code once that service ends ON ITS OWN: a clean or failing exit under
+# `restart = "never"`, or crash-looping to FATAL under a restarting
+# policy. Both `restart` policies are supported; pick "never" for a
+# one-off task, or a restarting policy when you want transient crashes
+# retried but permanent failure to exit the container.
+#
+# Operator actions never count as the service ending. `zpctl restart`
+# and `zpctl stop` on the named service leave zpinit running, so
+# bouncing it does not take the container down; use `zpctl shutdown`
+# for that.
 exit_code_from = "default"
 
 # Path of the zpctl Unix socket. Must be absolute. The socket is bound
@@ -252,6 +271,21 @@ backoff_initial     = "1s"
 backoff_max         = "30s"
 backoff_reset_after = "60s"
 
+# What this service failing its INITIAL boot does to the container.
+# "fail" (default) aborts PID 1 with exit 1, so an orchestrator sees a
+# container that could not start rather than one idling while it looks
+# healthy. "continue" logs the failure and carries on supervising: the
+# service is left in whatever state it reached (BACKOFF or FATAL under a
+# restarting policy, STOPPED otherwise), stays visible in `zpctl
+# status`, and the services behind it still boot.
+#
+# Set "continue" when operators need to get INTO a broken container to
+# repair it: a dev image where `docker exec` and `zpctl restart <svc>`
+# are the recovery path is the main case. Only initial boot consults
+# this; a service added by a reload has never been able to abort the
+# container.
+on_boot_failure = "fail"
+
 # Graceful stop. Falls back to globals if unset.
 stop_signal  = "TERM"   # or "INT", "QUIT", "USR1", "HUP", ...
 stop_timeout = "10s"
@@ -352,6 +386,17 @@ timeout  = "30s"     # give up after this long
 on_timeout = "fail"  # "fail" aborts boot; "continue" proceeds anyway
 ```
 
+`[ready].on_timeout` and `on_boot_failure` answer two different
+questions and both apply, in this order: `on_timeout` decides whether a
+probe that never passes counts as a boot failure at all, and
+`on_boot_failure` decides what a boot failure does to the container. So
+`on_timeout = "fail"` plus `on_boot_failure = "continue"` means "a
+service that never becomes ready has failed, log it and keep the
+container up", which is a legitimate combination and not a
+contradiction. `on_timeout = "continue"` makes the probe advisory, and
+then `on_boot_failure` never comes up for the probe (the service can
+still fail boot by dying before it is ready).
+
 ## `entrypoint.d/`
 
 Plain executables (any language with a shebang). zpinit runs them in
@@ -391,10 +436,12 @@ collisions, `exit_code_from` to a missing service) abort the load.
 - Service name uniqueness after prefix stripping.
 - Service name pattern (`^[a-zA-Z0-9_-]+$`).
 - `command` is non-empty.
-- `restart`, `entrypoint_on_failure`, `[ready].on_timeout` are valid.
+- `restart`, `on_boot_failure`, `entrypoint_on_failure`,
+  `[ready].on_timeout` are valid.
 - `default_stop_signal` and per-service `stop_signal` are recognised.
 - `exit_code_from` references an existing service (or is `"default"`).
-  Pointing it at a service with `replicas > 1` is rejected (ambiguous).
+  Pointing it at a service with `replicas > 1` or `replicas = "auto"`
+  is rejected (ambiguous: which replica's exit code would win?).
   This check is deliberately fatal even when the target's own file is
   merely skipped for a parse error: booting without the service whose
   exit decides the container's fate would supervise a workload that

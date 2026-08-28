@@ -26,6 +26,20 @@ and ignores `services/` entirely. Same image, three behaviors
 adding a separate "supervise + main task" mode; express foreground
 tasks as a service with `restart = "never"` plus `exit_code_from`.
 
+**Supervise mode is independent of whether any service is running.**
+Once boot has completed, nothing a service does ends the container: a
+crash, a crash-loop into FATAL, an operator `zpctl stop`, even every
+service stopped at once all leave PID 1 resident. That independence is
+the point of supervising instead of running the app as the container's
+CMD, because it is what keeps `docker exec` and `zpctl` available on a
+container whose app is broken. `exit_code_from` is the explicit,
+opt-in way to give that up for one named service, and even then only
+that service ending on its own counts; an operator restarting or
+stopping it does not. Initial boot is the one place the coupling is
+deliberate (a container that cannot start should say so), and
+`on_boot_failure = "continue"` opts out per service for images where
+getting a shell in matters more.
+
 **One Wait4 site.** zpinit reaps every child via a single
 `wait4(-1, WNOHANG)` loop dispatched per PID; never `cmd.Wait()` per
 process. The two race against each other; whichever the kernel

@@ -190,6 +190,28 @@ error while every valid service still loads. Boot and SIGHUP log the
 skip and continue; `zpctl update` / `reread` report it and exit
 non-zero so Puppet/CI notice. See [docs/configuration.md](docs/configuration.md).
 
+**The container outlives the services.** Once boot has completed,
+nothing a service does ends the container: a crash, a crash-loop into
+`FATAL`, an operator `zpctl stop`, even every service stopped at once
+all leave zpinit resident as PID 1, so `docker exec` and `zpctl` keep
+working on a container whose app is broken. That independence is the
+main reason to supervise instead of running the app as CMD. If you do
+want one service to own the container's lifetime (a one-off task that
+needs sidecars, say), set `exit_code_from = "<service>"` in
+`zpinit.toml`: zpinit then exits with that service's code when it ends
+*on its own*. Restarting or stopping it with `zpctl` still doesn't take
+the container down; `zpctl shutdown` is how you do that on purpose.
+
+**Boot failure is fatal by default.** If a service can't reach
+`RUNNING` (and pass its `[ready]` probe) within `boot_timeout`, zpinit
+tears everything down and exits 1, so an orchestrator sees a container
+that couldn't start instead of one idling while it looks healthy. Set
+`on_boot_failure = "continue"` on a service to opt out: the failure is
+logged, the service stays visible in `zpctl status`, later services
+still boot, and PID 1 keeps running. That's what you want in a dev
+image, where `docker exec` and `zpctl restart <service>` are how you
+repair a broken app in place.
+
 For runtime reloads (the running config on disk hasn't changed, but
 you want the service to re-read it), use `zpctl reload <service>`.
 Per-service `reload_signal` (e.g. `"HUP"` for nginx) or
@@ -201,7 +223,7 @@ automatically whenever the cgroup limit moves.
 
 See [docs/configuration.md](docs/configuration.md) for the full TOML
 schema: env precedence, `cwd`, `user`/`group`, backoff tuning, stop
-signals, and per-service `[env]`.
+signals, `on_boot_failure`, `exit_code_from`, and per-service `[env]`.
 
 #### 3.1 Node.js Clustering (replaces PM2)
 
@@ -296,7 +318,7 @@ match supervisorctl exactly.
 ```sh
 zpctl status [--verbose] [--json] [NAME[/N]...] # states; --verbose adds rss/cpu/fds/spawns; --json = NDJSON
 zpctl start [--wait] NAME[/N] | all  # --wait blocks until RUNNING and [ready] passed
-zpctl stop NAME[/N] | all
+zpctl stop NAME[/N] | all     # container stays up, even with 'all'
 zpctl restart [--wait] NAME[/N] | all
 zpctl reload NAME[/N] | all   # in-place: reload_signal/_command or stop+start
 zpctl signal NAME[/N] HUP     # arbitrary signal (lower-level than reload)
@@ -306,7 +328,7 @@ zpctl resolve NAME            # source TOML path + enabled state, as JSON
 zpctl tail [--follow|-f] NAME[/N] # last 8KB; --follow streams new lines (Ctrl-C to stop)
 zpctl update [NAME...]        # apply config changes (= SIGHUP); NAME = scoped to those services
 zpctl reread                  # dry-run config diff
-zpctl shutdown
+zpctl shutdown                # stop every service and exit PID 1 (ends the container)
 zpctl help
 ```
 

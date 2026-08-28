@@ -55,7 +55,15 @@ consecutive crashes (FATAL). The retry budget is hardcoded
    order. Each readiness probe blocks the next service's start.
    `boot_timeout` is a per-service budget: each service gets its own
    window, so a legitimately slow first service cannot starve later
-   services of their probe time.
+   services of their probe time. A service that does not come up
+   inside its window (or dies before it is ready) fails boot, which
+   tears everything down and exits 1, so an orchestrator sees a
+   container that could not start. Per-service
+   `on_boot_failure = "continue"` opts out: the failure is logged, the
+   service is left in whatever state it reached and stays visible in
+   `zpctl status`, later services still boot, and PID 1 keeps running.
+   Only initial boot consults it; a reload-added service that fails to
+   boot has never been able to abort the container.
 
 ## Reload
 
@@ -74,7 +82,10 @@ start until earlier filename is ready" invariant that initial boot
 relies on.
 
 `exit_code_from` is rebound on every reload, so the watched service
-can be added, removed, or retargeted.
+can be added, removed, or retargeted. Each installation carries a
+generation counter; a watcher goroutine re-checks its generation before
+firing, because cancelling the old watcher does not synchronize with
+its progress. See Shutdown for what the watcher fires on.
 
 Each service file is parsed and validated independently (see
 `docs/configuration.md`). A file that fails to parse or validate is
@@ -134,6 +145,31 @@ arguments stays a backwards-compatible alias for `update`
 (config reread + apply).
 
 ## Shutdown
+
+Three things end a supervise-mode container: a signal, `zpctl
+shutdown`, and the `exit_code_from` watcher. Nothing else does, once
+boot has completed. A service crashing, crash-looping to FATAL, or
+being stopped by an operator leaves PID 1 running, which is what keeps
+`docker exec` and `zpctl` usable on a container whose app is broken.
+(Initial boot is the exception, and it happens before this section
+applies: see Boot sequence step 4.)
+
+`exit_code_from = "<service>"` opts one service into owning the
+container's lifetime. The watcher fires only when that service reaches
+a terminal state *on its own*: an exit under a policy that does not
+restart it, or FATAL after the crash budget runs out. Reaching Stopped
+because an operator stopped it does not count, and `RestartCtx`
+transits Stopped between its stop and start halves, so treating any
+terminal edge as final used to make `zpctl restart <target>` shut the
+container down seconds after the service had come back up. Each
+terminal transition latches why it happened (`Runner.LastTerminal`,
+written before the state change so an observer woken by the transition
+already sees it); the watcher reads the latch, and on an operator edge
+parks in `WaitLeftTerminal` and resumes watching rather than returning,
+so a service restarted once can still end the container later. Firing
+closes `earlyShutdownCh`, which `Run` selects on alongside `ctx.Done`,
+and the container exits with the service's code (`128 + signal` if it
+was signaled).
 
 `SIGTERM`, `SIGINT`, or `SIGQUIT` to PID 1 triggers `stopAll`
 (`SIGQUIT` for supervisord parity: operators use `kill -QUIT` there

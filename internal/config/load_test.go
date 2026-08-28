@@ -993,3 +993,47 @@ func TestNewEmpty_AppliesDefaults(t *testing.T) {
 		t.Error("BootTimeout default not applied")
 	}
 }
+
+// TestLoad_OnBootFailure covers the per-service escape hatch from the
+// all-or-nothing initial boot. The default has to stay "fail": an
+// orchestrator needs to see a container that cannot start, so opting
+// out is the operator's explicit choice.
+func TestLoad_OnBootFailure(t *testing.T) {
+	t.Run("defaults to fail", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, filepath.Join(dir, "services", "10_app.toml"), `command = ["app"]`)
+		cfg, err := Load(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.Services[0].OnBootFailure; got != BootFail {
+			t.Errorf("on_boot_failure default = %q, want %q", got, BootFail)
+		}
+	})
+
+	t.Run("continue accepted", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, filepath.Join(dir, "services", "10_app.toml"), `
+command = ["app"]
+on_boot_failure = "continue"
+`)
+		cfg, err := Load(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.Services[0].OnBootFailure; got != BootContinue {
+			t.Errorf("on_boot_failure = %q, want %q", got, BootContinue)
+		}
+	})
+
+	t.Run("bogus value skips the file", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, filepath.Join(dir, "services", "10_app.toml"), `
+command = ["app"]
+on_boot_failure = "maybe"
+`)
+		if got := loadExpectSkip(t, dir); !strings.Contains(got, "on_boot_failure") {
+			t.Errorf("error = %q, want it to mention on_boot_failure", got)
+		}
+	})
+}

@@ -10,6 +10,29 @@
   zpinit is, how to copy it into an image, the three modes, service
   TOML basics, and the `zpctl` workflow.
 
+- **`on_boot_failure` keeps a container up when a service can't
+  start.** A service that fails its initial boot still aborts zpinit
+  with exit 1 by default, so an orchestrator sees a container that
+  couldn't start. Set `on_boot_failure = "continue"` on a service and
+  the failure is logged instead: it stays visible in `zpctl status`,
+  the services behind it still boot, and zpinit keeps running so
+  `docker exec` and `zpctl restart <service>` can repair a broken app
+  in place. Aimed at dev images; leave the default in production.
+  `zpinit --plan` now prints each service's resolved setting, so the
+  choice is verifiable before deploy.
+
+### Fixed
+
+- **`zpctl restart` on the `exit_code_from` service no longer takes
+  the container down.** Restarting or stopping the service named by
+  `exit_code_from` was read as that service ending, so a routine
+  `zpctl restart <service>` stopped every sibling and exited zpinit,
+  killing the container seconds after the service had already come
+  back up. Operator actions no longer count as the service ending;
+  only an exit under a policy that doesn't restart it, or crash-looping
+  to `FATAL`, still exits the container with that service's code. Use
+  `zpctl shutdown` to end the container on purpose.
+
 ## v0.5.5
 
 ### Fixed

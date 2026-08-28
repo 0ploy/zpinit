@@ -871,7 +871,7 @@ func (s *ControlServer) cmdHelp() *ctlproto.Response {
 	return okBody("ok", []string{
 		"status [--verbose] [--json] [NAME...] list service states (no args = all)",
 		"start [--wait] NAME[/N]... start service(s); --wait blocks until ready",
-		"stop NAME[/N]...      stop service(s); 'all' for everything",
+		"stop NAME[/N]...      stop service(s); 'all' for everything (container stays up)",
 		"restart [--wait] NAME[/N]... stop then start; --wait blocks until ready",
 		"pid [NAME[/N]]        PID of zpinit (no arg) or service replica",
 		"resolve NAME          print service's source TOML path + enabled state (JSON)",
@@ -882,7 +882,7 @@ func (s *ControlServer) cmdHelp() *ctlproto.Response {
 		"ready [NAME[/N]...]   exit 0 iff selected services are Running and [ready] passed",
 		"tail [--follow] NAME[/N] dump file-logged stdout; --follow streams new lines",
 		"signal NAME[/N] SIG   send arbitrary signal to service's process group",
-		"shutdown              stop supervisor and exit",
+		"shutdown              stop every service and exit PID 1 (ends the container)",
 		"help                  this list",
 		"",
 		"NAME refers to a service; for services declared with replicas > 1,",

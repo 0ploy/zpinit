@@ -340,6 +340,9 @@ func applyServiceDefaults(s *Service, g *Globals, reloadOnChangeSet bool) {
 	if s.Restart == "" {
 		s.Restart = RestartAlways
 	}
+	if s.OnBootFailure == "" {
+		s.OnBootFailure = BootFail
+	}
 	if s.BackoffInitial == 0 {
 		s.BackoffInitial = Duration(1 * time.Second)
 	}
@@ -506,6 +509,11 @@ func validateService(s *Service) []string {
 	case RestartAlways, RestartOnFailure, RestartNever:
 	default:
 		errs = append(errs, fmt.Sprintf("restart must be 'always', 'on-failure', or 'never'; got %q", s.Restart))
+	}
+	switch s.OnBootFailure {
+	case BootFail, BootContinue:
+	default:
+		errs = append(errs, fmt.Sprintf("on_boot_failure must be 'fail' or 'continue'; got %q", s.OnBootFailure))
 	}
 	if _, ok := ParseSignal(s.StopSignal); !ok {
 		errs = append(errs, fmt.Sprintf("stop_signal %q is not a recognised signal name", s.StopSignal))

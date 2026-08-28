@@ -27,6 +27,18 @@ const (
 	ReadyContinue ReadyOnTimeout = "continue"
 )
 
+// OnBootFailure decides what a service failing its initial boot does to
+// the container. "fail" (the default) aborts PID 1 so an orchestrator
+// sees a container that cannot start; "continue" logs and carries on
+// supervising, which is what a dev container wants when operators need
+// `docker exec` to survive a broken app.
+type OnBootFailure string
+
+const (
+	BootFail     OnBootFailure = "fail"
+	BootContinue OnBootFailure = "continue"
+)
+
 type Globals struct {
 	EntrypointOnFailure     EntrypointOnFailure `toml:"entrypoint_on_failure"`
 	EntrypointScriptTimeout Duration            `toml:"entrypoint_script_timeout"`
@@ -91,6 +103,11 @@ type Service struct {
 	BackoffResetAfter Duration `toml:"backoff_reset_after"`
 	StopSignal        string   `toml:"stop_signal"`
 	StopTimeout       Duration `toml:"stop_timeout"`
+	// OnBootFailure governs whether this service failing its initial
+	// boot aborts the container. Defaults to "fail". Only the initial
+	// boot consults it: a reload-added service that fails to boot has
+	// never been able to take the container down.
+	OnBootFailure OnBootFailure `toml:"on_boot_failure"`
 	// Reloadable defaults to true. Pointer so we can distinguish "unset"
 	// from "explicitly false".
 	Reloadable *bool             `toml:"reloadable"`

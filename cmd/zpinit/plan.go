@@ -98,7 +98,8 @@ func printPlan(w io.Writer, configDir string, cmdline []string) int {
 		printServicePlan(w, s)
 	}
 	if cfg.Globals.ExitCodeFrom != "default" {
-		fmt.Fprintf(w, "exit_code_from: %s\n", cfg.Globals.ExitCodeFrom)
+		fmt.Fprintf(w, "exit_code_from: %s (container exits with this service's code when it ends on its own)\n",
+			cfg.Globals.ExitCodeFrom)
 	}
 	// Mirror --check-config: a skipped file is a config error, so the
 	// plan exits non-zero even though the valid services are planned.
@@ -123,6 +124,10 @@ func printServicePlan(w io.Writer, s config.Service) {
 	fmt.Fprintf(w, "    restart   %s  backoff=%v..%v reset_after=%v\n",
 		s.Restart, s.BackoffInitial.Std(), s.BackoffMax.Std(), s.BackoffResetAfter.Std())
 	fmt.Fprintf(w, "    stop      signal=%s timeout=%v\n", s.StopSignal, s.StopTimeout.Std())
+	// Always printed: whether a failed boot takes the container down is
+	// the kind of thing an operator wants confirmed by the plan, not
+	// inferred from the absence of a line.
+	fmt.Fprintf(w, "    boot      on_failure=%s\n", s.OnBootFailure)
 	if s.Ready != nil {
 		fmt.Fprintf(w, "    ready     cmd=%q interval=%v timeout=%v on_timeout=%s\n",
 			s.Ready.Command, s.Ready.Interval.Std(), s.Ready.Timeout.Std(), s.Ready.OnTimeout)
