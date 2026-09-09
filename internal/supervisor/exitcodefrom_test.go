@@ -64,7 +64,8 @@ func newWatcherFixture(t *testing.T, restart config.Restart) *watcherFixture {
 	o.runnerCtx = ctx
 	o.wg = &wg
 	o.earlyShutdownCh = make(chan struct{})
-	o.spawnRunnerGoroutine(r)
+	o.wg.Add(1)
+	o.spawnRunnerGoroutine(r, o.runnerCtx, o.wg)
 	o.installExitCodeWatcher()
 	t.Cleanup(func() {
 		cancel()
@@ -283,7 +284,7 @@ func TestLastTerminal(t *testing.T) {
 	if !info.Valid || !info.Manual || info.State != StateStopped {
 		t.Errorf("after restart: LastTerminal() = %+v, want {Stopped true true}", info)
 	}
-	if f.r.StoppedManually() {
+	if f.r.Snapshot().Manual {
 		t.Error("StoppedManually() = true after the restart's Start; the latch must not rely on it")
 	}
 }

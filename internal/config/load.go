@@ -122,6 +122,12 @@ func applyGlobalDefaults(g *Globals) {
 	if g.Resources.ScaleDownAfter == 0 {
 		g.Resources.ScaleDownAfter = Duration(30 * time.Second)
 	}
+	if g.Resources.PollInterval == 0 {
+		// Backstop only; inotify is the primary trigger. Long on
+		// purpose: a host running hundreds of containers pays this
+		// wakeup once per container per interval.
+		g.Resources.PollInterval = Duration(15 * time.Minute)
+	}
 }
 
 func loadServices(dir string, cfg *Config) error {
@@ -426,6 +432,9 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Globals.Resources.ScaleDownAfter < 0 {
 		errs = append(errs, "[resources].scale_down_after must be >= 0")
+	}
+	if cfg.Globals.Resources.PollInterval < 0 {
+		errs = append(errs, "[resources].poll_interval must be >= 0")
 	}
 	// Negative durations parse fine ("-5s") but are born-expired
 	// contexts or instant SIGKILL escalations at runtime; a config

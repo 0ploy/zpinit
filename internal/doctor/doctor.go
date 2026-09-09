@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/0ploy/zpinit/internal/config"
+	"github.com/0ploy/zpinit/internal/resources"
 )
 
 // versionProbeTimeout bounds each runtime `--version` probe. doctor is
@@ -102,6 +103,7 @@ func Run(configDir string) []Check {
 	checks = append(checks, cfgChecks...)
 	if cfg != nil {
 		checks = append(checks, checkRuntimes(cfg)...)
+		checks = append(checks, checkCgroup(cfg, resources.Detect())...)
 		checks = append(checks, checkState(cfg)...)
 	}
 	return checks
@@ -423,6 +425,44 @@ func versionAtLeast(a, b, c, x, y, z int) bool {
 		return b > y
 	}
 	return c >= z
+}
+
+// checkCgroup reports whether zpinit can tie this process to its own
+// cgroup. When it cannot, limit detection silently falls back to the
+// host's /proc view: a container capped at 2 CPUs reads as the full
+// machine, so `replicas = "auto"` over-scales and every app sizing
+// itself from ZPINIT_CPU_COUNT / ZPINIT_MEMORY_BYTES is handed a budget
+// it does not have. FAIL rather than WARN when an auto service is
+// present, because that combination actively misbehaves.
+// snap is passed in rather than detected here so both branches are
+// unit-testable: on a dev laptop there is no cgroupfs at all, so a test
+// that called Detect() would exercise a different branch than CI.
+func checkCgroup(cfg *config.Config, snap resources.Snapshot) []Check {
+	if snap.CgroupResolved {
+		return []Check{{"state", "cgroup detection", StatusOK,
+			fmt.Sprintf("resolved this container's cgroup: %d CPU(s), %s memory",
+				snap.CPUCount, memoryDisplay(snap.MemoryBytes))}}
+	}
+	detail := fmt.Sprintf(
+		"could not locate this container's own cgroup; the reported %d CPU(s) / %s may be the host's. "+
+			"Check that /proc/self/cgroup is readable and the cgroupfs mount covers this cgroup",
+		snap.CPUCount, memoryDisplay(snap.MemoryBytes))
+	for _, s := range cfg.Services {
+		if s.Replicas.Auto {
+			return []Check{{"state", "cgroup detection", StatusFail,
+				detail + fmt.Sprintf("; service %q uses replicas = \"auto\" and will scale to the host's CPU count", s.Name)}}
+		}
+	}
+	return []Check{{"state", "cgroup detection", StatusWarn, detail}}
+}
+
+// memoryDisplay renders a byte budget for doctor rows; 0 means the
+// detector found no limit.
+func memoryDisplay(b uint64) string {
+	if b == 0 {
+		return "no memory limit"
+	}
+	return fmt.Sprintf("%.2f GiB", float64(b)/float64(uint64(1)<<30))
 }
 
 func checkState(cfg *config.Config) []Check {

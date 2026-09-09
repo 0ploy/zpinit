@@ -143,7 +143,7 @@ func (o *Orchestrator) scaleUp(filename string, baseEnv []string) {
 	}
 	o.log.Info("autoscale: scaling up",
 		"service", spec.Name, "from", len(running), "to", target)
-	jobs := make([]reloadBootJob, 0, target-len(running))
+	jobs := make([]*Runner, 0, target-len(running))
 	idx := 0
 	for n := target - len(running); n > 0; n-- {
 		for used[idx] {
@@ -160,8 +160,7 @@ func (o *Orchestrator) scaleUp(filename string, baseEnv []string) {
 		// NewRunnerForReplica keeps spec = the unmodified service-
 		// level config for reload-diff equality; cfg carries the
 		// per-replica log/env rewrites used at spawn time.
-		r := NewRunnerForReplica(perReplica, spec, env, idx, o.spawner, o.clock, o.log)
-		jobs = append(jobs, reloadBootJob{runner: r})
+		jobs = append(jobs, NewRunnerForReplica(perReplica, spec, env, idx, o.spawner, o.clock, o.log))
 	}
 	if err := o.registerAndBoot(jobs, nil, nil); err != nil {
 		o.log.Warn("autoscale: scale-up refused", "service", spec.Name, "err", err)

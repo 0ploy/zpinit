@@ -73,6 +73,14 @@ type Resources struct {
 	ReserveMemory  ByteSize `toml:"reserve_memory"`
 	ScaleUpAfter   Duration `toml:"scale_up_after"`
 	ScaleDownAfter Duration `toml:"scale_down_after"`
+	// PollInterval is how often the watcher re-detects on its own.
+	// It is a BACKSTOP: inotify on the cgroup limit files catches
+	// every runtime-driven quota change in milliseconds, and this
+	// only covers what inotify cannot see. Default 15m; the one
+	// reason to shorten it is a sandbox runtime whose cgroupfs
+	// accepts an inotify watch but never delivers events, where the
+	// backstop becomes the only trigger.
+	PollInterval Duration `toml:"poll_interval"`
 }
 
 type Logging struct {
@@ -182,6 +190,35 @@ type Config struct {
 	// the exit code (zpctl/--check-config exit non-zero; daemon boot
 	// logs and continues). Ordered by filename, matching the load walk.
 	SkippedFiles []FileError
+}
+
+// NeedsResourceWatch reports whether any service depends on LIVE
+// resource detection, i.e. on the watcher committing deltas after
+// boot. Two features consume a Change and nothing else does:
+//
+//   - `replicas = "auto"`: the scaler rebalances the replica count on
+//     every committed delta.
+//   - `reload_on_change`: the listed dimensions trigger a per-service
+//     reload action when they move.
+//
+// With neither present the watcher's commits have no consumer, so
+// runSupervise does not start it and ZPINIT_CPU_COUNT /
+// ZPINIT_CPU_QUOTA / ZPINIT_MEMORY_BYTES keep their boot-time detected
+// values for the container's life. That is a deliberate trade: a
+// poll loop per container costs every container on a shared node a
+// wakeup per second to track a cgroup quota that changes about never,
+// and a service that wants live values opts in with reload_on_change.
+//
+// Re-evaluated after every reload (see Orchestrator.SetConfigCommitHook):
+// a reload can introduce the first such service into a container that
+// booted without one.
+func (c *Config) NeedsResourceWatch() bool {
+	for _, s := range c.Services {
+		if s.Replicas.Auto || len(s.ReloadOnChange) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // FileError pairs a service file's basename with the parse or

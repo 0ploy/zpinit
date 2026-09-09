@@ -195,6 +195,16 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 		"cpu_quota", resourceEnv[resources.EnvCPUQuota],
 		"memory_bytes", snap.MemoryBytes,
 	)
+	if !snap.CgroupResolved {
+		// We could not tie this process to its own cgroup, so the
+		// numbers above may be the HOST's rather than the container's.
+		// Loud because the failure is silent otherwise and skews
+		// everything downstream: replicas = "auto" over-scales, and
+		// apps sizing heaps or worker pools from ZPINIT_MEMORY_BYTES /
+		// ZPINIT_CPU_COUNT get a budget they do not have.
+		log.Warn("could not locate this container's own cgroup; CPU/memory figures are UNVERIFIED and may describe the host",
+			"hint", "run `zpinit --doctor`; check the cgroup mount and whether /proc/self/cgroup is readable")
+	}
 	bootEnv := layeredMerge(finalEnv, resourceEnv)
 
 	// Boot banner on zpinit's own stderr, before mode dispatch. One
@@ -445,6 +455,12 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 	// dimension, and forwards each committed delta to the
 	// orchestrator. Lifetime tied to the supervise loop; cancel of
 	// watcherCtx stops the polling goroutine.
+	//
+	// Started only when some service actually consumes a delta
+	// (Config.NeedsResourceWatch). The subscription and the dispatch
+	// goroutine below are set up either way: an unstarted watcher
+	// publishes nothing, so the goroutine parks on an empty channel at
+	// no cost, and a later lazy Start needs no extra wiring.
 	watcherCtx, watcherCancel := context.WithCancel(context.Background())
 	defer watcherCancel()
 	watcher := resources.NewWatcher(
@@ -454,9 +470,39 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 		cfg.Globals.Resources.ScaleDownAfter.Std(),
 		log,
 	)
+	watcher.SetPollInterval(cfg.Globals.Resources.PollInterval.Std())
 	sub, unsubscribe := watcher.Subscribe()
 	defer unsubscribe()
-	watcher.Start(watcherCtx)
+	if cfg.NeedsResourceWatch() {
+		watcher.Start(watcherCtx)
+	} else {
+		// Nothing consumes resource deltas in this container. Polling
+		// anyway would cost every container sharing the host a wakeup
+		// per second to track a cgroup quota that changes about never;
+		// with a few hundred containers on one node that is the single
+		// largest thing zpinit does at idle. The trade is that the
+		// ZPINIT_CPU_* / ZPINIT_MEMORY_BYTES values stay at their
+		// boot-time detection: a service that wants them refreshed on
+		// its next respawn opts in with reload_on_change.
+		log.Info("resource watcher not started; no service uses replicas=\"auto\" or reload_on_change",
+			"effect", "ZPINIT_CPU_COUNT/ZPINIT_CPU_QUOTA/ZPINIT_MEMORY_BYTES stay at boot-time values")
+	}
+	// A reload can introduce the first auto / reload_on_change service
+	// into a container that booted without one, so re-evaluate on every
+	// committed config. Watcher.Start is idempotent and reports whether
+	// this call is the one that started polling. Deliberately one-way:
+	// a reload that removes the last such service leaves the watcher
+	// running rather than growing a teardown path, which would have to
+	// build a fresh Watcher (Start is one-shot) and re-subscribe. That
+	// costs exactly what every container paid before this gate existed.
+	orch.SetConfigCommitHook(func(needsResourceWatch bool) {
+		if !needsResourceWatch {
+			return
+		}
+		if watcher.Start(watcherCtx) {
+			log.Info("resource watcher started; a reload added a service that needs live resource detection")
+		}
+	})
 	go func() {
 		for {
 			select {

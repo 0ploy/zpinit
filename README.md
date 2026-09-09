@@ -291,6 +291,13 @@ them. `replicas = "auto"` implies the running replicas restart on
 each rescale to pick up the new env; opt out for stateless workers
 with `reload_on_change = []`.
 
+The values are detected once at boot. zpinit only keeps *watching*
+CPU/memory for live changes when a service asks for it — `replicas =
+"auto"` or a non-empty `reload_on_change`. Containers with neither
+skip the watcher entirely; the ones that do watch use inotify on the
+cgroup limit files and sleep until a quota actually moves, so a host
+running hundreds of them pays nothing at idle either way.
+
 See [docs/clustering.md § Auto-scaled replicas](docs/clustering.md)
 and the `[resources]` block in
 [docs/configuration.md](docs/configuration.md).

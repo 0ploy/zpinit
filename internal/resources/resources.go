@@ -41,6 +41,16 @@ type Snapshot struct {
 	CPUQuota    float64
 	CPUCount    int
 	MemoryBytes uint64
+	// CgroupResolved reports whether zpinit located THIS process's own
+	// cgroup directory (via /proc/self/cgroup + /proc/self/mountinfo)
+	// rather than assuming the cgroupfs mount root. When false the
+	// numbers above may describe the host instead of the container:
+	// under `--cgroupns=host` and similar layouts the mount root holds
+	// no cpu.max/memory.max, so detection falls through to /proc and
+	// reports the whole machine. Treat false as "unverified", never as
+	// "no limit". Not an exposed dimension: it is absent from EnvVars
+	// and ignored by the watcher's change comparison.
+	CgroupResolved bool
 }
 
 // Detect reads cgroupfs and /proc and returns the most restrictive
@@ -48,19 +58,13 @@ type Snapshot struct {
 // that report "unlimited" or fail to parse are skipped, not treated
 // as zero.
 func Detect() Snapshot {
-	cgroupRoot := os.Getenv("ZPINIT_CGROUP_ROOT")
-	if cgroupRoot == "" {
-		cgroupRoot = "/sys/fs/cgroup"
-	}
-	procRoot := os.Getenv("ZPINIT_PROC_ROOT")
-	if procRoot == "" {
-		procRoot = "/proc"
-	}
+	procRoot := procRootPath()
 
 	procCPU := procCPUCount(procRoot)
 	procMem := procMemoryBytes(procRoot)
-	cgCPU, cgMem := readCgroup(cgroupRoot)
-	csCPU := readCPUSetCount(cgroupRoot)
+	layout := resolveCgroupLayout()
+	cgCPU, cgMem := readCgroup(layout)
+	csCPU := readCPUSetCount(layout)
 
 	cpu := float64(procCPU)
 	if cgCPU > 0 && cgCPU < cpu {
@@ -84,10 +88,58 @@ func Detect() Snapshot {
 	}
 
 	return Snapshot{
-		CPUQuota:    cpu,
-		CPUCount:    cpuFloor(cpu),
-		MemoryBytes: mem,
+		CPUQuota:       cpu,
+		CPUCount:       cpuFloor(cpu),
+		MemoryBytes:    mem,
+		CgroupResolved: layout.resolved,
 	}
+}
+
+// procRootPath resolves the /proc root Detect reads, honouring the
+// ZPINIT_PROC_ROOT test override. The cgroup side is not a single root
+// any more; see resolveCgroupLayout, which owns ZPINIT_CGROUP_ROOT.
+func procRootPath() string {
+	if r := os.Getenv("ZPINIT_PROC_ROOT"); r != "" {
+		return r
+	}
+	return "/proc"
+}
+
+// cgroupLimitPaths lists every cgroup file whose contents feed a limit
+// into Detect, across BOTH hierarchy versions. The live watcher arms an
+// inotify watch on each one; paths absent on this host simply fail to
+// arm with ENOENT and are skipped, so no v1-vs-v2 branch is needed here.
+//
+// Keep in sync with readCgroupV2 / readCgroupV1 / readCPUSetCount: a
+// limit source that is read but not listed here can change without ever
+// waking the watcher, leaving detection stale until the backstop poll.
+// The /proc sources are deliberately absent — the kernel does not write
+// them through the VFS, so there is nothing for inotify to observe.
+func cgroupLimitPaths(l cgroupLayout) []string {
+	var out []string
+	if l.v2 != "" {
+		out = append(out,
+			filepath.Join(l.v2, "cpu.max"),
+			filepath.Join(l.v2, "memory.max"),
+			filepath.Join(l.v2, "cpuset.cpus.effective"),
+		)
+	}
+	if d := l.v1dir("cpu"); d != "" {
+		out = append(out,
+			filepath.Join(d, "cpu.cfs_quota_us"),
+			filepath.Join(d, "cpu.cfs_period_us"),
+		)
+	}
+	if d := l.v1dir("memory"); d != "" {
+		out = append(out, filepath.Join(d, "memory.limit_in_bytes"))
+	}
+	if d := l.v1dir("cpuset"); d != "" {
+		out = append(out,
+			filepath.Join(d, "cpuset.effective_cpus"),
+			filepath.Join(d, "cpuset.cpus"),
+		)
+	}
+	return out
 }
 
 // WithReserves returns a snapshot reduced by the operator-configured
@@ -103,9 +155,10 @@ func (s Snapshot) WithReserves(reserveCPU float64, reserveMemory uint64) Snapsho
 		mem = s.MemoryBytes - reserveMemory
 	}
 	return Snapshot{
-		CPUQuota:    cpu,
-		CPUCount:    cpuFloor(cpu),
-		MemoryBytes: mem,
+		CPUQuota:       cpu,
+		CPUCount:       cpuFloor(cpu),
+		MemoryBytes:    mem,
+		CgroupResolved: s.CgroupResolved,
 	}
 }
 
@@ -140,11 +193,13 @@ func formatQuota(q float64) string {
 	return s
 }
 
-func readCgroup(root string) (float64, uint64) {
-	if v2cpu, v2mem, ok := readCgroupV2(root); ok {
-		return v2cpu, v2mem
+func readCgroup(l cgroupLayout) (float64, uint64) {
+	if l.v2 != "" {
+		if v2cpu, v2mem, ok := readCgroupV2(l.v2); ok {
+			return v2cpu, v2mem
+		}
 	}
-	return readCgroupV1(root)
+	return readCgroupV1(l.v1dir("cpu"), l.v1dir("memory"))
 }
 
 // readCgroupV2 reads the unified hierarchy. ok=true if either file
@@ -196,14 +251,14 @@ func readV2Memory(path string) (uint64, bool) {
 	return n, true
 }
 
-func readCgroupV1(root string) (float64, uint64) {
-	quota := readInt64(filepath.Join(root, "cpu", "cpu.cfs_quota_us"))
-	period := readInt64(filepath.Join(root, "cpu", "cpu.cfs_period_us"))
+func readCgroupV1(cpuDir, memDir string) (float64, uint64) {
+	quota := readInt64(filepath.Join(cpuDir, "cpu.cfs_quota_us"))
+	period := readInt64(filepath.Join(cpuDir, "cpu.cfs_period_us"))
 	var cpu float64
 	if quota > 0 && period > 0 {
 		cpu = float64(quota) / float64(period)
 	}
-	memRaw := readUint64(filepath.Join(root, "memory", "memory.limit_in_bytes"))
+	memRaw := readUint64(filepath.Join(memDir, "memory.limit_in_bytes"))
 	var mem uint64
 	// v1 uses a near-MaxInt64 sentinel for "unlimited". Anything
 	// above 2^62 is treated as no limit; real container limits are
@@ -219,12 +274,18 @@ func readCgroupV1(root string) (float64, uint64) {
 // (unified hierarchy), then the v1 controller paths; the effective
 // files are preferred because they reflect what the kernel actually
 // granted after hierarchy constraints.
-func readCPUSetCount(root string) int {
-	for _, p := range []string{
-		filepath.Join(root, "cpuset.cpus.effective"),           // v2
-		filepath.Join(root, "cpuset", "cpuset.effective_cpus"), // v1
-		filepath.Join(root, "cpuset", "cpuset.cpus"),           // v1 fallback
-	} {
+func readCPUSetCount(l cgroupLayout) int {
+	var candidates []string
+	if l.v2 != "" {
+		candidates = append(candidates, filepath.Join(l.v2, "cpuset.cpus.effective"))
+	}
+	if d := l.v1dir("cpuset"); d != "" {
+		candidates = append(candidates,
+			filepath.Join(d, "cpuset.effective_cpus"), // v1
+			filepath.Join(d, "cpuset.cpus"),           // v1 fallback
+		)
+	}
+	for _, p := range candidates {
 		data, err := os.ReadFile(p)
 		if err != nil {
 			continue

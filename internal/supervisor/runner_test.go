@@ -288,7 +288,7 @@ func TestRunner_BackoffResetsAfterStableRun(t *testing.T) {
 	f.clock.Advance(time.Millisecond)
 	f.waitState(StateRunning, time.Second)
 
-	if c := f.runner.Crashes(); c != 1 {
+	if c := f.runner.Snapshot().Crashes; c != 1 {
 		t.Errorf("Crashes = %d after reset; want 1", c)
 	}
 }
@@ -472,7 +472,7 @@ func TestRunner_StartAfterStopped(t *testing.T) {
 	if f.spawnCount() != 2 {
 		t.Errorf("spawns = %d", f.spawnCount())
 	}
-	if c := f.runner.Crashes(); c != 0 {
+	if c := f.runner.Snapshot().Crashes; c != 0 {
 		t.Errorf("Crashes = %d after manual Start from Stopped; want reset to 0", c)
 	}
 }

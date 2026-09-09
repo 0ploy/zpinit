@@ -107,7 +107,8 @@ func scaleTestOrch(t *testing.T, svc config.Service, indices []int) *Orchestrato
 	for _, idx := range indices {
 		r := NewRunnerForReplica(svc, svc, nil, idx, o.spawner, o.clock, o.log)
 		o.runners = append(o.runners, r)
-		o.spawnRunnerGoroutine(r)
+		o.wg.Add(1)
+		o.spawnRunnerGoroutine(r, o.runnerCtx, o.wg)
 	}
 	sortRunners(o.runners)
 	return o

@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`[resources] poll_interval`** (default `15m`) sets the resource
+  watcher's backstop re-detect interval. You should not need it:
+  inotify catches every runtime-driven quota change in milliseconds.
+  Shorten it only on a runtime whose cgroupfs accepts an inotify watch
+  but never delivers events, where the backstop is the only trigger.
+
+### Fixed
+
+- **CPU and memory limits were misdetected as the host's in some
+  container layouts.** zpinit assumed the cgroupfs mount root was the
+  container's own cgroup. That holds under `--cgroupns=private`
+  (Docker's default on cgroup v2) but not under `--cgroupns=host` (the
+  default on cgroup v1 hosts), nor when the host's `/sys/fs/cgroup` is
+  bind-mounted in, nor under some Kubernetes/CRI and LXC layouts. In
+  those, no limit file was found and detection fell back to the host's
+  `/proc` view: a container capped at 2 CPUs / 512 MB reported 8 CPUs /
+  8.3 GB on the test host. `replicas = "auto"` scaled to the host's CPU
+  count, and anything sizing itself from `ZPINIT_MEMORY_BYTES` or
+  `ZPINIT_CPU_COUNT` was handed a budget it did not have.
+
+  zpinit now resolves its own cgroup from `/proc/self/cgroup` and
+  `/proc/self/mountinfo`. When that fails it says so at boot instead of
+  reporting a plausible wrong number, and `zpinit --doctor` reports it
+  (FAIL with a `replicas = "auto"` service present, WARN otherwise).
+  Check the boot log after upgrading: a container that was silently
+  over-scaling will now start the correct number of replicas.
+
+- **`zpctl update` during container startup could leave a reload
+  half-applied.** The control socket accepts connections slightly
+  before the supervisor finishes initialising, and a reload that added
+  a service in that window panicked internally; the handler recovered,
+  so PID 1 survived, but the reload had already stopped services and
+  committed the new config. Such a reload is now refused cleanly with
+  "supervisor is not running yet" and changes nothing.
+
+### Changed
+
+- **The resource watcher only runs when a service needs it.** zpinit
+  polled cgroup and `/proc` state every second in every container,
+  whether or not anything consumed the result. It now starts that loop
+  only for `replicas = "auto"` or a non-empty `reload_on_change`, its
+  only two consumers, removing the largest thing zpinit did at idle on
+  a densely packed host. A reload that adds the first such service
+  still starts it; the boot log says which way the gate went.
+
+  With the watcher off, `ZPINIT_CPU_COUNT`, `ZPINIT_CPU_QUOTA`, and
+  `ZPINIT_MEMORY_BYTES` keep their boot-time values for the life of the
+  container rather than refreshing on a later respawn. Services that
+  need live values should set `reload_on_change`.
+
+- **The resource watcher no longer polls; it waits on inotify.** When a
+  service does need it, the watcher now sleeps on the cgroup limit
+  files instead of re-detecting once a second, so an idle container
+  costs no wakeups at all and a `docker update --cpus` or Kubernetes
+  in-place resize is picked up in milliseconds instead of up to a
+  second. A 15-minute backstop poll (`poll_interval`) still covers the
+  cases inotify cannot see. Debounce behaviour (`scale_up_after` /
+  `scale_down_after`) is unchanged, and off Linux the backstop carries
+  the whole job as before. Wakes are rate-limited to one re-detection
+  per 100 ms (deferred, never dropped) so a process with write access
+  to cgroupfs cannot spin the watcher.
+
 ## v0.6.0
 
 ### Added

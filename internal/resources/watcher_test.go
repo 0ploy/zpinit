@@ -69,14 +69,28 @@ func itoaInt(n int) string {
 	return string(out)
 }
 
+// newBubbleWatcher builds a Watcher with the platform cgroup notifier
+// disabled. These tests run inside a testing/synctest bubble, and a
+// goroutine parked on a real inotify read is not "durably blocked", so
+// the bubble's virtual clock would never advance with the notifier
+// live. Disabling it exercises the backstop-poll path — which drives
+// the same observe() body an inotify wake does, so the debounce and
+// commit behaviour under test is identical either way. The notifier's
+// own behaviour is covered by TestInotifyNotifier_* on Linux.
+func newBubbleWatcher(upAfter, downAfter time.Duration) *Watcher {
+	w := NewWatcher(0, 0, upAfter, downAfter,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w.notifier = nil
+	return w
+}
+
 func TestWatcher_NoChangeNoEmit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cg, proc := newTestRoots(t)
 		writeCgroupV2(t, cg, 200000, 100000, 1<<30)
 		writeProc(t, proc, 8, 16<<30)
 
-		w := NewWatcher(0, 0, 20*time.Millisecond, 20*time.Millisecond,
-			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		w := newBubbleWatcher(20*time.Millisecond, 20*time.Millisecond)
 		w.SetPollInterval(10 * time.Millisecond)
 		sub, _ := w.Subscribe()
 
@@ -99,8 +113,7 @@ func TestWatcher_ScaleUpCommitsAfterDebounce(t *testing.T) {
 		writeCgroupV2(t, cg, 200000, 100000, 1<<30) // 2 CPUs, 1 GiB
 		writeProc(t, proc, 8, 16<<30)
 
-		w := NewWatcher(0, 0, 50*time.Millisecond, 1*time.Second,
-			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		w := newBubbleWatcher(50*time.Millisecond, 1*time.Second)
 		w.SetPollInterval(10 * time.Millisecond)
 		sub, _ := w.Subscribe()
 
@@ -131,8 +144,7 @@ func TestWatcher_ScaleDownUsesLongerDebounce(t *testing.T) {
 		writeCgroupV2(t, cg, 400000, 100000, 1<<30) // 4 CPUs
 		writeProc(t, proc, 8, 16<<30)
 
-		w := NewWatcher(0, 0, 10*time.Millisecond, 200*time.Millisecond,
-			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		w := newBubbleWatcher(10*time.Millisecond, 200*time.Millisecond)
 		w.SetPollInterval(10 * time.Millisecond)
 		sub, _ := w.Subscribe()
 
@@ -167,8 +179,7 @@ func TestWatcher_TransientFlipDoesNotEmit(t *testing.T) {
 		writeCgroupV2(t, cg, 200000, 100000, 1<<30)
 		writeProc(t, proc, 8, 16<<30)
 
-		w := NewWatcher(0, 0, 100*time.Millisecond, 100*time.Millisecond,
-			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		w := newBubbleWatcher(100*time.Millisecond, 100*time.Millisecond)
 		w.SetPollInterval(10 * time.Millisecond)
 		sub, _ := w.Subscribe()
 
@@ -196,8 +207,7 @@ func TestWatcher_SubIntegerWobbleDoesNotEmit(t *testing.T) {
 		writeCgroupV2(t, cg, 120000, 100000, 1<<30)
 		writeProc(t, proc, 8, 16<<30)
 
-		w := NewWatcher(0, 0, 30*time.Millisecond, 30*time.Millisecond,
-			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		w := newBubbleWatcher(30*time.Millisecond, 30*time.Millisecond)
 		w.SetPollInterval(10 * time.Millisecond)
 		sub, _ := w.Subscribe()
 
@@ -222,8 +232,7 @@ func TestWatcher_MemoryChange(t *testing.T) {
 		writeCgroupV2(t, cg, 200000, 100000, 1<<30) // 1 GiB
 		writeProc(t, proc, 8, 16<<30)
 
-		w := NewWatcher(0, 0, 30*time.Millisecond, 200*time.Millisecond,
-			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		w := newBubbleWatcher(30*time.Millisecond, 200*time.Millisecond)
 		w.SetPollInterval(10 * time.Millisecond)
 		sub, _ := w.Subscribe()
 
@@ -254,8 +263,7 @@ func TestWatcher_CurrentSeedsAtStart(t *testing.T) {
 		writeCgroupV2(t, cg, 300000, 100000, 1<<30)
 		writeProc(t, proc, 8, 16<<30)
 
-		w := NewWatcher(0, 0, 10*time.Millisecond, 10*time.Millisecond,
-			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		w := newBubbleWatcher(10*time.Millisecond, 10*time.Millisecond)
 		w.SetPollInterval(10 * time.Millisecond)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -277,8 +285,7 @@ func TestWatcher_StopCancelsLoop(t *testing.T) {
 		writeCgroupV2(t, cg, 200000, 100000, 1<<30)
 		writeProc(t, proc, 8, 16<<30)
 
-		w := NewWatcher(0, 0, 10*time.Millisecond, 10*time.Millisecond,
-			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		w := newBubbleWatcher(10*time.Millisecond, 10*time.Millisecond)
 		w.SetPollInterval(10 * time.Millisecond)
 
 		ctx, cancel := context.WithCancel(context.Background())

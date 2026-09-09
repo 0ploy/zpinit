@@ -40,6 +40,13 @@ type Orchestrator struct {
 	// and friends without rerunning scripts either. nil means
 	// baseEnv is fixed at construction (the default for tests).
 	baseEnvBuilder func(globalsEnv, resourceEnv map[string]string) []string
+	// configCommitHook, if set, is invoked after every reload commits a
+	// new config, carrying whether the new service set needs the live
+	// resource watcher. main.go installs it so a reload that introduces
+	// the first `replicas = "auto"` / `reload_on_change` service starts
+	// the watcher that boot deliberately skipped. Read and written under
+	// o.mu; the callback itself runs outside the lock.
+	configCommitHook func(needsResourceWatch bool)
 	// resourceEnv is the latest set of detected resource env vars
 	// (ZPINIT_CPU_COUNT/CPU_QUOTA/MEMORY_BYTES). Updated by
 	// OnResourceChange when the watcher commits a delta; passed
@@ -122,6 +129,15 @@ type Orchestrator struct {
 // registerAndBoot, control start/restart) once stopAll has begun.
 var errShuttingDown = errors.New("supervisor is shutting down")
 
+// errNotRunning is returned by registerAndBoot before Orchestrator.Run
+// has published runnerCtx and wg. The window is real in production:
+// runSupervise starts the control socket BEFORE orch.Run, so a `zpctl
+// update` that lands in between reaches the reload path against a
+// half-built orchestrator. Registering there used to panic outright
+// ("cannot create context from nil parent"), recovered by the control
+// handler but leaving the reload half-applied.
+var errNotRunning = errors.New("supervisor is not running yet")
+
 // isStopping reports whether stopAll has begun teardown.
 func (o *Orchestrator) isStopping() bool {
 	o.mu.RLock()
@@ -148,6 +164,32 @@ func (o *Orchestrator) SetBaseEnvBuilder(fn func(globalsEnv, resourceEnv map[str
 	o.mu.Lock()
 	o.baseEnvBuilder = fn
 	o.mu.Unlock()
+}
+
+// SetConfigCommitHook installs a callback invoked after each reload
+// commits a new config. Optional; unset means no notification (the
+// default for tests). Same "main.go wires it after construction"
+// pattern as SetBaseEnvBuilder.
+func (o *Orchestrator) SetConfigCommitHook(fn func(needsResourceWatch bool)) {
+	o.mu.Lock()
+	o.configCommitHook = fn
+	o.mu.Unlock()
+}
+
+// notifyConfigCommitted fires the commit hook against the config that
+// was just committed. The predicate is evaluated under o.mu (Reload
+// swaps o.cfg wholesale and the scaler writes Replicas.N under the same
+// lock) but the callback runs after the unlock, so a hook that calls
+// back into the orchestrator cannot deadlock.
+func (o *Orchestrator) notifyConfigCommitted() {
+	o.mu.RLock()
+	fn := o.configCommitHook
+	needs := fn != nil && o.cfg != nil && o.cfg.NeedsResourceWatch()
+	o.mu.RUnlock()
+	if fn == nil {
+		return
+	}
+	fn(needs)
 }
 
 // SetCurrentSnapshot records the latest committed resource
@@ -251,10 +293,15 @@ func (o *Orchestrator) Run(ctx context.Context) int {
 	o.shutdownOnce = sync.Once{}
 	o.stopping = false
 	runnersSnap := append([]*Runner(nil), o.runners...)
+	// Add inside the publishing critical section, matching the rule
+	// every other registration path follows. Trivially safe here (the
+	// deferred Wait cannot have started yet), but keeping the shape
+	// uniform means there is exactly one Add discipline to reason about.
+	wg.Add(len(runnersSnap))
 	o.mu.Unlock()
 
 	for _, r := range runnersSnap {
-		o.spawnRunnerGoroutine(r)
+		o.spawnRunnerGoroutine(r, runnerCtx, &wg)
 	}
 
 	bootErr := o.boot(ctx)
@@ -622,31 +669,38 @@ func (o *Orchestrator) stopRunnerGroup(ctx context.Context, group []*Runner) {
 func (o *Orchestrator) ShutdownBudget() time.Duration {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
+	// o.runners is kept filename-sorted by sortRunners on every
+	// registration, which is groupByFilename's documented precondition;
+	// using it here keeps the "one budget unit per logical service"
+	// rule in the same place stopAll and applyReloadDiff read it from.
 	total := shutdownHeadroom
-	var currentFilename string
-	for _, r := range o.runners {
-		cfg := r.Cfg()
-		if cfg.Filename != currentFilename {
-			currentFilename = cfg.Filename
-			total += cfg.StopTimeout.Std() + reapGrace
-		}
+	for _, g := range groupByFilename(o.runners) {
+		total += g[0].Cfg().StopTimeout.Std() + reapGrace
 	}
 	return total
 }
 
-func (o *Orchestrator) spawnRunnerGoroutine(r *Runner) {
-	// Snapshot the runner-lifetime ctx and waitgroup under the lock so
-	// reloads racing with Run's setup observe a published value rather
-	// than a torn read. Run is the sole writer and writes both fields
-	// under o.mu.Lock; the matching read here gives the Go race
-	// detector a clean happens-before edge.
-	o.mu.RLock()
-	parent := o.runnerCtx
-	wg := o.wg
-	o.mu.RUnlock()
+// spawnRunnerGoroutine launches r's Run loop against parent.
+//
+// The caller MUST already have done wg.Add(1) for this runner inside
+// the SAME o.mu critical section as its o.stopping check, and must
+// have verified parent/wg are non-nil there. Two separate hazards make
+// that non-negotiable:
+//
+//   - An unlocked Add can race Run's deferred wg.Wait at a zero
+//     counter, which panics with "WaitGroup misuse"; in PID 1 that
+//     kills the container mid-shutdown. Same rule OnResourceChange
+//     follows, documented in CLAUDE.md.
+//   - Before Run's setup block publishes them, runnerCtx and wg are
+//     nil, and this function would panic on context.WithCancel(nil)
+//     and then nil-deref the WaitGroup.
+//
+// Taking parent and wg as arguments rather than re-reading the fields
+// is what makes both preconditions checkable at the single call site
+// that owns the lock.
+func (o *Orchestrator) spawnRunnerGoroutine(r *Runner, parent context.Context, wg *sync.WaitGroup) {
 	runCtx, cancel := context.WithCancel(parent)
 	r.setRunCancel(cancel)
-	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		r.Run(runCtx)

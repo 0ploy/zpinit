@@ -52,7 +52,7 @@ func TestWaitUntilReady_NoProbeSucceeds(t *testing.T) {
 	if err := o.WaitUntilReady(context.Background(), r); err != nil {
 		t.Fatalf("WaitUntilReady: %v", err)
 	}
-	if !r.ReadyPassed() {
+	if !r.Snapshot().ReadyPassed {
 		t.Errorf("expected ReadyPassed after WaitUntilReady on a no-probe service")
 	}
 }

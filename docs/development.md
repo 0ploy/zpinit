@@ -44,6 +44,24 @@ macOS builds compile via build tags but don't exercise PID-1 paths.
 Run `make integration` on a Linux box (or in a container) to validate
 those code paths.
 
+The resource watcher's inotify trigger (`internal/resources/
+notify_linux.go`) is one of these: off Linux `newCgroupNotify` returns
+nil and the watcher falls back to its backstop poll, so
+`notify_linux_test.go` is `//go:build linux` and never runs on a macOS
+`make test`. To exercise it without a Linux box:
+
+```sh
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o /tmp/res.test ./internal/resources
+docker run --rm -v /tmp/res.test:/t:ro alpine:3.20 /t -test.v
+```
+
+The `-race` build needs cgo, so for a race-checked Linux run mount the
+tree into a Go image instead:
+
+```sh
+docker run --rm -v "$PWD":/src -w /src golang:1.26 go test -race ./...
+```
+
 ## Project notes for agents
 
 `CLAUDE.md` in the repo root documents the load-bearing design rules

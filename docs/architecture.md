@@ -40,17 +40,24 @@ consecutive crashes (FATAL). The retry budget is hardcoded
 2. **Mode detection.** If `flag.Args()` is non-empty after zpinit
    parses its own flags, a CMD was provided: zpinit `syscall.Exec`s
    it as PID 1 and ignores `services/`.
-3. **Resource detection.** `internal/resources` reads cgroup v2 / v1
-   and `/proc` (taking the min of all sources). Reservations from
+3. **Resource detection.** `internal/resources` resolves this
+   process's own cgroup directory from `/proc/self/cgroup` +
+   `/proc/self/mountinfo` (the cgroupfs mount root is only the
+   container's cgroup under `--cgroupns=private`), then reads cgroup
+   v2 / v1 and `/proc`, taking the min of all sources. A failed
+   resolution sets `Snapshot.CgroupResolved = false`, which warns at
+   boot and is a `--doctor` finding: the numbers may be the host's. Reservations from
    `[resources]` are subtracted; the result is exported as
    `ZPINIT_CPU_COUNT`, `ZPINIT_CPU_QUOTA`, and `ZPINIT_MEMORY_BYTES`
    at the top of the env precedence chain so neither container env
    nor entrypoint scripts can shadow the detected values. Validation
-   rejects the keys in any operator `[env]` table. A resource watcher
-   keeps polling after boot and commits debounced deltas (env
-   updates, `reload_on_change` fanout, `replicas = "auto"`
-   rebalancing). The `[resources]` reservation values themselves are
-   read once at boot; changing them requires a container restart.
+   rejects the keys in any operator `[env]` table. When some service
+   needs it (see Live resource watcher), a watcher keeps polling after
+   boot and commits debounced deltas (env updates,
+   `reload_on_change` fanout, `replicas = "auto"` rebalancing);
+   otherwise the detected values are fixed for the container's life.
+   The `[resources]` reservation values themselves are read once at
+   boot; changing them requires a container restart.
 4. **Service boot.** In supervise mode, services start in filename
    order. Each readiness probe blocks the next service's start.
    `boot_timeout` is a per-service budget: each service gets its own
@@ -97,10 +104,60 @@ when any file was skipped; daemon boot and SIGHUP log and continue.
 
 ### Live resource watcher
 
-A polling goroutine in `internal/resources.Watcher` re-runs
-`Detect` once a second. When the exposed integer (`ZPINIT_CPU_COUNT`)
-or uint64 (`ZPINIT_MEMORY_BYTES`) value differs from the last
-committed Snapshot, a per-direction debounce timer starts
+The watcher is **gated**: `runSupervise` starts it only when
+`Config.NeedsResourceWatch()` is true, i.e. some service declares
+`replicas = "auto"` or a non-empty `reload_on_change`. Those are the
+only two consumers of a committed `Change`, so with neither present
+the loop would poll for nobody — and with a few hundred containers on
+one host that idle poll is the largest thing zpinit does. When the
+watcher is off, `ZPINIT_CPU_COUNT` / `ZPINIT_CPU_QUOTA` /
+`ZPINIT_MEMORY_BYTES` stay at their boot-time detected values.
+`Orchestrator.SetConfigCommitHook` re-evaluates the predicate after
+every committed reload so a newly-added auto / `reload_on_change`
+service still arms it (`Watcher.Start` is idempotent and reports
+whether it was the call that started polling). The transition is
+one-way: removing the last such service leaves the watcher running.
+
+When started, the watcher's trigger is **inotify, not polling**. It
+arms `IN_MODIFY` watches on the cgroup limit files of the RESOLVED
+cgroup directory (`cgroupLimitPaths`: the v2 and v1 paths together,
+whichever exist) and parks on a blocking read. Every runtime-driven quota change is a
+userspace write to one of those files — `docker update`, a Kubernetes
+in-place pod resize, systemd — and the kernel raises `IN_MODIFY`
+through the generic `vfs_write` path, so the event arrives in
+milliseconds and an idle container costs zero wakeups. Only
+`IN_MODIFY` is requested: `IN_ACCESS`/`IN_OPEN` would fire on the
+`Detect` a wake triggers, making the loop self-sustaining.
+
+An event carries no usable payload. The runtime writes `cpu.max` and
+`memory.max` as separate, non-atomic writes, so a wake can land on a
+half-applied change; the wake means only "re-`Detect`", and the
+debounce below settles it. Watches are re-armed on every observation
+rather than tracked — `inotify_add_watch` is idempotent, returning the
+same descriptor — which self-heals an `IN_IGNORED` (the inode went away
+under a cgroupfs remount, silently dropping the watch) and a transient
+`ENOSPC` (another process in the container exhausting the per-UID watch
+budget).
+
+Wakes are rate-limited to one observation per `observeCooldown`
+(100 ms). Because wakes are demand-driven, a process with write access
+to cgroupfs (cgroup delegation: nested containers, systemd-in-container)
+could otherwise drive a full `Detect` per write. A wake inside the
+window is deferred to the end of it, never dropped, so batching costs
+latency and never correctness.
+
+A backstop ticker (`[resources] poll_interval`, default 15 min) re-runs
+`Detect` on its own. It is not the primary path; it covers only what
+inotify cannot see: a limit the kernel derives internally rather than
+by a write to our file (a parent cgroup's cpuset propagating into
+`cpuset.cpus.effective`), and a sandbox runtime that accepts the watch
+but never delivers, which is silent and undetectable. Off Linux there
+is no notifier at all and the backstop carries the whole job.
+
+Both triggers run the same observation, and the debounce below is
+unchanged from the polling design. When the exposed integer
+(`ZPINIT_CPU_COUNT`) or uint64 (`ZPINIT_MEMORY_BYTES`) value differs
+from the last committed Snapshot, a per-direction debounce timer starts
 (`scale_down_after` when any dimension moves down, including
 mixed-direction moves; `scale_up_after` only when everything moves
 up). If the new value still holds when the timer fires, the
@@ -118,9 +175,14 @@ env, then fans out a reload action to every runner whose
 Sub-integer quota wobble that doesn't move the floor is invisible
 by construction.
 
-Polling is intentionally simple; inotify on cgroupfs would cut the
-median detection latency but is left as an optimization since one
-file-read per second is essentially free.
+Together the gate and the inotify trigger make an idle container's
+resource tracking free: containers with no `replicas = "auto"` /
+`reload_on_change` service run no watcher at all, and the ones that do
+sleep in the kernel until a quota actually moves. The remaining known
+cost is `Detect` itself, which re-reads `/proc/cpuinfo` in full on
+every observation — cheap now that observations are rare, but the
+obvious next optimization is to cache the `/proc` half (it cannot
+change for a running container) and re-read only the cgroup files.
 
 ### Per-service reload action
 

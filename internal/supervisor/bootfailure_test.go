@@ -46,7 +46,8 @@ func bootFixture(t *testing.T, svcs ...config.Service) *Orchestrator {
 		}, newFakeClock(time.Now()), testLog())
 		r.jitterRand = nil
 		o.runners = append(o.runners, r)
-		o.spawnRunnerGoroutine(r)
+		o.wg.Add(1)
+		o.spawnRunnerGoroutine(r, o.runnerCtx, o.wg)
 	}
 	t.Cleanup(func() {
 		cancel()

@@ -195,7 +195,22 @@ service):
 - `ZPINIT_MEMORY_BYTES` — memory budget in bytes, `0` for unlimited
   or undetected.
 
-Detection takes the min of every source it can read: cgroup v2
+zpinit first locates **this container's own cgroup** by combining
+`/proc/self/cgroup` with `/proc/self/mountinfo`, rather than assuming
+the cgroupfs mount root is it. The mount root is only the container's
+cgroup under `--cgroupns=private` (Docker's default on cgroup v2);
+under `--cgroupns=host` (the default on cgroup v1 hosts), with the
+host's `/sys/fs/cgroup` bind-mounted in, or under some Kubernetes/CRI
+and LXC layouts it is the *host's* root cgroup, which carries no
+limits at all. Reading it there makes a 2-CPU container look like the
+whole machine.
+
+If that resolution fails, zpinit logs a warning at boot and
+`zpinit --doctor` reports it (FAIL when a `replicas = "auto"` service
+is present, WARN otherwise). Treat the figures as unverified in that
+case — not as "no limit".
+
+Detection then takes the min of every source it can read: cgroup v2
 (`cpu.max`, `memory.max`), cgroup v1 (`cpu.cfs_quota_us` /
 `cpu.cfs_period_us`, `memory.limit_in_bytes`), the cpuset
 (`cpuset.cpus.effective`; covers `--cpuset-cpus` without `--cpus`,
@@ -227,6 +242,15 @@ reserve_memory  = "256MiB"
 # dip to restart their workers.
 scale_up_after   = "5s"
 scale_down_after = "30s"
+
+# Backstop re-detect interval. zpinit watches the cgroup limit files
+# with inotify, so a `docker update --cpus` or a Kubernetes in-place
+# resize is picked up in milliseconds and this timer normally never
+# does anything. Shorten it only on a runtime whose cgroupfs accepts
+# an inotify watch but never delivers events (some sandbox kernels),
+# where it becomes the only trigger. Longer is cheaper: a host running
+# hundreds of containers pays one wakeup per container per interval.
+poll_interval    = "15m"
 ```
 
 Byte sizes accept `K`/`KB`/`Ki`/`KiB` (and `M`, `G`) suffixes:
@@ -234,11 +258,23 @@ unsuffixed digits and `B`/`KB`/`MB`/`GB` use 1000-base; `Ki`/`Mi`/`Gi`
 and the `iB` forms use 1024-base. `reserve_cpu` is a non-negative
 float; `reserve_memory` is a non-negative byte count.
 
-The watcher polls cgroup state once a second and emits a change
-only when the *exposed* integer / uint64 values move and stay
-moved past the configured debounce. Sub-integer quota wobble that
+The watcher is woken by inotify on the cgroup limit files (with
+`poll_interval` as a backstop) and emits a change only when the
+*exposed* integer / uint64 values move and stay moved past the
+configured debounce. Sub-integer quota wobble that
 doesn't change `ZPINIT_CPU_COUNT` is invisible. Use
 `reload_on_change` on a service to subscribe to either dimension.
+
+**The watcher only runs when something consumes it.** zpinit starts
+it if any service declares `replicas = "auto"` or a non-empty
+`reload_on_change`, and skips it entirely otherwise — a poll loop in
+every container costs a wakeup per second on the shared host to track
+a quota that changes about never. With the watcher off, the three env
+vars keep their boot-time detected values for the container's life;
+a service that wants them refreshed on its next respawn opts in with
+`reload_on_change`. A reload that adds the first such service starts
+the watcher; removing the last one does not stop it again (it keeps
+running until the container restarts). Boot logs which way it went.
 
 The `[resources]` values themselves (reserves and debounce windows)
 are read once at boot; a `zpctl update` after editing them has no

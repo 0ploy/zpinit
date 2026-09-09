@@ -96,7 +96,6 @@ type Runner struct {
 	mu        sync.Mutex
 	state     State
 	process   Process
-	lastPID   int
 	lastExit  reaper.ExitInfo
 	crashes   int
 	upSince   time.Time
@@ -365,19 +364,6 @@ func (r *Runner) Run(ctx context.Context) {
 	}
 }
 
-// Start brings the runner from Pending/Stopped/Fatal/Backoff to a fresh
-// spawn cycle. Blocks until the command is processed by Run; if the
-// Run goroutine has already exited (e.g. orchestrator shutdown) this
-// will block until the cmds-channel buffer is exhausted, then forever.
-// Production code should prefer StartCtx so a dead Run goroutine
-// doesn't permanently hang the caller.
-func (r *Runner) Start() { _ = r.sendCtx(context.Background(), cmdStart) }
-
-// Stop signals the running process (or skips signaling if not running)
-// and transitions the runner to Stopping/Stopped. Same blocking caveat
-// as Start; prefer StopCtx in production.
-func (r *Runner) Stop() { _ = r.sendCtx(context.Background(), cmdStop) }
-
 // StartCtx is the context-aware variant of Start. Returns ctx.Err if
 // ctx fires before Run consumes the command — which happens cleanly
 // when Run has exited because its own context was canceled.
@@ -440,13 +426,6 @@ func (r *Runner) PID() int {
 		return r.process.PID()
 	}
 	return 0
-}
-
-// Crashes returns the consecutive-crash counter (test-visible).
-func (r *Runner) Crashes() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.crashes
 }
 
 // Observe returns a channel that receives every state transition, and
@@ -684,34 +663,6 @@ func (r *Runner) MarkReady() {
 	r.mu.Unlock()
 }
 
-// ReadyPassed reports whether MarkReady has been called for this
-// runner. Use for `zpctl ready` and similar readiness queries; does
-// not consult State (a service that was ready then crashed into
-// backoff still returns true here; combine with State() if you want
-// "ready AND currently running").
-func (r *Runner) ReadyPassed() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.readyPassed
-}
-
-// UpSince returns when the runner last entered Running, or the zero
-// time if it isn't currently running. Drives "uptime" in zpctl status.
-func (r *Runner) UpSince() time.Time {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.upSince
-}
-
-// StoppedManually reports whether the most recent terminal state was
-// reached via Stop rather than a clean exit. Used to render the
-// supervisord-compatible STOPPED-vs-EXITED distinction.
-func (r *Runner) StoppedManually() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.stoppedManually
-}
-
 // SetBaseEnv replaces the runner's captured baseEnv. Subsequent
 // spawns (after a Stop or a crash-driven restart) will see the new
 // slice. The currently-running child keeps its boot-time env: env
@@ -804,9 +755,6 @@ func (r *Runner) setState(s State) {
 
 func (r *Runner) setProcess(p Process) {
 	r.mu.Lock()
-	if p != nil {
-		r.lastPID = p.PID()
-	}
 	r.process = p
 	r.mu.Unlock()
 }

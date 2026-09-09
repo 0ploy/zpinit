@@ -362,6 +362,62 @@ change observable behavior, it was never quiet — give it an entry.
   Advance(delay) timings must clear `r.jitterRand` after `NewRunner`;
   the existing runner-test fixture does this.
 
+- The resource watcher is gated on `Config.NeedsResourceWatch()`
+  (any `replicas = "auto"` or non-empty `reload_on_change`), because
+  those are its ONLY two consumers; without one, a committed `Change`
+  has nowhere to go and the poll loop is pure cost on a host running
+  many containers. `Orchestrator.SetConfigCommitHook` re-runs the
+  predicate after every committed reload (fired from `applyReloadDiff`,
+  the single commit point shared by `Reload` and `ReloadScoped`) so a
+  newly-added auto service still arms it. The lazy start is
+  deliberately ONE-WAY: `Watcher.Start` is one-shot (`w.started`), so
+  stopping and restarting would mean building a fresh Watcher and
+  re-subscribing, and the reward is only reaching the pre-gate status
+  quo. Don't add a stop path. Consequence to keep in mind when
+  touching env: with the watcher off, the `ZPINIT_CPU_*` /
+  `ZPINIT_MEMORY_BYTES` values are fixed at boot-time detection, so
+  `OnResourceChange`'s baseEnv recompose never runs.
+
+- Detection resolves THIS process's cgroup from `/proc/self/cgroup` +
+  `/proc/self/mountinfo` (`resolveCgroupLayout`); the cgroupfs mount
+  root is NOT the container's cgroup under `--cgroupns=host`, with the
+  host's `/sys/fs/cgroup` bind-mounted in, or under some k8s/LXC
+  layouts, and reading it there reports the whole machine's budget.
+  `ZPINIT_CGROUP_ROOT` short-circuits resolution and keeps the legacy
+  shape (root is the unified dir, v1 controllers are subdirectories) —
+  every existing fixture depends on that. `Snapshot.CgroupResolved`
+  false means "unverified", never "no limit": don't let a caller treat
+  it as unlimited. Deliberately not cached, so a per-test
+  `t.Setenv(ZPINIT_CGROUP_ROOT)` keeps working.
+
+- The resource watcher waits on inotify (`internal/resources/
+  notify_linux.go`); `[resources] poll_interval` (15m) is only a
+  BACKSTOP for what inotify cannot see (a kernel-derived limit change
+  such as a parent cpuset propagating into `cpuset.cpus.effective`, and
+  sandbox runtimes that accept the watch but never deliver). Rules that
+  are load-bearing: watch ONLY `IN_MODIFY` — `IN_ACCESS`/`IN_OPEN` fire
+  on the `Detect` that a wake triggers, so the loop would drive itself;
+  treat a wake as "re-Detect" and never as a per-dimension signal (the
+  runtime writes `cpu.max` and `memory.max` non-atomically, so an event
+  can land on a half-applied change); and call `rearm()` on EVERY
+  observation rather than tracking watch state, because
+  `inotify_add_watch` is idempotent and that is what self-heals a
+  dropped watch after `IN_IGNORED` (cgroupfs remount) or a transient
+  `ENOSPC` (per-UID watch budget exhausted by another process in the
+  container). `cgroupLimitPaths` must list every file `readCgroupV2` /
+  `readCgroupV1` / `readCPUSetCount` read, or a limit can move without
+  waking anyone until the backstop.
+
+- `Watcher.notifier` is a swappable field, not a constructor arg,
+  because the watcher tests run inside a `testing/synctest` bubble: a
+  goroutine parked on a real inotify read is not "durably blocked", so
+  the bubble's virtual clock never advances with a live notifier. The
+  bubbled tests set it to nil (`newBubbleWatcher`) and exercise the
+  backstop path, which runs the same `observe()` body; the notifier
+  itself is covered by `notify_linux_test.go`, which is `//go:build
+  linux` and does NOT run on a macOS `make test`. See
+  docs/development.md for how to run it in a container.
+
 - Listener replicas without app-level `SO_REUSEPORT` opt-in will
   EADDRINUSE on every replica except the first to win the bind race;
   the child crash-loops past `MaxConsecutiveCrashes` and goes FATAL.

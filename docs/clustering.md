@@ -54,7 +54,8 @@ restart = "always"
 
 The boot-time count comes from `Detect()`; thereafter every
 debounced commit from the resource watcher rebalances the runner
-set. `docker update --cpus N` (or Kubernetes in-place pod resize)
+set. Declaring `replicas = "auto"` is what starts that watcher —
+containers with only static replica counts never run it. `docker update --cpus N` (or Kubernetes in-place pod resize)
 propagates to live workloads without operator intervention. Scale-up
 boots new replicas one at a time in filename order (same
 serialization the reload-boot path uses); scale-down stops the

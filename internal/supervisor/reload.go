@@ -610,12 +610,9 @@ func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, com
 	// Expand every (re)added service into per-replica boot jobs. Sort
 	// is preserved at the filename level by addSpecs above; replica
 	// indices then run in 0..N-1 order within a filename.
-	var jobs []reloadBootJob
+	var jobs []*Runner
 	for _, s := range addSpecs {
-		runners := expandServiceToRunners(s, newBaseEnv, o.spawner, o.clock, o.log)
-		for _, r := range runners {
-			jobs = append(jobs, reloadBootJob{runner: r})
-		}
+		jobs = append(jobs, expandServiceToRunners(s, newBaseEnv, o.spawner, o.clock, o.log)...)
 	}
 
 	// Commit the new config + baseEnv atomically with the runner
@@ -629,6 +626,11 @@ func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, com
 	// Rebind the exit_code_from watcher: the watched service may have
 	// been added in this reload, or the target name may have changed.
 	o.installExitCodeWatcher()
+	// Let main.go react to the newly committed service set: a reload can
+	// introduce the first service that needs the live resource watcher.
+	// Fired even when errs is non-empty, because the config was still
+	// committed and the added services are registered.
+	o.notifyConfigCommitted()
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
@@ -655,7 +657,7 @@ func (o *Orchestrator) applyReloadDiff(ctx context.Context, diff reloadDiff, com
 // entry points (Reload, ReloadScoped, OnResourceChange, control
 // start) are gated too; this check closes the window where shutdown
 // begins mid-reload.
-func (o *Orchestrator) registerAndBoot(jobs []reloadBootJob, commitCfg *config.Config, newBaseEnv []string) error {
+func (o *Orchestrator) registerAndBoot(jobs []*Runner, commitCfg *config.Config, newBaseEnv []string) error {
 	// Capture runnerCtx under the same lock as the registration so the
 	// detached boot goroutine reads a properly-published value (Run is
 	// the sole writer of runnerCtx; the pairing keeps it race-clean).
@@ -665,42 +667,43 @@ func (o *Orchestrator) registerAndBoot(jobs []reloadBootJob, commitCfg *config.C
 		o.log.Warn("service registration refused; supervisor shutting down", "jobs", len(jobs))
 		return errShuttingDown
 	}
-	for _, j := range jobs {
-		o.runners = append(o.runners, j.runner)
+	// Run has not published runnerCtx/wg yet. Reachable in production:
+	// runSupervise starts the control socket before orch.Run, so an
+	// early `zpctl update` lands here against a half-built
+	// orchestrator. Refuse the whole batch rather than register runners
+	// whose Run goroutine we cannot start; Run's own setup rebuilds
+	// o.runners from o.cfg, so a partial registration would be silently
+	// discarded anyway.
+	bootRoot, wg := o.runnerCtx, o.wg
+	if bootRoot == nil || wg == nil {
+		o.mu.Unlock()
+		o.log.Warn("service registration refused; supervisor not running yet", "jobs", len(jobs))
+		return errNotRunning
 	}
+	o.runners = append(o.runners, jobs...)
 	sortRunners(o.runners)
 	if commitCfg != nil {
 		o.cfg = commitCfg
 		o.baseEnv = newBaseEnv
 	}
 	globals := o.cfg.Globals
-	bootRoot := o.runnerCtx
+	// Add for every job in the same critical section as the stopping
+	// check above; see spawnRunnerGoroutine for why an unlocked Add is
+	// a panic waiting to happen.
+	wg.Add(len(jobs))
 	o.mu.Unlock()
-	if bootRoot == nil {
-		// No live Run loop (constructed-directly tests); boots still
-		// need a non-nil root for runReloadBoots' ctx handling.
-		bootRoot = context.Background()
-	}
 
-	// spawnRunnerGoroutine takes no orchestrator locks but pulls
-	// runnerCtx via setRunCancel, so run it after the unlock.
-	for _, j := range jobs {
-		o.spawnRunnerGoroutine(j.runner)
+	// spawnRunnerGoroutine takes no orchestrator locks, so run it after
+	// the unlock; the Add it pairs with is already done.
+	for _, r := range jobs {
+		o.spawnRunnerGoroutine(r, bootRoot, wg)
 	}
 
 	if len(jobs) > 0 {
-		bootJobs := append([]reloadBootJob(nil), jobs...)
+		bootJobs := append([]*Runner(nil), jobs...)
 		go o.runReloadBoots(bootRoot, bootJobs, globals)
 	}
 	return nil
-}
-
-// reloadBootJob carries a pre-built runner through Reload's serial boot
-// phase. Built synchronously inside Reload and drained one at a time by
-// runReloadBoots in filename order. (The runner already holds its own
-// Cfg(); bootReloadJob reads it from there.)
-type reloadBootJob struct {
-	runner *Runner
 }
 
 // runReloadBoots drives the post-Reload boot sequence: each job is
@@ -714,11 +717,11 @@ type reloadBootJob struct {
 // and break filename order. Boot goroutines are not part of the Run
 // waitgroup; on orchestrator shutdown they die with the process, so a
 // plain mutex without ctx-aware acquisition is sufficient.
-func (o *Orchestrator) runReloadBoots(root context.Context, jobs []reloadBootJob, globals config.Globals) {
+func (o *Orchestrator) runReloadBoots(root context.Context, jobs []*Runner, globals config.Globals) {
 	defer recoverLog(o.log, "reload boot")
 	o.reloadBootMu.Lock()
 	defer o.reloadBootMu.Unlock()
-	for _, j := range jobs {
+	for _, r := range jobs {
 		// Both checks matter: root (runnerCtx) is canceled only after
 		// stopAll finishes, so a boot list in flight when SIGTERM
 		// lands must also honor the stopping latch or it would spawn
@@ -726,24 +729,23 @@ func (o *Orchestrator) runReloadBoots(root context.Context, jobs []reloadBootJob
 		if root.Err() != nil || o.isStopping() {
 			return
 		}
-		// A reload that landed after this job was queued may have
-		// removed its runner already (its Run goroutine is gone).
-		// Booting it anyway would park StartCtx for the full
-		// boot_timeout while holding reloadBootMu, stalling every
-		// legitimate boot queued behind this one.
-		if !o.isRegistered(j.runner) {
+		// A reload that landed after this runner was queued may have
+		// removed it already (its Run goroutine is gone). Booting it
+		// anyway would park StartCtx for the full boot_timeout while
+		// holding reloadBootMu, stalling every legitimate boot queued
+		// behind this one.
+		if !o.isRegistered(r) {
 			o.log.Info("reload: boot job skipped; service removed before boot",
-				"service", j.runner.DisplayName())
+				"service", r.DisplayName())
 			continue
 		}
 		bctx, bcancel := context.WithTimeout(root, globals.BootTimeout.Std())
-		o.bootReloadJob(bctx, j)
+		o.bootReloadJob(bctx, r)
 		bcancel()
 	}
 }
 
-func (o *Orchestrator) bootReloadJob(ctx context.Context, j reloadBootJob) {
-	r := j.runner
+func (o *Orchestrator) bootReloadJob(ctx context.Context, r *Runner) {
 	name := r.DisplayName()
 	o.log.Info("reload: booting", "service", name)
 	if err := r.StartCtx(ctx); err != nil {
