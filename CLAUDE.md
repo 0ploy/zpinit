@@ -28,6 +28,9 @@ commit when the topic changes.
   reaping, control protocol (including the streaming extension).
 - `docs/security.md`: threat model, control socket, log handling, env
   injection.
+- `docs/troubleshooting.md`: operator runbook, symptom-indexed. A new
+  gotcha below with an operator-visible symptom gets an entry there in
+  the same commit; this file is agent-facing, that one is not.
 - `docs/development.md`: build/test/lint commands and platform notes.
 
 ## Load-Bearing Design Rules

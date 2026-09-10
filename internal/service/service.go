@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -273,10 +274,20 @@ func MergeEnv(base []string, override map[string]string) []string {
 		}
 		out = append(out, e)
 	}
-	for k, v := range override {
+	// Keys absent from base are appended in sorted order. Map iteration
+	// is randomised, so without this a service's env slice differs run
+	// to run: `zpinit --plan` output is not reproducible and any future
+	// env diffing is noisy for no reason. The order of entries already
+	// present in base is preserved untouched.
+	extra := make([]string, 0, len(override))
+	for k := range override {
 		if !seen[k] {
-			out = append(out, k+"="+v)
+			extra = append(extra, k)
 		}
+	}
+	sort.Strings(extra)
+	for _, k := range extra {
+		out = append(out, k+"="+override[k])
 	}
 	return out
 }

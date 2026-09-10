@@ -433,7 +433,12 @@ func (s *ControlServer) cmdStatus(args []string) *ctlproto.Response {
 // accidentally write the flag twice.
 func extractFlag(args []string, name string) (bool, []string) {
 	found := false
-	out := args[:0]
+	// A fresh slice, not args[:0]. Filtering in place overwrites the
+	// caller's backing array, so req.Args would be silently truncated
+	// for anything that read it afterwards — and cmdTailFollow already
+	// calls this twice in a row on the same array. The allocation is
+	// noise on a path that already does file and socket I/O.
+	out := make([]string, 0, len(args))
 	for _, a := range args {
 		if a == name {
 			found = true

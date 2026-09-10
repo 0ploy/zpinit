@@ -86,9 +86,36 @@ func (c *Conn) ReadRequest() (*Request, error) {
 	return &Request{Verb: parts[0], Args: parts[1:]}, nil
 }
 
+// WriteRequest serialises a request onto the wire.
+//
+// Verb and args are REJECTED rather than sanitised if they contain
+// whitespace or control characters. Responses are sanitised because
+// their content is log text and TOML errors zpinit does not control, so
+// mangling beats a malformed frame. A request field is always a verb, a
+// flag, or a service name — none of which can legally contain
+// whitespace — so silently rewriting one would turn a typo into a
+// different, valid-looking command: the wire is space-delimited, so an
+// embedded space splits one argument into two, and an embedded newline
+// truncates the request because the daemon reads exactly one line.
+//
+// zpctl checks this too and reports it in operator language; enforcing
+// it here means the invariant lives at the wire layer, where a future
+// client cannot bypass it.
 func (c *Conn) WriteRequest(req *Request) error {
+	if err := checkRequestField(req.Verb); err != nil {
+		return fmt.Errorf("verb %q: %w", req.Verb, err)
+	}
+	for _, a := range req.Args {
+		if err := checkRequestField(a); err != nil {
+			return fmt.Errorf("argument %q: %w", a, err)
+		}
+	}
 	var b strings.Builder
-	b.Grow(len(req.Verb) + 1)
+	n := len(req.Verb) + 1
+	for _, a := range req.Args {
+		n += len(a) + 1
+	}
+	b.Grow(n)
 	b.WriteString(req.Verb)
 	for _, a := range req.Args {
 		b.WriteByte(' ')
@@ -192,6 +219,19 @@ func (c *Conn) ReadBodyLine() (line string, done bool, err error) {
 		return "", true, nil
 	}
 	return line, false, nil
+}
+
+// errFieldNotRepresentable marks a request verb or argument that cannot
+// survive the space-delimited, newline-terminated wire format.
+var errFieldNotRepresentable = errors.New("contains whitespace or control characters; not representable on the wire")
+
+func checkRequestField(s string) error {
+	if strings.ContainsFunc(s, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\r' || r == '\n' || r < 0x20 || r == 0x7f
+	}) {
+		return errFieldNotRepresentable
+	}
+	return nil
 }
 
 // sanitizeLine fixes content that would break the line-based wire

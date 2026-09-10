@@ -1194,33 +1194,6 @@ Open questions:
   in resolver behavior inside the probe loop; IP-only is more
   predictable for a localhost-oriented check.
 
-## 35. Operator troubleshooting runbook: `docs/troubleshooting.md`
-
-Not a code feature: a symptom-to-cause runbook for operators debugging
-a live container. Much of this knowledge exists today only in
-`CLAUDE.md` gotchas (agent-facing) or in heads. Candidate entries:
-
-- Service crash-loops to FATAL with EADDRINUSE: listener replicas
-  without app-level `SO_REUSEPORT` opt-in; run `zpinit --doctor`.
-- Service won't die on stop: child in uninterruptible kernel sleep
-  (D state); what the bounded post-SIGKILL reap wait does and what to
-  check on the host.
-- Whole container exits after a reload: the `exit_code_from`-watched
-  service was removed by that reload.
-- Reload appears to ignore a file: it failed parse/validation and was
-  skipped; where the skip is reported.
-- Boot hangs on one service: `[ready]` probe never passes; how
-  `boot_timeout` and `on_timeout` interact.
-- `zpctl` gets connection refused / permission denied: socket perms
-  and the peer-cred gate; must be same UID as the daemon.
-
-Open questions:
-
-- Sync discipline: several entries restate `CLAUDE.md` gotchas in
-  operator language. Add a convention that a new gotcha with operator-
-  visible symptoms gets a runbook entry in the same commit?
-- Structure: one symptom-indexed page, or per-mode sections?
-
 ## Mid-tier mode-3 ideas (no dedicated section)
 
 - **Service groups** (`group = "web"`) plus `zpctl restart --group web`.
@@ -1293,6 +1266,12 @@ in the "pending" section above:
 - Item 27 `zpctl ready` and `zpctl status --verbose` (shipped v0.4.0).
 - Mid-tier item `zpctl tail --follow` (shipped v0.4.0 with a streaming
   control-protocol extension).
+- Item 35 operator troubleshooting runbook (shipped v0.7.1 as
+  `docs/troubleshooting.md`). The sync question it raised is answered:
+  `CLAUDE.md`'s docs-landscape entry now states that a new gotcha with
+  an operator-visible symptom gets a runbook entry in the same commit.
+  Structure landed as one symptom-indexed page rather than per-mode
+  sections.
 
 References below preserve their original numbering for traceability;
 the items themselves were removed from the body of this file.
@@ -1388,7 +1367,6 @@ Within the reliability-review cluster (items 31-35):
   after a crash. Small surface (cgroup counter read at reap time).
 - (31) reload dry-run: the diff engine already exists; this is mostly
   an output surface. High fleet-rollout value.
-- (35) troubleshooting runbook: pure docs, cheap, do anytime.
 - (34) TCP ready probe: small and useful on its own, but best shipped
   together with the shared probe package that items 1 and 20 need, so
   the `connect` type lands in all three probe surfaces at once.

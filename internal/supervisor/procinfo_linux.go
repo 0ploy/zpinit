@@ -101,13 +101,23 @@ func readCPUSeconds(path string) (float64, bool) {
 	return float64(utime+stime) / clockTicksPerSecond, true
 }
 
-// countFDs returns the number of entries in /proc/<pid>/fd. Cheap
-// (one syscall per entry) and tolerant: a fd that vanishes between
-// readdir and the loop doesn't affect the count we already have.
+// countFDs returns the number of entries in /proc/<pid>/fd.
+//
+// Readdirnames rather than os.ReadDir: ReadDir allocates a DirEntry per
+// fd and sorts them by name, and all we want is the length. A php-fpm
+// master with a few thousand fds made that an O(n log n) string sort
+// per status row, on a path `status --json --verbose` invites a metrics
+// scraper to poll. Tolerant by design: an fd that vanishes mid-read
+// doesn't invalidate the count.
 func countFDs(path string) (int, bool) {
-	entries, err := os.ReadDir(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return 0, false
 	}
-	return len(entries), true
+	defer f.Close()
+	names, err := f.Readdirnames(-1)
+	if err != nil {
+		return 0, false
+	}
+	return len(names), true
 }

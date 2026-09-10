@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`docs/troubleshooting.md`**, a symptom-indexed runbook for debugging
+  a live container: wrong CPU/memory figures, EADDRINUSE crash loops,
+  boot hanging on a readiness probe, a reload that appears to ignore a
+  file, a service that will not die, `zpctl` connection failures, and
+  the STOPPED-vs-EXITED-vs-FATAL distinction. Each entry says what to
+  check and what to change. Linked from the README.
+
+### Fixed
+
+- **`zpctl shutdown` now tears down exactly like SIGTERM does.** It
+  closed neither the control socket before teardown nor bounded the
+  wait for the supervisor, so a service slow to stop could hold the
+  container open with nothing logged, while the same shutdown triggered
+  by a signal was closed and budgeted. Both paths now share one
+  routine.
+
+- **A service's environment could differ between otherwise identical
+  boots.** Variables set only in a service's `[env]` were appended in
+  Go map order, which is randomised per run. Harmless to the process,
+  but it made `zpinit --plan` output non-reproducible and unusable for
+  the CI boot-plan diffing the README suggests. The order is now
+  stable; variables already inherited keep their existing position.
+
+### Changed
+
+- `zpctl` arguments containing whitespace or control characters are now
+  rejected by the wire layer rather than only by the client. The wire is
+  space-delimited and newline-terminated, so such an argument could
+  otherwise be silently split or truncated into a different, valid
+  command. No legal service name, replica target, or flag is affected.
+
+- `zpctl status --verbose` no longer sorts the entries of
+  `/proc/<pid>/fd` just to count them, which was an unnecessary
+  allocation and sort per service row on a path that `--json` invites
+  monitoring to poll.
+
+- `zpinit --version` and `zpinit --doctor-quiet` are documented in the
+  README; both already worked.
+
 ## v0.7.0
 
 ### Added

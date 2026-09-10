@@ -533,7 +533,21 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 	// propagates to the orchestrator just like SIGTERM would.
 	ctrlCtx, ctrlCancel := context.WithCancel(context.Background())
 	defer ctrlCancel()
-	ctrl := supervisor.NewControlServer(orch, cancel, log)
+	// `zpctl shutdown` routes through the main loop rather than
+	// cancelling ctx directly, so it gets the same treatment a signal
+	// does: control socket closed first, teardown bounded by
+	// ShutdownBudget. Previously it only cancelled ctx, leaving the
+	// socket accepting requests throughout stopAll and the wait for
+	// the orchestrator unbounded and unlogged. Buffered + non-blocking
+	// so the verb's response is written even if the loop is busy, and
+	// a second `zpctl shutdown` during teardown is a no-op.
+	shutdownReq := make(chan struct{}, 1)
+	ctrl := supervisor.NewControlServer(orch, func() {
+		select {
+		case shutdownReq <- struct{}{}:
+		default:
+		}
+	}, log)
 	go func() {
 		if err := ctrl.Listen(ctrlCtx, cfg.Globals.ControlSocket); err != nil {
 			log.Error("control socket", "err", err)
@@ -548,6 +562,44 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 		log.Info("no services configured; control socket up, waiting for reload (zpctl reread / SIGHUP)")
 	}
 
+	// beginShutdown is the single teardown path, shared by the signal
+	// handler and `zpctl shutdown` so the two cannot drift.
+	beginShutdown := func(reason string) int {
+		// Recompute the budget against the *current* runner set rather
+		// than reusing a boot-time snapshot — reload may have added
+		// services or bumped stop_timeout since startup, and the
+		// supervisor's outer wait must cover stopAll's serial inner
+		// wait.
+		budget := orch.ShutdownBudget()
+		log.Info("shutting down", "reason", reason, "budget", budget)
+		// Close the control socket before teardown begins so no new
+		// zpctl request lands mid-stopAll. The orchestrator's stopping
+		// latch is the second gate for requests already in flight.
+		// Closing the listener does not close already-accepted
+		// connections, so an in-flight `zpctl shutdown` still receives
+		// its response.
+		ctrlCancel()
+		cancel()
+		shutdownTimer := time.NewTimer(budget)
+		defer shutdownTimer.Stop()
+		// A second shutdown request during this wait is deliberately
+		// ignored (nothing reads userCh or shutdownReq anymore):
+		// graceful stop is already running at full speed and per-runner
+		// SIGKILL escalation is the accelerator. Operators who want an
+		// immediate hard kill use the runtime's (docker stop -t 0);
+		// Pdeathsig takes the children down with PID 1.
+		select {
+		case code := <-exitCh:
+			cleanup()
+			return code
+		case <-shutdownTimer.C:
+			log.Error("orchestrator did not return within budget; exiting anyway",
+				"budget", budget)
+			cleanup()
+			return 1
+		}
+	}
+
 	for {
 		select {
 		case sig := <-userCh:
@@ -556,37 +608,7 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 			// coming from there use `kill -QUIT` for graceful shutdown,
 			// and the Go default would be a goroutine dump + hard exit.
 			case syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT:
-				// Recompute the budget against the *current* runner
-				// set rather than reusing a boot-time snapshot —
-				// reload may have added services or bumped
-				// stop_timeout since startup, and the supervisor's
-				// outer wait must cover stopAll's serial inner wait.
-				budget := orch.ShutdownBudget()
-				log.Info("shutdown signal", "signal", sig.String(), "budget", budget)
-				// Close the control socket before teardown begins so no
-				// new zpctl request lands mid-stopAll. The orchestrator's
-				// stopping latch is the second gate for requests already
-				// in flight.
-				ctrlCancel()
-				cancel()
-				shutdownTimer := time.NewTimer(budget)
-				// A second TERM/INT/QUIT during this wait is deliberately
-				// ignored (nothing reads userCh anymore): graceful stop is
-				// already running at full speed and per-runner SIGKILL
-				// escalation is the accelerator. Operators who want an
-				// immediate hard kill use the runtime's (docker stop -t 0);
-				// Pdeathsig takes the children down with PID 1.
-				select {
-				case code := <-exitCh:
-					shutdownTimer.Stop()
-					cleanup()
-					return code
-				case <-shutdownTimer.C:
-					log.Error("orchestrator did not return within budget; exiting anyway",
-						"budget", budget)
-					cleanup()
-					return 1
-				}
+				return beginShutdown("signal " + sig.String())
 			case syscall.SIGHUP:
 				log.Info("SIGHUP: reloading config", "dir", configDir)
 				newCfg, err := config.Load(configDir)
@@ -613,7 +635,12 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 					log.Error("reload: failed", "err", err)
 				}
 			}
+		case <-shutdownReq:
+			return beginShutdown("zpctl shutdown")
 		case code := <-exitCh:
+			// The orchestrator ended on its own: the exit_code_from
+			// target reached a terminal state, or boot failed. Run has
+			// already returned, so there is nothing left to bound.
 			cleanup()
 			return code
 		}

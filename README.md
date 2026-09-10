@@ -423,7 +423,15 @@ each `command[0]` on PATH (or as an absolute path), surfaces runtime
 versions, warns when a node service has `replicas > 1` with Node below
 22.12.0 (the [clustering EADDRINUSE](docs/clustering.md) case), and
 reports whether a zpinit instance is already attached to the control
-socket. Exit 0 on green, 1 on FAIL, 2 on WARN-only.
+socket. It also reports whether zpinit could locate the container's own
+cgroup: when it cannot, the detected CPU/memory figures may be the
+host's, which is a FAIL if any service uses `replicas = "auto"`. Add
+`--doctor-quiet` to print only WARN and FAIL rows, which is what you
+want from a CI gate or a `HEALTHCHECK`. Exit 0 on green, 1 on FAIL, 2 on
+WARN-only.
+
+`zpinit --version` prints the build version and exits; the same string
+appears in the boot banner.
 
 ## Learn more
 
@@ -432,6 +440,7 @@ socket. Exit 0 on green, 1 on FAIL, 2 on WARN-only.
 - [docs/clustering.md](docs/clustering.md): replicas, reusePort, PM2 comparison and migration.
 - [docs/architecture.md](docs/architecture.md): packages, state machine, reload internals.
 - [docs/security.md](docs/security.md): threat model, control socket, env injection.
+- [docs/troubleshooting.md](docs/troubleshooting.md): symptom-indexed runbook for live containers.
 - [docs/development.md](docs/development.md): build, test, contribute.
 
 ## License
