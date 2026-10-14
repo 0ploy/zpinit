@@ -37,6 +37,36 @@ filter. Both run with `go test -race -count=1` so the
 data-race class the v0.3.x review surfaced can't regress unnoticed
 in the supervise / reload / autoscale fan-out.
 
+### Writing tests against the fake runner
+
+Runner state changes are observable before the matching signal lands:
+`handleStop` transitions to Stopping, then calls `SignalGroup`. A test
+that has just seen a state and wants the signal must use
+`waitSignals(t, p, n, timeout)` from `fake_test.go`, never read
+`signalsReceived()` directly after `waitState`; the bare read passed
+by luck and failed under `-count=3`.
+
+### Integration test conventions
+
+- One supervisor per test, config in `t.TempDir()`, socket path set
+  through `control_socket` in `zpinit.toml`. `startZpinit` /
+  `zpctlRunner` / `waitForRunning` / `waitForStateRow` in
+  `reload_test.go` and `lifecycle_test.go` are the shared helpers.
+- Assert what the product contract promises, not what the scheduler
+  usually does. Filename order fixes spawn order only; a test that
+  needs "B runs after A is up" gives A a `[ready]` probe.
+- Without a `[ready]` probe a service is booted the moment it is
+  spawned, so an immediate exit is a normal EXITED, not a boot
+  failure. Boot-failure tests give the service a probe that never
+  passes and let the child die while it is polling.
+- A zpinit that a test must observe exiting goes through `watchExit`;
+  a bare `exited <- zp.Wait()` channel read twice (test body, then
+  cleanup) hangs the suite until the `go test` timeout.
+- `TestPID1InContainer` is the only test that runs zpinit as a real
+  PID 1 (orphan reaping, container exit code). It needs a docker
+  daemon and skips without one, so it runs on the ubuntu CI runner,
+  not in a docker-less dev container.
+
 ## Linux-only paths
 
 zpinit uses `Pdeathsig`, `Setpgid`, and `/proc` in its hot paths.

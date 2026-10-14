@@ -258,7 +258,7 @@ reload_on_change = ["memory"]
 	pidBefore, _ := zpctl("pid", "app")
 	pidBefore = strings.TrimSpace(pidBefore)
 
-	// Cpu change only — memory-only listener must NOT restart.
+	// Cpu change only; memory-only listener must NOT restart.
 	writeFile(t, filepath.Join(cg, "cpu.max"), "400000 100000\n")
 
 	// Allow enough time for the watcher to commit (100 ms scale_up_after
