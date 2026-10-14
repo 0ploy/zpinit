@@ -28,6 +28,19 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(tmp)
 
+	// ZPINIT_TEST_COVERDIR (set by `make coverage`) builds the binaries
+	// under test with coverage instrumentation and points every zpinit
+	// / zpctl these tests spawn at that directory, so the integration
+	// run contributes to the merged coverage figure. The helpers pass
+	// os.Environ() through to children, which carries GOCOVERDIR.
+	var buildExtra []string
+	if dir := os.Getenv("ZPINIT_TEST_COVERDIR"); dir != "" {
+		// atomic matches what -race unit runs emit; covdata refuses to
+		// merge mixed counter modes.
+		buildExtra = []string{"-cover", "-covermode=atomic", "-coverpkg=github.com/0ploy/zpinit/..."}
+		os.Setenv("GOCOVERDIR", dir)
+	}
+
 	for _, target := range []struct {
 		name string
 		bin  *string
@@ -36,7 +49,9 @@ func TestMain(m *testing.M) {
 		{"zpctl", &zpctlBin},
 	} {
 		path := filepath.Join(tmp, target.name)
-		build := exec.Command("go", "build", "-o", path, "../../cmd/"+target.name)
+		args := append([]string{"build"}, buildExtra...)
+		args = append(args, "-o", path, "../../cmd/"+target.name)
+		build := exec.Command("go", args...)
 		build.Stderr = os.Stderr
 		if err := build.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "TestMain: build %s: %v\n", target.name, err)

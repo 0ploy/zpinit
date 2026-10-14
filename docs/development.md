@@ -22,20 +22,42 @@ tests.
 ## Test
 
 ```sh
-make test        # unit tests (Linux + macOS)
-make integration # full-binary integration tests (Linux only)
-make lint        # gofmt + go vet
+make test             # fast dev loop: unit tests, cached (Linux + macOS)
+make test-race        # unit tests as CI runs them: -race -shuffle=on -count=1
+make integration      # full-binary integration tests (Linux only)
+make integration-race # the CI variant of the above
+make coverage         # merged unit + integration coverage -> cover/coverage.html
+make lint             # gofmt -s, go vet (incl. integration tag), staticcheck
+make vuln             # govulncheck against the module
+make check            # everything CI gates on: lint vuln test-race integration-race
 ```
 
 Tests use the standard library only. No testify, gomock, or similar.
 The only approved external dependency is `github.com/BurntSushi/toml`;
-anything else needs explicit approval before `go get`.
+anything else needs explicit approval before `go get`. `staticcheck`
+and `govulncheck` run through `go run pkg@version` (versions pinned in
+the Makefile), which uses the module cache and never touches `go.mod`.
 
-CI runs unit tests on every push and PR (Linux + macOS), then
-integration tests (Linux) once unit passes; there is no branch
-filter. Both run with `go test -race -count=1` so the
-data-race class the v0.3.x review surfaced can't regress unnoticed
-in the supervise / reload / autoscale fan-out.
+CI runs the same Makefile targets: `make lint` + `make vuln` (lint
+job), `make test-race` on Linux and macOS (unit job), then
+`make integration-race` and `make coverage` once unit passes; there is
+no branch filter. `-race` exists because the v0.3.x review surfaced a
+data-race class in the supervise / reload / autoscale fan-out;
+`-shuffle=on` exists so a test that only passes in file order fails
+loudly; `-count=1` keeps a flake from hiding behind a cached pass.
+Coverage is reported (job summary + artifact), not gated: a threshold
+would only invite padding tests.
+
+### Coverage
+
+`make coverage` produces one merged figure: unit test binaries write
+binary coverage data through `-test.gocoverdir`, and the integration
+`TestMain` builds instrumented `zpinit` / `zpctl` binaries when
+`ZPINIT_TEST_COVERDIR` is set, pointing their `GOCOVERDIR` at the same
+directory. `go tool covdata` merges all of it. The per-package `go test
+-cover` lines printed during the unit phase are unit-only and look
+low for `cmd/zpinit` (it is exercised through the real binary); the
+"per package" block at the end is the real number.
 
 ### Writing tests against the fake runner
 
