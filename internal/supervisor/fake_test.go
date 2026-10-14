@@ -3,6 +3,7 @@ package supervisor
 import (
 	"sync"
 	"syscall"
+	"testing"
 	"time"
 
 	"github.com/0ploy/zpinit/internal/reaper"
@@ -93,6 +94,24 @@ func (p *fakeProcess) signalsReceived() []syscall.Signal {
 	out := make([]syscall.Signal, len(p.signals))
 	copy(out, p.signals)
 	return out
+}
+
+// waitSignals blocks until p has received at least n signals (or
+// timeout elapses) and returns the signals seen. Runner state changes
+// are observable BEFORE the matching SignalGroup call lands (handleStop
+// transitions to Stopping, then signals), so a test that has just seen
+// a state and wants the signal must wait for it here rather than read
+// signalsReceived directly.
+func waitSignals(t *testing.T, p *fakeProcess, n int, timeout time.Duration) []syscall.Signal {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		sigs := p.signalsReceived()
+		if len(sigs) >= n || time.Now().After(deadline) {
+			return sigs
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // pushExit simulates the kernel reaping this process.
