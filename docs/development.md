@@ -40,8 +40,9 @@ the Makefile), which uses the module cache and never touches `go.mod`.
 
 CI runs the same Makefile targets: `make lint` + `make vuln` (lint
 job), `make test-race` on Linux and macOS (unit job), then
-`make integration-race` and `make coverage` once unit passes; there is
-no branch filter. `-race` exists because the v0.3.x review surfaced a
+`make integration-race` and `make coverage` once unit passes. It
+triggers on pull requests and on pushes to `main` or a release tag, so
+a branch with an open PR gets one run per push, not two. `-race` exists because the v0.3.x review surfaced a
 data-race class in the supervise / reload / autoscale fan-out;
 `-shuffle=on` exists so a test that only passes in file order fails
 loudly; `-count=1` keeps a flake from hiding behind a cached pass.

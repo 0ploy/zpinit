@@ -1,7 +1,12 @@
 name: ci
 
+# A branch with an open PR used to get two runs per push (push +
+# pull_request events, different concurrency keys). Pushes now trigger
+# only on main and release tags; everything else runs as a PR check.
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
 
 permissions:
