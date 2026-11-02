@@ -1,0 +1,58 @@
+# Dependabot: version updates for the three places this repo pins things.
+#
+# cooldown holds every new release back for 7 days before Dependabot
+# proposes it, so a release that gets yanked or hotfixed within a week
+# never reaches a PR here. Security updates ignore the cooldown by
+# design.
+#
+# Actions are pinned to commit SHAs (see CLAUDE.md); Dependabot bumps
+# the SHA and keeps the "# vX.Y.Z" comment in sync.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Berlin
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  # go.mod: BurntSushi/toml (the only approved dependency) and the go
+  # directive. Anything new in go.mod still needs explicit approval;
+  # Dependabot only bumps what is already there.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Berlin
+    cooldown:
+      default-days: 7
+    groups:
+      go-deps:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  # Devcontainer base image (digest-pinned golang:1.26-bookworm). The
+  # gh release pulled in the same Dockerfile is an ARG, not a FROM, and
+  # is bumped by hand.
+  - package-ecosystem: docker
+    directory: /.devcontainer
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Berlin
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "devcontainer"

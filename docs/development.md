@@ -48,6 +48,12 @@ loudly; `-count=1` keeps a flake from hiding behind a cached pass.
 Coverage is reported (job summary + artifact), not gated: a threshold
 would only invite padding tests.
 
+Dependabot (`.github/dependabot.yml`) opens weekly PRs for the SHA-
+pinned Actions, `go.mod`, and the devcontainer base image digest. Every
+release is held back 7 days (`cooldown`) before it is proposed, so a
+release yanked or hotfixed within a week never lands here; security
+updates skip the cooldown.
+
 ### Coverage
 
 `make coverage` produces one merged figure: unit test binaries write

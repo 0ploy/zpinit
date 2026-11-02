@@ -91,6 +91,10 @@ support, no interactive `zpctl fg`.
   upgrading, dereference the new tag with
   `gh api repos/<owner>/<repo>/git/refs/tags/<tag> --jq '.object.sha'`
   and put the human-readable version in the trailing comment.
+  Dependabot (`.github/dependabot.yml`) opens those bumps itself and
+  keeps the comment in sync; it holds every release back 7 days
+  (`cooldown`) so a yanked or hotfixed release never reaches a PR.
+  Don't shorten the cooldown without asking.
 
 ## CHANGELOG.md
 
