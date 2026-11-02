@@ -88,9 +88,19 @@ func newFixture(t *testing.T, cfg config.Service) *testFixture {
 func (f *testFixture) waitState(want State, timeout time.Duration) {
 	f.t.Helper()
 	// Already there? Most calls land here because Run processes events
-	// synchronously and the observer buffer outlives them.
+	// synchronously and the observer buffer outlives them. Drop the
+	// buffered events that led here: left in place, a stale event
+	// satisfies a later wait for the same state before the runner has
+	// re-entered it (Running -> Backoff -> Running with both earlier
+	// waits short-cutting handed the respawn wait the first Running).
 	if f.runner.State() == want {
-		return
+		for {
+			select {
+			case <-f.states:
+			default:
+				return
+			}
+		}
 	}
 	deadline := time.After(timeout)
 	for {

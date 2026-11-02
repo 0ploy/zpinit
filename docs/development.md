@@ -74,6 +74,13 @@ that has just seen a state and wants the signal must use
 `signalsReceived()` directly after `waitState`; the bare read passed
 by luck and failed under `-count=3`.
 
+`waitState` returns early when the runner is already in the wanted
+state, and drains the observer channel when it does. Observer events
+are buffered and never dropped, so without the drain the event for an
+earlier visit to a state can satisfy a later wait for that same state
+before the runner re-enters it. A test that waits for A, then B, then
+A again (restart after exit) relies on this.
+
 ### Integration test conventions
 
 - One supervisor per test, config in `t.TempDir()`, socket path set

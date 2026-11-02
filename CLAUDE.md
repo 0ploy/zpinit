@@ -155,7 +155,11 @@ change observable behavior, it was never quiet; give it an entry.
 - Runner tests: `handleStop` sets Stopping BEFORE it calls
   `SignalGroup`, so `waitState(StateStopping)` followed by a bare
   `signalsReceived()` is a race that `-count=3` reproduces. Use
-  `waitSignals` from `fake_test.go`. Integration tests: without a
+  `waitSignals` from `fake_test.go`. `waitState` drains the observer
+  channel when it short-cuts on `State() == want`; without the drain a
+  stale event satisfies a later wait for the same state (Running ->
+  Backoff -> Running returned before the respawn, CI-only flake).
+  Keep the drain. Integration tests: without a
   `[ready]` probe a service counts as booted the moment it is spawned,
   so "exits immediately" is EXITED, not a boot failure; RUNNING means
   spawned, not that the child's first command has run, so poll for its
