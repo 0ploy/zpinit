@@ -28,6 +28,19 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(tmp)
 
+	// ZPINIT_TEST_COVERDIR (set by `make coverage`) builds the binaries
+	// under test with coverage instrumentation and points every zpinit
+	// / zpctl these tests spawn at that directory, so the integration
+	// run contributes to the merged coverage figure. The helpers pass
+	// os.Environ() through to children, which carries GOCOVERDIR.
+	var buildExtra []string
+	if dir := os.Getenv("ZPINIT_TEST_COVERDIR"); dir != "" {
+		// atomic matches what -race unit runs emit; covdata refuses to
+		// merge mixed counter modes.
+		buildExtra = []string{"-cover", "-covermode=atomic", "-coverpkg=github.com/0ploy/zpinit/..."}
+		os.Setenv("GOCOVERDIR", dir)
+	}
+
 	for _, target := range []struct {
 		name string
 		bin  *string
@@ -36,7 +49,9 @@ func TestMain(m *testing.M) {
 		{"zpctl", &zpctlBin},
 	} {
 		path := filepath.Join(tmp, target.name)
-		build := exec.Command("go", "build", "-o", path, "../../cmd/"+target.name)
+		args := append([]string{"build"}, buildExtra...)
+		args = append(args, "-o", path, "../../cmd/"+target.name)
+		build := exec.Command("go", args...)
 		build.Stderr = os.Stderr
 		if err := build.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "TestMain: build %s: %v\n", target.name, err)
@@ -246,7 +261,7 @@ func TestEntrypointSkippedViaEnv(t *testing.T) {
 	}
 }
 
-// #18: env propagation — script writes FOO=bar to env file, CMD sees FOO=bar.
+// #18: env propagation: script writes FOO=bar to env file, CMD sees FOO=bar.
 func TestEnvPropagation(t *testing.T) {
 	cfg := t.TempDir()
 	envFile := filepath.Join(t.TempDir(), "env")
@@ -457,6 +472,14 @@ control_socket = "%s"
 
 // #20: supervise mode actually runs services in filename order, stays
 // alive as PID 1's stand-in, and shuts them down cleanly on SIGTERM.
+//
+// Filename order only fixes the SPAWN order. Without a readiness probe
+// the second child is forked right after the first, and which shell
+// reaches its `echo` first is up to the scheduler (observed inverted
+// under a coverage-instrumented binary). The [ready] probe on the
+// first service is what the product contract offers for "second must
+// not start before first is up", so the ordering assertion below
+// rests on that, not on luck.
 func TestSuperviseMode(t *testing.T) {
 	cfg := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "log")
@@ -464,7 +487,12 @@ func TestSuperviseMode(t *testing.T) {
 command = ["/bin/sh", "-c", "echo first >> %s; sleep 30"]
 restart = "always"
 stop_timeout = "3s"
-`, marker))
+
+[ready]
+command = ["/bin/grep", "-q", "first", %q]
+interval = "20ms"
+timeout = "5s"
+`, marker, marker))
 	writeFile(t, filepath.Join(cfg, "services", "20_second.toml"), fmt.Sprintf(`
 command = ["/bin/sh", "-c", "echo second >> %s; sleep 30"]
 restart = "always"
@@ -745,6 +773,6 @@ command = ["/bin/sh", "-c", "echo ran > %s"]
 		t.Errorf("CMD output missing: %q", res.stdout)
 	}
 	if _, err := os.Stat(canary); err == nil {
-		t.Error("service ran in wrap mode — services should be ignored when CMD is provided")
+		t.Error("service ran in wrap mode; services should be ignored when CMD is provided")
 	}
 }

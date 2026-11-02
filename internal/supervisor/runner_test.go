@@ -332,7 +332,7 @@ func TestRunner_StopDuringRunning(t *testing.T) {
 	go f.runner.Stop()
 	f.waitState(StateStopping, time.Second)
 
-	sigs := p.signalsReceived()
+	sigs := waitSignals(t, p, 1, time.Second)
 	if len(sigs) != 1 || sigs[0] != syscall.SIGTERM {
 		t.Errorf("signals = %v; want [SIGTERM]", sigs)
 	}
@@ -358,22 +358,15 @@ func TestRunner_StopEscalatesToKillAfterStopTimeout(t *testing.T) {
 	f.waitState(StateStopping, time.Second)
 
 	// First signal is the configured stop_signal.
-	sigs := p.signalsReceived()
+	sigs := waitSignals(t, p, 1, time.Second)
 	if len(sigs) != 1 || sigs[0] != syscall.SIGTERM {
 		t.Fatalf("after Stop: signals = %v, want [SIGTERM]", sigs)
 	}
 
-	// Process refuses to exit. Cross the stop_timeout — SIGKILL fires.
+	// Process refuses to exit. Cross the stop_timeout; SIGKILL fires.
 	f.clock.Advance(10 * time.Second)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(p.signalsReceived()) >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	sigs = p.signalsReceived()
+	sigs = waitSignals(t, p, 2, 2*time.Second)
 	if len(sigs) != 2 || sigs[1] != syscall.SIGKILL {
 		t.Errorf("after stop_timeout: signals = %v, want [SIGTERM, SIGKILL]", sigs)
 	}
