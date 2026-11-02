@@ -144,7 +144,9 @@ change observable behavior, it was never quiet; give it an entry.
 
 - `ZPINIT_ENV_FILE` is an internal/test override for the env-file path.
   Production always reads `/run/zpinit/env`. Don't expose it in
-  `--help` or document it publicly.
+  `--help` or document it publicly. `ZPINIT_TEST_COVERDIR` is the
+  same kind of thing for the integration harness (`make coverage`);
+  it lives only in `test/integration` and `docs/development.md`.
 
 - Runner tests: `handleStop` sets Stopping BEFORE it calls
   `SignalGroup`, so `waitState(StateStopping)` followed by a bare
