@@ -4,7 +4,7 @@ name: ci
 # pull_request events, different concurrency keys). Pushes now trigger
 # only on main and release tags; everything else runs as a PR check.
 #
-# The weekly schedule exists for govulncheck (make vuln in the lint
+# The daily schedule exists for govulncheck (make vuln in the lint
 # job): a CVE published between pushes would otherwise go unnoticed
 # until someone pushes. It runs the whole workflow on main, which also
 # catches runner-image drift. GitHub suspends the schedule after 60
@@ -15,7 +15,7 @@ on:
     tags: ['v*']
   pull_request:
   schedule:
-    - cron: '0 5 * * 1' # Mondays, 06:00 Berlin (winter)
+    - cron: '0 5 * * *' # daily, 06:00 Berlin (winter)
 
 permissions:
   contents: read

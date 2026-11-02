@@ -42,7 +42,7 @@ CI runs the same Makefile targets: `make lint` + `make vuln` (lint
 job), `make test-race` on Linux and macOS (unit job), then
 `make integration-race` and `make coverage` once unit passes. It
 triggers on pull requests and on pushes to `main` or a release tag, so
-a branch with an open PR gets one run per push, not two, plus a weekly
+a branch with an open PR gets one run per push, not two, plus a daily
 scheduled run on `main` so `govulncheck` sees a CVE published between
 pushes (GitHub suspends the schedule after 60 days without a commit).
 `-race` exists because the v0.3.x review surfaced a
