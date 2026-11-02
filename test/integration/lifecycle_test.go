@@ -20,6 +20,24 @@ import (
 
 // waitForStateRow polls `zpctl status` until the named row shows the
 // wanted supervisord-style state. Returns the last status output.
+// waitForFile polls until path exists (or timeout) and returns its
+// FileInfo. A service is RUNNING the moment it is spawned, so a test
+// that waits for RUNNING and then looks for the child's side effect
+// must poll for the side effect too.
+func waitForFile(path string, timeout time.Duration) (os.FileInfo, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		fi, err := os.Stat(path)
+		if err == nil {
+			return fi, true
+		}
+		if time.Now().After(deadline) {
+			return nil, false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func waitForStateRow(zpctl func(args ...string) (string, int), name, want string, timeout time.Duration) (string, bool) {
 	deadline := time.Now().Add(timeout)
 	var out string
@@ -178,9 +196,11 @@ stop_timeout = "1s"
 	if err != nil {
 		t.Fatalf("gate file missing: %v", err)
 	}
-	mi, err := os.Stat(marker)
-	if err != nil {
-		t.Fatalf("marker file missing: %v", err)
+	// RUNNING means spawned, not that the child's first command has
+	// executed yet; the touch can still be pending (seen on CI).
+	mi, ok := waitForFile(marker, 3*time.Second)
+	if !ok {
+		t.Fatalf("marker file missing after second service reached RUNNING")
 	}
 	if mi.ModTime().Before(gi.ModTime()) {
 		t.Errorf("second service started (%v) before the first became ready (%v)", mi.ModTime(), gi.ModTime())

@@ -157,7 +157,9 @@ change observable behavior, it was never quiet; give it an entry.
   `signalsReceived()` is a race that `-count=3` reproduces. Use
   `waitSignals` from `fake_test.go`. Integration tests: without a
   `[ready]` probe a service counts as booted the moment it is spawned,
-  so "exits immediately" is EXITED, not a boot failure; and filename
+  so "exits immediately" is EXITED, not a boot failure; RUNNING means
+  spawned, not that the child's first command has run, so poll for its
+  side effect (`waitForFile`) instead of a single `Stat`; and filename
   order fixes spawn order only, so an ordering assertion needs a
   probe on the earlier service.
 

@@ -87,6 +87,10 @@ by luck and failed under `-count=3`.
   spawned, so an immediate exit is a normal EXITED, not a boot
   failure. Boot-failure tests give the service a probe that never
   passes and let the child die while it is polling.
+- RUNNING likewise means spawned, not that the child's first command
+  has executed. A test that waits for RUNNING and then checks a file
+  the child writes polls for it (`waitForFile`); a single `os.Stat`
+  right after `waitForRunning` is a race CI reproduces.
 - A zpinit that a test must observe exiting goes through `watchExit`;
   a bare `exited <- zp.Wait()` channel read twice (test body, then
   cleanup) hangs the suite until the `go test` timeout.
