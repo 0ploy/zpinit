@@ -22,20 +22,78 @@ tests.
 ## Test
 
 ```sh
-make test        # unit tests (Linux + macOS)
-make integration # full-binary integration tests (Linux only)
-make lint        # gofmt + go vet
+make test             # fast dev loop: unit tests, cached (Linux + macOS)
+make test-race        # unit tests as CI runs them: -race -shuffle=on -count=1
+make integration      # full-binary integration tests (Linux only)
+make integration-race # the CI variant of the above
+make coverage         # merged unit + integration coverage -> cover/coverage.html
+make lint             # gofmt -s, go vet (incl. integration tag), staticcheck
+make vuln             # govulncheck against the module
+make check            # everything CI gates on: lint vuln test-race integration-race
 ```
 
 Tests use the standard library only. No testify, gomock, or similar.
 The only approved external dependency is `github.com/BurntSushi/toml`;
-anything else needs explicit approval before `go get`.
+anything else needs explicit approval before `go get`. `staticcheck`
+and `govulncheck` run through `go run pkg@version` (versions pinned in
+the Makefile), which uses the module cache and never touches `go.mod`.
 
-CI runs unit tests on every push and PR (Linux + macOS), then
-integration tests (Linux) once unit passes; there is no branch
-filter. Both run with `go test -race -count=1` so the
-data-race class the v0.3.x review surfaced can't regress unnoticed
-in the supervise / reload / autoscale fan-out.
+CI runs the same Makefile targets: `make lint` + `make vuln` (lint
+job), `make test-race` on Linux and macOS (unit job), then
+`make integration-race` and `make coverage` once unit passes; there is
+no branch filter. `-race` exists because the v0.3.x review surfaced a
+data-race class in the supervise / reload / autoscale fan-out;
+`-shuffle=on` exists so a test that only passes in file order fails
+loudly; `-count=1` keeps a flake from hiding behind a cached pass.
+Coverage is reported (job summary + artifact), not gated: a threshold
+would only invite padding tests.
+
+Dependabot (`.github/dependabot.yml`) opens weekly PRs for the SHA-
+pinned Actions, `go.mod`, and the devcontainer base image digest. Every
+release is held back 7 days (`cooldown`) before it is proposed, so a
+release yanked or hotfixed within a week never lands here; security
+updates skip the cooldown.
+
+### Coverage
+
+`make coverage` produces one merged figure: unit test binaries write
+binary coverage data through `-test.gocoverdir`, and the integration
+`TestMain` builds instrumented `zpinit` / `zpctl` binaries when
+`ZPINIT_TEST_COVERDIR` is set, pointing their `GOCOVERDIR` at the same
+directory. `go tool covdata` merges all of it. The per-package `go test
+-cover` lines printed during the unit phase are unit-only and look
+low for `cmd/zpinit` (it is exercised through the real binary); the
+"per package" block at the end is the real number.
+
+### Writing tests against the fake runner
+
+Runner state changes are observable before the matching signal lands:
+`handleStop` transitions to Stopping, then calls `SignalGroup`. A test
+that has just seen a state and wants the signal must use
+`waitSignals(t, p, n, timeout)` from `fake_test.go`, never read
+`signalsReceived()` directly after `waitState`; the bare read passed
+by luck and failed under `-count=3`.
+
+### Integration test conventions
+
+- One supervisor per test, config in `t.TempDir()`, socket path set
+  through `control_socket` in `zpinit.toml`. `startZpinit` /
+  `zpctlRunner` / `waitForRunning` / `waitForStateRow` in
+  `reload_test.go` and `lifecycle_test.go` are the shared helpers.
+- Assert what the product contract promises, not what the scheduler
+  usually does. Filename order fixes spawn order only; a test that
+  needs "B runs after A is up" gives A a `[ready]` probe.
+- Without a `[ready]` probe a service is booted the moment it is
+  spawned, so an immediate exit is a normal EXITED, not a boot
+  failure. Boot-failure tests give the service a probe that never
+  passes and let the child die while it is polling.
+- RUNNING likewise means spawned, not that the child's first command
+  has executed. A test that waits for RUNNING and then checks a file
+  the child writes polls for it (`waitForFile`); a single `os.Stat`
+  right after `waitForRunning` is a race CI reproduces.
+- A zpinit that a test must observe exiting goes through `watchExit`;
+  a bare `exited <- zp.Wait()` channel read twice (test body, then
+  cleanup) hangs the suite until the `go test` timeout.
 
 ## Linux-only paths
 
@@ -61,6 +119,17 @@ tree into a Go image instead:
 ```sh
 docker run --rm -v "$PWD":/src -w /src golang:1.26 go test -race ./...
 ```
+
+## Dev container
+
+`.devcontainer/` holds a Compose-based dev container (Go 1.26 on Debian,
+`gh`, Claude Code). Its main value is that it IS Linux: `make integration`
+and the `//go:build linux` tests run there directly, with `-race`, the
+same way CI runs them. It has no docker daemon, so
+`TestPID1InContainer` (the only test that runs zpinit as a real PID 1,
+covering orphan reaping and the container exit code) skips there and
+runs on the ubuntu CI runner. Setup (GitHub token, git identity, caches, what
+needs a rebuild) is in `.devcontainer/README.md`.
 
 ## Project notes for agents
 

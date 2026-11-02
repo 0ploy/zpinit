@@ -91,6 +91,10 @@ support, no interactive `zpctl fg`.
   upgrading, dereference the new tag with
   `gh api repos/<owner>/<repo>/git/refs/tags/<tag> --jq '.object.sha'`
   and put the human-readable version in the trailing comment.
+  Dependabot (`.github/dependabot.yml`) opens those bumps itself and
+  keeps the comment in sync; it holds every release back 7 days
+  (`cooldown`) so a yanked or hotfixed release never reaches a PR.
+  Don't shorten the cooldown without asking.
 
 ## CHANGELOG.md
 
@@ -112,7 +116,7 @@ commit", no phase numbers.
 **Not every change earns an entry.** The changelog is the operator's
 release note, not a commit log: it answers "what changed for me?" Be
 selective. When unsure, ask "would an operator running zpinit in
-production want to know this before upgrading?" — if not, it's quiet
+production want to know this before upgrading?" If not, it's quiet
 cleanup and belongs in `git log` only.
 
 - *Worth an entry:* new or changed config keys / CLI flags / zpctl
@@ -127,7 +131,7 @@ cleanup and belongs in `git log` only.
 
 A batch of quiet cleanups does not accumulate into an entry; several
 invisible refactors are still invisible. If a "cleanup" turns out to
-change observable behavior, it was never quiet — give it an entry.
+change observable behavior, it was never quiet; give it an entry.
 
 **Cutting a release** (when asked):
 
@@ -144,7 +148,20 @@ change observable behavior, it was never quiet — give it an entry.
 
 - `ZPINIT_ENV_FILE` is an internal/test override for the env-file path.
   Production always reads `/run/zpinit/env`. Don't expose it in
-  `--help` or document it publicly.
+  `--help` or document it publicly. `ZPINIT_TEST_COVERDIR` is the
+  same kind of thing for the integration harness (`make coverage`);
+  it lives only in `test/integration` and `docs/development.md`.
+
+- Runner tests: `handleStop` sets Stopping BEFORE it calls
+  `SignalGroup`, so `waitState(StateStopping)` followed by a bare
+  `signalsReceived()` is a race that `-count=3` reproduces. Use
+  `waitSignals` from `fake_test.go`. Integration tests: without a
+  `[ready]` probe a service counts as booted the moment it is spawned,
+  so "exits immediately" is EXITED, not a boot failure; RUNNING means
+  spawned, not that the child's first command has run, so poll for its
+  side effect (`waitForFile`) instead of a single `Stat`; and filename
+  order fixes spawn order only, so an ordering assertion needs a
+  probe on the earlier service.
 
 - Initial boot is fatal on failure unless the service opts out with
   `on_boot_failure = "continue"` (per-service, default `"fail"`). Only
@@ -387,7 +404,7 @@ change observable behavior, it was never quiet — give it an entry.
   host's `/sys/fs/cgroup` bind-mounted in, or under some k8s/LXC
   layouts, and reading it there reports the whole machine's budget.
   `ZPINIT_CGROUP_ROOT` short-circuits resolution and keeps the legacy
-  shape (root is the unified dir, v1 controllers are subdirectories) —
+  shape (root is the unified dir, v1 controllers are subdirectories);
   every existing fixture depends on that. `Snapshot.CgroupResolved`
   false means "unverified", never "no limit": don't let a caller treat
   it as unlimited. Deliberately not cached, so a per-test
@@ -398,7 +415,7 @@ change observable behavior, it was never quiet — give it an entry.
   BACKSTOP for what inotify cannot see (a kernel-derived limit change
   such as a parent cpuset propagating into `cpuset.cpus.effective`, and
   sandbox runtimes that accept the watch but never deliver). Rules that
-  are load-bearing: watch ONLY `IN_MODIFY` — `IN_ACCESS`/`IN_OPEN` fire
+  are load-bearing: watch ONLY `IN_MODIFY`; `IN_ACCESS`/`IN_OPEN` fire
   on the `Detect` that a wake triggers, so the loop would drive itself;
   treat a wake as "re-Detect" and never as a per-dimension signal (the
   runtime writes `cpu.max` and `memory.max` non-atomically, so an event

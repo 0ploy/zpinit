@@ -1,0 +1,10 @@
+{
+  "name": "zpinit",
+  "dockerComposeFile": ["docker-compose.yml"],
+  "service": "zpinit",
+  "workspaceFolder": "/workspaces/zpinit",
+  "postCreateCommand": "zpinit-bootstrap",
+  "postStartCommand": "zpinit-bootstrap",
+  "shutdownAction": "stopCompose",
+  "remoteUser": "dev"
+}

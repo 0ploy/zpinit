@@ -9,3 +9,8 @@
 .DS_Store
 PLAN*.md
 CODE_REVIEW*.md
+# Dev container secrets (GitHub token); .env.example is the template.
+.devcontainer/.env
+
+# make coverage output
+cover/

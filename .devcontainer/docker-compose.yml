@@ -1,0 +1,48 @@
+# Dev container for zpinit (Go). Setup and rationale: README.md. Backing
+# services would go under `services:`; zpinit needs none.
+#
+# Per-developer values (GH_TOKEN, GIT_EMAIL) come from .devcontainer/.env, which
+# Compose loads automatically. See .env.example.
+services:
+  zpinit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    command: sleep infinity
+    container_name: zpinit
+    hostname: zpinit
+    environment:
+      # Claude Code keeps credentials, settings and .claude.json in this
+      # directory, which is a named volume so the login survives rebuilds.
+      CLAUDE_CONFIG_DIR: /home/dev/.claude
+      # GitHub: one token for gh and for git (via the credential helper below).
+      GH_TOKEN: ${GH_TOKEN:-}
+      # Git: user.name from the mounted ~/.gitconfig, everything else here.
+      # Every git@github.com: remote is rewritten to HTTPS so the token works
+      # while the host keeps SSH. Commits are not signed in the container.
+      GIT_CONFIG_COUNT: "4"
+      GIT_CONFIG_KEY_0: user.email
+      GIT_CONFIG_VALUE_0: ${GIT_EMAIL:-}
+      GIT_CONFIG_KEY_1: commit.gpgsign
+      GIT_CONFIG_VALUE_1: "false"
+      GIT_CONFIG_KEY_2: url.https://github.com/.insteadOf
+      GIT_CONFIG_VALUE_2: "git@github.com:"
+      GIT_CONFIG_KEY_3: credential.https://github.com.helper
+      GIT_CONFIG_VALUE_3: "!gh auth git-credential"
+    volumes:
+      # Host checkout, edits land on the host directly.
+      - ..:/workspaces/zpinit
+      # Go module and build caches on named volumes: fast, and the Linux
+      # artifacts never touch virtiofs.
+      - zpinit-gomod:/home/dev/go/pkg/mod
+      - zpinit-gocache:/home/dev/.cache/go-build
+      # Claude Code store, separate from the host's ~/.claude.
+      - zpinit-claude:/home/dev/.claude
+      # Host git identity (user.name). Git auth is GH_TOKEN, no SSH keys.
+      - ${HOME}/.gitconfig:/home/dev/.gitconfig:ro
+
+volumes:
+  zpinit-gomod:
+  zpinit-gocache:
+  zpinit-claude:
