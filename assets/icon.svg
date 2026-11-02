@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="zpinit">
+  <rect width="512" height="512" rx="140" fill="#0e0e0e"/>
+  <g fill="#ff52a6">
+    <polygon points="318.8,96.0 396.8,96.0 296.0,376.0 218.0,376.0"/>
+    <polygon points="318.8,96.0 215.2,171.2 215.2,237.2 318.8,162.0"/>
+    <polygon points="101.4,400.0 349.4,400.0 346.5,408.0 98.5,408.0"/>
+    <polygon points="96.6,413.3 344.6,413.3 341.7,421.3 93.7,421.3"/>
+    <polygon points="91.8,426.7 339.8,426.7 336.9,434.7 88.9,434.7"/>
+    <polygon points="87.0,440.0 335.0,440.0 332.1,448.0 84.1,448.0"/>
+  </g>
+</svg>
