@@ -19,6 +19,7 @@ import (
 
 	"github.com/0ploy/zpinit/execproto"
 	"github.com/0ploy/zpinit/internal/reaper"
+	"github.com/0ploy/zpinit/internal/service"
 )
 
 // harness runs a Server over a unix socketpair with a polling reaper,
@@ -249,20 +250,33 @@ func TestExecErrors(t *testing.T) {
 }
 
 func TestComposeEnv(t *testing.T) {
+	root := &service.Identity{Name: "root", Home: "/root"}
 	base := []string{"PATH=/bin", "HOME=/home/app", "A=1"}
-	got := composeEnv(base, &execproto.Request{TTY: true, Env: []string{"A=2", "B=3"}}, false, "/root")
-	want := "PATH=/bin HOME=/home/app A=2 TERM=xterm B=3"
+	got := composeEnv(base, &execproto.Request{TTY: true, Env: []string{"A=2", "B=3"}}, false, root)
+	want := "PATH=/bin HOME=/home/app A=2 USER=root LOGNAME=root TERM=xterm B=3"
 	if strings.Join(got, " ") != want {
 		t.Errorf("default user: %v, want %s", got, want)
 	}
-	// Another user gets its own HOME unless the request sets one.
-	got = composeEnv(base, &execproto.Request{}, true, "/root")
-	if strings.Join(got, " ") != "PATH=/bin HOME=/root A=1" {
+	// Another user gets its own HOME, USER and LOGNAME unless the request
+	// sets them.
+	base = []string{"PATH=/bin", "HOME=/home/app", "USER=app", "A=1"}
+	got = composeEnv(base, &execproto.Request{}, true, root)
+	if strings.Join(got, " ") != "PATH=/bin HOME=/root USER=root A=1 LOGNAME=root" {
 		t.Errorf("other user: %v", got)
 	}
-	got = composeEnv(base, &execproto.Request{Env: []string{"HOME=/tmp"}}, true, "/root")
-	if strings.Join(got, " ") != "PATH=/bin HOME=/tmp A=1" {
-		t.Errorf("request HOME: %v", got)
+	got = composeEnv(base, &execproto.Request{Env: []string{"HOME=/tmp", "USER=x"}}, true, root)
+	if strings.Join(got, " ") != "PATH=/bin HOME=/tmp USER=x A=1 LOGNAME=root" {
+		t.Errorf("request HOME and USER: %v", got)
+	}
+	// The default user keeps the env's USER.
+	got = composeEnv(base, &execproto.Request{}, false, root)
+	if strings.Join(got, " ") != "PATH=/bin HOME=/home/app USER=app A=1 LOGNAME=root" {
+		t.Errorf("default user, env USER: %v", got)
+	}
+	// A uid with no passwd entry: no USER or LOGNAME, HOME is /.
+	got = composeEnv([]string{"PATH=/bin"}, &execproto.Request{}, true, &service.Identity{})
+	if strings.Join(got, " ") != "PATH=/bin HOME=/" {
+		t.Errorf("no passwd entry: %v", got)
 	}
 }
 

@@ -371,9 +371,12 @@ Semantics:
   runtimes.
 - **Env:** `exec.env`, then the request's `env` on top (`docker exec`
   semantics). Nothing else: not `[env]` from `zpinit.toml`, not what
-  entrypoint.d added. `HOME` follows the exec user when the request
-  picked a user other than the default, and is set to the user's home
-  (else `/`) when absent; `TERM=xterm` is defaulted for a tty; `PATH`
+  entrypoint.d added. `HOME`, `USER` and `LOGNAME` follow the exec
+  user when the request picked a user other than the default, and are
+  set when absent: `HOME` to the user's home (else `/`), `USER` and
+  `LOGNAME` to the passwd name, as `login` and `sshd` do (`docker exec`
+  sets neither; a uid with no passwd entry gets neither);
+  `TERM=xterm` is defaulted for a tty; `PATH`
   defaults to `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`.
   `argv[0]` is resolved against that `PATH`.
 - **Working directory:** the request's, else `exec.working_dir`, else

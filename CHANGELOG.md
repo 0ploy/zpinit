@@ -12,10 +12,11 @@
   `zpinit: reset ...` line on the console tells the host why (with
   `oom=1` when the kernel's OOM killer ended the workload), a failed
   bringup parks the machine in a rescue mode, and an optional host-only
-  exec listener on vsock replaces `docker exec`. Inside the machine,
-  busybox `reboot`, `halt` and `poweroff` are graceful stops, like
-  `zpctl shutdown`. There is no flag; none of it can switch on in a
-  container. See `docs/machine-mode.md`.
+  exec listener on vsock replaces `docker exec` (sessions get `HOME`,
+  `USER` and `LOGNAME` for the exec user, as a login shell expects).
+  Inside the machine, busybox `reboot`, `halt` and `poweroff` are
+  graceful stops, like `zpctl shutdown`. There is no flag; none of it
+  can switch on in a container. See `docs/machine-mode.md`.
   The exec wire protocol is a public Go package,
   `github.com/0ploy/zpinit/execproto`, for host-side clients.
 

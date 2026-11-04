@@ -11,8 +11,9 @@ import (
 // runs with, plus what its env needs.
 type Identity struct {
 	Cred *syscall.Credential
-	// Home is the user's home directory from the passwd database, or ""
+	// Name and Home are the user's passwd name and home directory, or ""
 	// when the user is a bare numeric id with no entry.
+	Name string
 	Home string
 }
 
@@ -32,6 +33,7 @@ func ResolveIdentity(spec string) (*Identity, error) {
 	}
 	var (
 		uid, gid uint32
+		name     string
 		home     string
 		groups   []uint32
 	)
@@ -46,7 +48,7 @@ func ResolveIdentity(spec string) (*Identity, error) {
 		if err != nil {
 			return nil, fmt.Errorf("user %q: %w", userPart, err)
 		}
-		home = u.HomeDir
+		name, home = u.Username, u.HomeDir
 		if ids, gerr := u.GroupIds(); gerr == nil {
 			for _, s := range ids {
 				if g, perr := parseID(s); perr == nil && g != gid {
@@ -87,6 +89,7 @@ func ResolveIdentity(spec string) (*Identity, error) {
 	}
 	return &Identity{
 		Cred: &syscall.Credential{Uid: uid, Gid: gid, Groups: groups},
+		Name: name,
 		Home: home,
 	}, nil
 }

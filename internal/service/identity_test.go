@@ -26,7 +26,7 @@ func TestResolveIdentityNumericWithoutPasswd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id.Cred.Uid != 4242424 || id.Cred.Gid != 0 || id.Home != "" {
+	if id.Cred.Uid != 4242424 || id.Cred.Gid != 0 || id.Home != "" || id.Name != "" {
 		t.Errorf("got %+v home=%q", id.Cred, id.Home)
 	}
 	id, err = ResolveIdentity("4242424:777")
@@ -47,7 +47,7 @@ func TestResolveIdentityByName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strconv.Itoa(int(id.Cred.Uid)) != u.Uid || strconv.Itoa(int(id.Cred.Gid)) != u.Gid || id.Home != u.HomeDir {
+	if strconv.Itoa(int(id.Cred.Uid)) != u.Uid || strconv.Itoa(int(id.Cred.Gid)) != u.Gid || id.Home != u.HomeDir || id.Name != u.Username {
 		t.Errorf("got %+v home=%q, want uid=%s gid=%s home=%s", id.Cred, id.Home, u.Uid, u.Gid, u.HomeDir)
 	}
 	if _, err := ResolveIdentity("no-such-user-zpinit"); err == nil {

@@ -201,7 +201,7 @@ func (s *Server) start(req *execproto.Request) (*session, error) {
 	if dir == "" {
 		dir = "/"
 	}
-	env := composeEnv(s.cfg.Env, req, userSpec != s.cfg.User, id.Home)
+	env := composeEnv(s.cfg.Env, req, userSpec != s.cfg.User, id)
 
 	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
 	cmd.Dir = dir
@@ -291,9 +291,13 @@ func (s *Server) start(req *execproto.Request) (*session, error) {
 }
 
 // composeEnv layers the request env over the image env (docker exec
-// semantics). HOME follows the exec user when the request picked a user
-// other than the default; TERM is defaulted for a tty.
-func composeEnv(base []string, req *execproto.Request, otherUser bool, home string) []string {
+// semantics). HOME, USER and LOGNAME follow the exec user when the request
+// picked a user other than the default, and are filled in when absent, as
+// login and sshd set them (docker exec sets no USER, but an interactive
+// shell expects one); a uid with no passwd entry gets no USER or LOGNAME.
+// TERM is defaulted for a tty.
+func composeEnv(base []string, req *execproto.Request, otherUser bool, id *service.Identity) []string {
+	home := id.Home
 	m := map[string]string{}
 	var order []string
 	set := func(kv string) {
@@ -315,6 +319,13 @@ func composeEnv(base []string, req *execproto.Request, otherUser bool, home stri
 			h = "/"
 		}
 		set("HOME=" + h)
+	}
+	if id.Name != "" {
+		for _, k := range []string{"USER", "LOGNAME"} {
+			if _, ok := m[k]; otherUser || !ok {
+				set(k + "=" + id.Name)
+			}
+		}
 	}
 	if _, ok := m["PATH"]; !ok {
 		set("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
