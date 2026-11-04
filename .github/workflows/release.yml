@@ -26,6 +26,18 @@ jobs:
           # release binaries embed the standard library and its fixes.
           check-latest: true
 
+      # First, so a tag without notes fails before the image is pushed.
+      # The match is the exact tag: `## v0.1.1` must not pick up
+      # `## v0.1.10`, and a forgotten `## Unreleased` rename must not
+      # publish the wrong section.
+      - name: Extract release notes
+        run: |
+          awk -v h="## ${GITHUB_REF_NAME}" '$0==h || index($0, h" ")==1 {found=1; next} /^## /{if(found) exit} found' CHANGELOG.md > release-notes.md
+          if [ -z "$(tr -d '[:space:]' < release-notes.md)" ]; then
+            echo "::error::CHANGELOG.md has no '## ${GITHUB_REF_NAME}' section"
+            exit 1
+          fi
+
       - name: Run tests
         run: go test -race -count=1 ./...
 
@@ -39,6 +51,19 @@ jobs:
               go build -trimpath -ldflags "${LDFLAGS}" -o zpinit-linux-${ARCH} ./cmd/zpinit
             CGO_ENABLED=0 GOOS=linux GOARCH=${ARCH} \
               go build -trimpath -ldflags "${LDFLAGS}" -o zpctl-linux-${ARCH} ./cmd/zpctl
+          done
+
+      # CI checks this for `make build`; this checks the binaries that ship.
+      # A -X path that matches no variable is silently ignored by the linker.
+      - name: Verify versions
+        run: |
+          for BIN in zpinit-linux-amd64 zpctl-linux-amd64; do
+            VER=$(./${BIN} -version)
+            echo "${BIN} reports: ${VER}"
+            if [ "${VER}" != "${GITHUB_REF_NAME}" ]; then
+              echo "::error::${BIN} reports '${VER}', want ${GITHUB_REF_NAME}; check the -X main.version path"
+              exit 1
+            fi
           done
 
       - name: Generate checksums
@@ -111,13 +136,11 @@ jobs:
 
           sed -i "s/IMAGE_TAG_PLACEHOLDER/${IMAGE_TAG}/g" release-body.md
 
-          # Append the latest CHANGELOG section (skips the version heading
-          # itself; that already appears as the GitHub release title).
-          if [ -f CHANGELOG.md ]; then
-            echo "---" >> release-body.md
-            echo "" >> release-body.md
-            awk '/^## /{if(found) exit; found=1; next} found{print}' CHANGELOG.md >> release-body.md
-          fi
+          # Append this tag's CHANGELOG section, extracted and checked in
+          # the first step (without its heading: that is the release title).
+          echo "---" >> release-body.md
+          echo "" >> release-body.md
+          cat release-notes.md >> release-body.md
 
       - name: Create release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3

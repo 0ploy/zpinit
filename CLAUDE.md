@@ -114,7 +114,9 @@ support, no interactive `zpctl fg`.
 - GitHub Actions in both workflows are pinned to commit SHAs, never
   floating tags (the release pipeline has GHCR push rights). When
   upgrading, dereference the new tag with
-  `gh api repos/<owner>/<repo>/git/refs/tags/<tag> --jq '.object.sha'`
+  `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha` (not
+  `git/refs/tags/<tag>`: for an annotated tag that returns the tag
+  object, not the commit)
   and put the human-readable version in the trailing comment.
   Dependabot (`.github/dependabot.yml`) opens those bumps itself and
   keeps the comment in sync; it holds every release back 7 days
@@ -123,14 +125,17 @@ support, no interactive `zpctl fg`.
 
 ## CHANGELOG.md
 
-The release workflow's awk script extracts the latest `## vX.Y.Z`
-section verbatim into the GitHub release body (everything between the
-first `## ` heading, skipped, and the second `## `, end). So:
+The release workflow extracts the section whose heading is exactly the
+tag (`## vX.Y.Z`, or `## vX.Y.Z ` followed by anything) verbatim into
+the GitHub release body, up to the next `## `. A tag without such a
+section fails the release in its first step, before the image is
+pushed. So:
 
 - New version sections go at the very top.
-- Nothing above the top `## ` heading leaks into the release body.
+- Nothing outside the tag's section leaks into the release body.
 - The `## Unreleased` heading is the accumulation target between
-  releases.
+  releases; forgetting to rename it fails the release rather than
+  publishing it.
 
 Entries lead with a **bold headline** stating what changed (or broke,
 for fixes) followed by 2-4 lines on *what it does now* and *why the
@@ -168,6 +173,16 @@ change observable behavior, it was never quiet; give it an entry.
 3. Commit `release: vX.Y.Z`.
 4. `git tag vX.Y.Z && git push origin main vX.Y.Z`. Tag push triggers
    the public release; never do this without an explicit go-ahead.
+
+What the tag runs (`.github/workflows/release.yml`), in order: extract
+the release notes (fails on a missing section); `go test -race`; build
+zpinit and zpctl for linux amd64 and arm64; check the amd64 binaries
+report the tag (an `-X main.version` path that matches no variable is
+silently ignored by the linker); `checksums.txt`; push
+`ghcr.io/0ploy/zpinit` as `X.Y.Z`, `X.Y` and `latest`; publish the
+GitHub release. A failure after the image push leaves the image tags
+published without a release: fix forward with a new patch tag rather
+than moving a tag that is already pulled.
 
 ## Gotchas
 
