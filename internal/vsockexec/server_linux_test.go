@@ -4,6 +4,7 @@ package vsockexec
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -270,5 +272,207 @@ func TestAcceptOnlyHost(t *testing.T) {
 		if got := s.accept(cid); got != want {
 			t.Errorf("accept(%d) = %v, want %v", cid, got, want)
 		}
+	}
+}
+
+// readStarted reads frames up to the started frame and returns its pid.
+func (h *harness) readStarted() int {
+	h.t.Helper()
+	_ = h.client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for {
+		ft, p, err := execproto.ReadFrame(h.client)
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		if ft == execproto.FrameStarted {
+			var st execproto.Started
+			_ = json.Unmarshal(p, &st)
+			_ = h.client.SetReadDeadline(time.Time{})
+			return st.PID
+		}
+	}
+}
+
+// floodStdin writes stdin frames until the connection fails.
+func (h *harness) floodStdin() {
+	go func() {
+		chunk := bytes.Repeat([]byte("x"), 32*1024)
+		for execproto.WriteFrame(h.client, execproto.FrameStdin, chunk) == nil {
+		}
+	}()
+}
+
+func waitGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+		if err != nil {
+			return
+		}
+		if st, _, ok := statSession(b); ok && st == 'Z' {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d survived", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// An exec that never reads stdin fills the stdin queue and stalls the
+// frame reader. A connection dropped then must still be noticed and
+// the exec killed.
+func TestExecDropWhileStdinStalled(t *testing.T) {
+	h := newHarness(t, Config{Env: []string{"PATH=/usr/bin:/bin"}})
+	h.send(&execproto.Request{V: 1, Argv: []string{"sleep", "60"}})
+	pid := h.readStarted()
+	h.floodStdin()
+	// Long enough for the pipe and the queue to fill.
+	time.Sleep(500 * time.Millisecond)
+	h.client.Close()
+	select {
+	case <-h.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("session did not end after the connection dropped with stdin stalled")
+	}
+	waitGone(t, pid)
+}
+
+// An escaped process holding the stdin pipe keeps the stdin writer
+// blocked; the session must still end when the exec exits.
+func TestExecExitWhileStdinStalled(t *testing.T) {
+	h := newHarness(t, Config{Env: []string{"PATH=/usr/bin:/bin"}})
+	h.send(&execproto.Request{V: 1, Argv: []string{"sh", "-c", `exec 3<&0; setsid sleep 60 <&3 3<&- >/dev/null 2>&1 & echo $!; sleep 1; exit 0`}})
+	h.readStarted()
+	var esc int
+	_ = h.client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for esc == 0 {
+		ft, p, err := execproto.ReadFrame(h.client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ft == execproto.FrameStdout {
+			esc, _ = strconv.Atoi(strings.TrimSpace(string(p)))
+		}
+	}
+	t.Cleanup(func() { _ = syscall.Kill(esc, syscall.SIGKILL) })
+	h.floodStdin()
+	select {
+	case <-h.done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("session did not end after the exec exited with stdin stalled")
+	}
+}
+
+// A tty shell with job control puts each job in its own process group.
+// The connection-drop kill must reach them too: it takes the session.
+func TestExecConnectionDropKillsSession(t *testing.T) {
+	if _, err := os.Stat("/dev/ptmx"); err != nil {
+		t.Skip("no /dev/ptmx")
+	}
+	h := newHarness(t, Config{Env: []string{"PATH=/usr/bin:/bin"}})
+	h.send(&execproto.Request{V: 1, Argv: []string{"sh", "-c", `set -m; sleep 60 & echo "bg=$!"; wait`}, TTY: true})
+	leader := h.readStarted()
+	var bg int
+	var out strings.Builder
+	_ = h.client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for bg == 0 {
+		ft, p, err := execproto.ReadFrame(h.client)
+		if err != nil {
+			t.Fatalf("%v (output %q)", err, out.String())
+		}
+		if ft == execproto.FrameStdout {
+			out.Write(p)
+			if _, v, ok := strings.Cut(out.String(), "bg="); ok {
+				if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && strings.ContainsAny(v, "\r\n") {
+					bg = n
+				}
+			}
+		}
+	}
+	t.Cleanup(func() { _ = syscall.Kill(bg, syscall.SIGKILL) })
+	// The scenario only exists if the job really left the group.
+	if pgid, err := syscall.Getpgid(bg); err != nil || pgid == leader {
+		t.Skipf("the shell did not move the job to its own group (pgid %d, err %v)", pgid, err)
+	}
+	h.client.Close()
+	select {
+	case <-h.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("session did not end after the connection dropped")
+	}
+	waitGone(t, leader)
+	waitGone(t, bg)
+}
+
+func TestStatSession(t *testing.T) {
+	st, sid, ok := statSession([]byte("4242 (a) b (c) S 1 4242 4300 0 -1 4194560\n"))
+	if !ok || st != 'S' || sid != 4300 {
+		t.Errorf("statSession = %c %d %v", st, sid, ok)
+	}
+	if _, _, ok := statSession([]byte("garbage")); ok {
+		t.Error("statSession(garbage) ok")
+	}
+}
+
+// fakeAcceptor fails with errs in turn, then blocks until closed.
+type fakeAcceptor struct {
+	errs   []error
+	calls  chan struct{}
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (f *fakeAcceptor) Accept() (*os.File, uint32, error) {
+	f.calls <- struct{}{}
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		f.errs = f.errs[1:]
+		return nil, 0, err
+	}
+	<-f.closed
+	return nil, 0, os.ErrClosed
+}
+
+func (f *fakeAcceptor) Close() error {
+	f.once.Do(func() { close(f.closed) })
+	return nil
+}
+
+// Running out of fds or memory is transient: the listener must back
+// off and keep accepting, not close for the life of the machine.
+func TestServeSurvivesTransientAcceptErrors(t *testing.T) {
+	s := NewServer(Config{}, reaper.New(nil), nil)
+	f := &fakeAcceptor{
+		errs:   []error{syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM, syscall.ECONNABORTED},
+		calls:  make(chan struct{}, 16),
+		closed: make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	accepts := len(f.errs) + 1 // read before serve starts consuming errs
+	go func() { done <- s.serve(ctx, f) }()
+	for i := range accepts {
+		select {
+		case <-f.calls:
+		case err := <-done:
+			t.Fatalf("serve returned after %d accepts: %v", i, err)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("accept %d never came", i+1)
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("serve after cancel = %v", err)
+	}
+}
+
+// A permanent error still ends Serve, so the caller logs it.
+func TestServeReturnsPermanentAcceptError(t *testing.T) {
+	s := NewServer(Config{}, reaper.New(nil), nil)
+	f := &fakeAcceptor{errs: []error{syscall.EBADF}, calls: make(chan struct{}, 4), closed: make(chan struct{})}
+	if err := s.serve(context.Background(), f); !errors.Is(err, syscall.EBADF) {
+		t.Errorf("serve = %v, want EBADF", err)
 	}
 }

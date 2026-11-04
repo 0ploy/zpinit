@@ -242,7 +242,9 @@ zpinit: reset intent=shutdown cause=exit signal=SIGKILL oom=1
 - Always its own line: preceded by `\n` so a partial line from the
   workload cannot swallow it, written by opening the console directly
   (so it appears even with logging off), and drained (`tcdrain`) before
-  `reboot`. The tty turns `\n` into `\r\n`; the host strips `\r`.
+  `reboot`. Only a character device is written: a `console` that names
+  anything else (a disk, a file, a FIFO) gets no line and an error in
+  the log, never an overwrite. The tty turns `\n` into `\r\n`; the host strips `\r`.
   Hosts match lines beginning `zpinit: reset `.
 - No line means unknown: a kernel panic, the guest calling `reboot(2)`
   itself, or a Ctrl+Alt+Del before zpinit started.
@@ -379,12 +381,24 @@ Semantics:
 - Each exec is `setsid`'d, so it is its own session and process group.
   With a tty it gets a fresh pty from `/dev/ptmx` as its controlling
   terminal.
-- **The exec's process group does not outlive the exec.** When the
-  connection drops before the exit, the group is `SIGKILL`ed; when the
-  exec's main process exits, whatever is left of its group is
-  `SIGKILL`ed too, and output still buffered is delivered (for up to
-  2 s) before the `exit` frame. A process that escaped the group with
-  its own `setsid` survives until the machine ends.
+- **The exec's session does not outlive the exec.** When the
+  connection drops before the exit, every process in the exec's
+  session is `SIGKILL`ed, including jobs a tty shell moved into process
+  groups of their own; when the exec's main process exits, whatever is
+  left of its session is `SIGKILL`ed too, and output still buffered is
+  delivered (for up to 2 s) before the `exit` frame. A process that
+  escaped the session with its own `setsid` survives until the machine
+  ends. A `signal` frame, by contrast, goes to the exec's process group
+  only, as a signal sent to the command would.
+- **Stdin has backpressure.** zpinit queues a bounded amount of stdin
+  and stops reading the connection while the exec is not taking it, so
+  a fast host slows down instead of growing memory in PID 1. Frames
+  behind that stdin (`resize`, `signal`) wait with it. A dropped
+  connection is still noticed while stalled: zpinit checks for a hangup
+  every 250 ms.
+- **The listener survives running out of fds or memory.** `accept`
+  failing with `EMFILE`, `ENFILE`, `ENOBUFS` or `ENOMEM` is retried with
+  backoff (up to 1 s) instead of closing the listener.
 - Exec sessions are killed by the teardown's `kill(-1)`.
 
 ## Testing

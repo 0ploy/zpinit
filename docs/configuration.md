@@ -293,7 +293,10 @@ name = "redis"
 # Working directory.
 cwd = "/var/lib/redis"
 
-# Drop privileges. Names or numeric IDs.
+# Drop privileges. Names or numeric IDs, resolved as container
+# runtimes do: the user's supplementary groups come from /etc/group,
+# and a numeric uid with no passwd entry runs with gid 0 (or `group`).
+# Neither set: the service runs as zpinit does.
 user  = "redis"
 group = "redis"
 

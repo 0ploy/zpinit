@@ -5,6 +5,7 @@ package machine
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
@@ -196,11 +197,28 @@ func remountRO(target string) error {
 // reboot(2) would otherwise cut the line off mid-transmit. O_NOCTTY,
 // because PID 1 is a session leader and would otherwise acquire the
 // console as its controlling terminal.
+//
+// Only a character device is written. The path comes from machine.json
+// (or is salvaged from one that failed validation) and the write lands
+// at offset 0, so a console that names a disk (/dev/vda) would
+// otherwise overwrite its first sector. O_NONBLOCK keeps the open from
+// hanging on a FIFO before the type check can refuse it; os.NewFile
+// then parks a write that would block in the runtime poller.
 func writeResetLine(console, line string) error {
-	f, err := os.OpenFile(console, os.O_WRONLY|syscall.O_NOCTTY, 0)
+	fd, err := syscall.Open(console, syscall.O_WRONLY|syscall.O_NOCTTY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return err
+		return &os.PathError{Op: "open", Path: console, Err: err}
 	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		syscall.Close(fd)
+		return &os.PathError{Op: "fstat", Path: console, Err: err}
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFCHR {
+		syscall.Close(fd)
+		return fmt.Errorf("%s: not a character device", console)
+	}
+	f := os.NewFile(uintptr(fd), console)
 	defer f.Close()
 	if _, err := f.WriteString(line); err != nil {
 		return err

@@ -148,9 +148,13 @@ a hypervisor when the host is itself a VM.
   console. That is acceptable only because it carries nothing the host
   acts on more strongly than "the guest wants to end", which the guest
   can always achieve by exiting.
-- An exec session's process group is killed when its connection drops.
-  A process that leaves the group with its own `setsid` survives until
-  the machine ends, as a daemonised process would under `docker exec`.
+- An exec session's whole session (every process group in it) is
+  killed when its connection drops, also while the exec is not reading
+  stdin. A process that leaves the session with its own `setsid`
+  survives until the machine ends, as a daemonised process would under
+  `docker exec`.
+- The reset line is written only to a character device, so a
+  `console` that names a disk cannot overwrite it.
 
 ## Non-goals
 

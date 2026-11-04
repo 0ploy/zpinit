@@ -313,7 +313,9 @@ installs them after the one-shot commands (`--version`, `--doctor`,
 Wrap mode normally `syscall.Exec`s the CMD. With `--init` (or
 `ZPINIT_INIT=1`) it forks it instead, the way tini does: the CMD runs
 in its own process group (put in the terminal's foreground when stdin
-is a tty, so job control and Ctrl+C behave as if it ran directly) with
+is zpinit's controlling terminal, so job control and Ctrl+C behave as
+if it ran directly; a tty that is not, such as `/dev/console` under
+`init=zpinit`, is left alone) with
 `Pdeathsig: SIGKILL`, and zpinit stays as PID 1 running the reaper
 loop. A stop signal is forwarded to the group (as received in a
 container; machine mode sends the image's stop signal instead), then
@@ -351,7 +353,10 @@ fast-dying children.
 In machine mode the reaper also attributes `SIGKILL` deaths of
 tracked children to the OOM killer (`SetOOMDetector`, backed by
 `machine.KernelOOM` reading `/dev/kmsg`) and sets
-`ExitInfo.OOMKilled`; see
+`ExitInfo.OOMKilled`. The lookup runs off the reap loop, once per
+`Reap` batch, so a stop deadline that SIGKILLs many children does not
+reap them one kernel-log read at a time; only those children's
+`ExitInfo` waits for it. See
 [machine-mode.md](machine-mode.md#out-of-memory-kills).
 
 The SIGCHLD loop (`startReapLoop`) runs in supervise mode, the

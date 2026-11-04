@@ -2,40 +2,12 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"os"
-	"syscall"
 
-	"github.com/0ploy/zpinit/internal/config"
 	"github.com/0ploy/zpinit/internal/machine"
 	"github.com/0ploy/zpinit/internal/reaper"
 	"github.com/0ploy/zpinit/internal/vsockexec"
 )
-
-// runWrapInit is wrap mode with --init, and every wrap in machine mode.
-func runWrapInit(log *slog.Logger, cfg *config.Config, cmdline []string, env map[string]string, r *reaper.Reaper, opts runOpts) machine.Outcome {
-	stop := wrapStop{timeout: cfg.Globals.DefaultStopTimeout.Std()}
-	var cred *syscall.Credential
-	var onStarted func()
-	if ms := opts.machine; ms != nil {
-		// The machine's graceful-stop contract replaces the container
-		// one: the image's STOPSIGNAL, within the machine's budget.
-		stop = wrapStop{signal: ms.StopSignal(), timeout: ms.Stop.Timeout.Std()}
-		// zpinit stays root (as PID 1 it must be able to reboot); the
-		// CMD runs as the image USER.
-		c, err := identityFor(ms.User)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "zpinit: user:", err)
-			return machine.Outcome{Code: 126}
-		}
-		cred = c
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		onStarted = func() { startExecServer(ctx, log, ms, r) }
-	}
-	return runInitWrap(log, cmdline, env, cred, stop, opts.latch, opts.sink, r, onStarted)
-}
 
 // runPark is rescue mode: bringup failed and the bringup init parked
 // the machine.

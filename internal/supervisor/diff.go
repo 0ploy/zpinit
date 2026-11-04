@@ -279,13 +279,16 @@ func sortRunners(rs []*Runner) {
 // replica count for auto services (the scaler owns it; the file reload
 // from disk has N=0 by definition).
 //
-// Normalizes nil-vs-empty for every map/slice field and resolves the
-// Reloadable *bool pointer to its effective value before comparison.
+// Normalizes nil-vs-empty for every map/slice field and resolves every
+// pointer field (Reloadable, Pdeathsig, MaxConsecutiveCrashes) to its
+// effective value before comparison. A new pointer field must be added
+// here too, or writing out its default restarts the service.
 // Without the normalization, reflect.DeepEqual reports phantom
 // inequality for cosmetic edits that don't change semantics:
 //
 //   - `env = {}` vs no `env` key
 //   - `reloadable = true` vs no key (both mean reloadable)
+//   - `pdeathsig = true` / `max_consecutive_crashes = 5` vs no key
 //   - `reload_on_change = []` vs no key (both disable the trigger)
 //   - `command = []` vs no key (both invalid; caught by validate)
 //
@@ -306,6 +309,11 @@ func servicesEqual(a, b config.Service) bool {
 		return false
 	}
 	a.Reloadable, b.Reloadable = nil, nil
+	if a.WantsPdeathsig() != b.WantsPdeathsig() || a.CrashBudget() != b.CrashBudget() {
+		return false
+	}
+	a.Pdeathsig, b.Pdeathsig = nil, nil
+	a.MaxConsecutiveCrashes, b.MaxConsecutiveCrashes = nil, nil
 	// Nil-vs-empty normalization on every field DeepEqual would
 	// distinguish. Cheap: typical service configs touch a handful of
 	// these, the rest are no-ops.

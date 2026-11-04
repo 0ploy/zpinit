@@ -264,8 +264,8 @@ func TestSpawn_LogParentDirCreated(t *testing.T) {
 	}
 }
 
-func TestResolveCredentials_NoUser(t *testing.T) {
-	cred, err := resolveCredentials("", "")
+func TestServiceCredential_NoUser(t *testing.T) {
+	cred, err := serviceCredential("", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,9 +274,9 @@ func TestResolveCredentials_NoUser(t *testing.T) {
 	}
 }
 
-func TestResolveCredentials_NumericUid(t *testing.T) {
+func TestServiceCredential_NumericUid(t *testing.T) {
 	uid := strconv.Itoa(os.Getuid())
-	cred, err := resolveCredentials(uid, "")
+	cred, err := serviceCredential(uid, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,11 +286,49 @@ func TestResolveCredentials_NumericUid(t *testing.T) {
 	if int(cred.Uid) != os.Getuid() {
 		t.Errorf("uid = %d, want %d", cred.Uid, os.Getuid())
 	}
+	if cred.Groups == nil {
+		t.Error("Groups is nil: the child would inherit zpinit's supplementary groups")
+	}
 }
 
-func TestResolveCredentials_UnknownUser(t *testing.T) {
-	if _, err := resolveCredentials("nonexistent_user_zzz", ""); err == nil {
-		t.Fatal("expected error")
+// A service resolves user and group exactly like the wrap CMD and exec
+// sessions: a numeric uid with no passwd entry is allowed (gid 0, or
+// the explicit group), as under container runtimes.
+func TestServiceCredential_MatchesResolveIdentity(t *testing.T) {
+	cred, err := serviceCredential("4242424", "")
+	if err != nil {
+		t.Fatalf("numeric uid without passwd: %v", err)
+	}
+	if cred.Uid != 4242424 || cred.Gid != 0 {
+		t.Errorf("cred = %+v, want uid 4242424 gid 0", cred)
+	}
+	cred, err = serviceCredential("4242424", "777")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cred.Uid != 4242424 || cred.Gid != 777 {
+		t.Errorf("cred = %+v, want uid 4242424 gid 777", cred)
+	}
+	for _, spec := range []string{"root", "0"} {
+		got, err := serviceCredential(spec, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := ResolveIdentity(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Uid != want.Cred.Uid || got.Gid != want.Cred.Gid || len(got.Groups) != len(want.Cred.Groups) {
+			t.Errorf("%s: service %+v, exec/wrap %+v", spec, got, want.Cred)
+		}
+	}
+}
+
+func TestServiceCredential_Errors(t *testing.T) {
+	for _, c := range [][2]string{{"nonexistent_user_zzz", ""}, {"0", "nonexistent_group_zzz"}, {"app:grp", ""}} {
+		if _, err := serviceCredential(c[0], c[1]); err == nil {
+			t.Errorf("serviceCredential(%q, %q): expected error", c[0], c[1])
+		}
 	}
 }
 

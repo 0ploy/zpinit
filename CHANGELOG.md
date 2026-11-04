@@ -65,6 +65,13 @@
 
 ### Changed
 
+- **Services get their user's supplementary groups.** A service with
+  `user = "app"` now runs with app's groups from `/etc/group`, as under
+  `docker run --user` and supervisord; before, it had none, so access
+  granted through a secondary group (a shared socket, a log directory)
+  failed. A numeric `user` with no passwd entry is accepted and runs
+  with gid 0 (or `group`) instead of failing to start.
+
 - **The published image is based on Alpine 3.24** (was 3.20, which is
   past end of life). Only matters if you run `ghcr.io/0ploy/zpinit`
   itself; `COPY --from` of the binaries is unaffected.

@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/0ploy/zpinit/internal/config"
 	"github.com/0ploy/zpinit/internal/entrypoint"
+	"github.com/0ploy/zpinit/internal/execpath"
 	"github.com/0ploy/zpinit/internal/machine"
 	"github.com/0ploy/zpinit/internal/reaper"
 	"github.com/0ploy/zpinit/internal/resources"
@@ -342,16 +342,9 @@ func run(log *slog.Logger, opts runOpts) machine.Outcome {
 	switch detectMode(cmdline) {
 	case modeWrap:
 		if opts.init {
-			return runWrapInit(log, cfg, cmdline, bootEnv, r, opts)
+			return runInitWrap(log, cfg, cmdline, bootEnv, r, opts)
 		}
-		// A stop that arrived after entrypoint.d but before the exec
-		// would otherwise be lost (the latch caught it, and the exec'd
-		// CMD resets the handler). Report it the way dying of it would
-		// have.
-		if sig, ok := opts.latch.Signal().(syscall.Signal); ok {
-			return machine.Outcome{Code: 128 + int(sig), Signal: sig}
-		}
-		return fail(execCmd(log, cmdline, bootEnv))
+		return execCmd(log, cmdline, bootEnv, opts.latch)
 	case modeSupervise:
 		// scriptEnv is the delta entrypoint.d wrote to /run/zpinit/env
 		// (or set on its own children that bubbled up via the env
@@ -497,27 +490,51 @@ func runEntrypoint(log *slog.Logger, configDir string, cfg *config.Config, skipF
 	})
 }
 
-func execCmd(log *slog.Logger, cmdline []string, env map[string]string) int {
+// execve is syscall.Exec; a test seam, since a successful call never
+// returns.
+var execve = syscall.Exec
+
+// execCmd is plain wrap mode: replace zpinit with the CMD.
+//
+// A stop signal that arrives after entrypoint.d but before the exec is
+// caught by the stop latch, and the exec'd CMD would never see it (the
+// handler resets across execve). So the latch is checked last, after
+// the lookup, the env and the log line, immediately before execve, and
+// a latched stop is reported the way dying of it would have been.
+// What remains is the Go runtime's own signal-delivery latency between
+// that check and the syscall; closing it fully would need every thread
+// to block the signals, which Go cannot do, and a blocked mask would
+// be inherited by the CMD.
+func execCmd(log *slog.Logger, cmdline []string, env map[string]string, latch *stopLatch) machine.Outcome {
 	// Resolve the binary against the MERGED env's PATH, not zpinit's
 	// inherited one: an entrypoint.d script that exports PATH via
 	// /run/zpinit/env expects it to affect binary resolution, exactly
-	// as it will affect the exec'd process. exec.LookPath consults the
-	// process env, so install the merged PATH first; the mutation is
-	// moot because Exec replaces the image (and on failure we exit).
-	if p, ok := env["PATH"]; ok {
-		_ = os.Setenv("PATH", p)
-	}
-	argv0, err := exec.LookPath(cmdline[0])
+	// as it will affect the exec'd process.
+	argv0, err := execpath.Find(cmdline[0], childPath(env))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "zpinit:", err)
-		return 127 // shell convention: command not found
+		return machine.Outcome{Code: 127} // shell convention: command not found
 	}
+	envv := entrypoint.SliceFromEnviron(env)
 	log.Info("exec", "cmd", cmdline)
-	if err := syscall.Exec(argv0, cmdline, entrypoint.SliceFromEnviron(env)); err != nil {
-		fmt.Fprintln(os.Stderr, "zpinit: exec:", err)
-		return 126 // shell convention: found but not executable
+	if sig, ok := latch.Signal().(syscall.Signal); ok {
+		return machine.Outcome{Code: 128 + int(sig), Signal: sig}
 	}
-	return 0 // unreachable; Exec replaces the process image
+	if err := execve(argv0, cmdline, envv); err != nil {
+		fmt.Fprintln(os.Stderr, "zpinit: exec:", err)
+		return machine.Outcome{Code: 126} // shell convention: found but not executable
+	}
+	return machine.Outcome{} // unreachable; Exec replaces the process image
+}
+
+// childPath is the PATH a wrap CMD resolves against: the merged env's,
+// else zpinit's own (the env normally carries one; it is layered over
+// zpinit's).
+func childPath(env map[string]string) string {
+	if p, ok := env["PATH"]; ok {
+		return p
+	}
+	return os.Getenv("PATH")
 }
 
 // runSupervise is the supervise-mode entry point. It splits signals

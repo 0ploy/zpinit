@@ -165,15 +165,24 @@ type fakeOOM struct {
 	asked  []int
 	since  []time.Duration
 	answer bool
+	// block, when set, holds Killed until it is closed.
+	block chan struct{}
 }
 
 func (f *fakeOOM) Now() time.Duration { return f.now }
-func (f *fakeOOM) Killed(pid int, since time.Duration) bool {
+func (f *fakeOOM) Killed(cands []OOMCandidate) []bool {
+	if f.block != nil {
+		<-f.block
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.asked = append(f.asked, pid)
-	f.since = append(f.since, since)
-	return f.answer
+	out := make([]bool, len(cands))
+	for i, c := range cands {
+		f.asked = append(f.asked, c.PID)
+		f.since = append(f.since, c.Since)
+		out[i] = f.answer
+	}
+	return out
 }
 
 // Only a SIGKILL death is attributed, with the clock sampled at spawn.
@@ -254,5 +263,55 @@ func TestNoOOMDetector(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout")
+	}
+}
+
+// A slow OOM lookup must not hold up reaping: attribution runs off the
+// reap loop, so a plain exit reaped after a SIGKILL death is delivered
+// while the detector is still busy.
+func TestOOMAttributionDoesNotBlockReap(t *testing.T) {
+	oom := &fakeOOM{answer: true, block: make(chan struct{})}
+	r := New(discardLogger())
+	r.SetOOMDetector(oom)
+	defer drainReaper(t, r)()
+	spawn := func(script string) (*os.Process, <-chan ExitInfo) {
+		cmd := exec.Command("/bin/sh", "-c", script)
+		p, ch, err := r.SpawnTracked(func() (*os.Process, error) {
+			if err := cmd.Start(); err != nil {
+				return nil, err
+			}
+			return cmd.Process, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p, ch
+	}
+	p, killedCh := spawn("exec sleep 30")
+	_ = p.Signal(syscall.SIGKILL)
+	// Give the reap loop time to take the SIGKILL death first.
+	time.Sleep(100 * time.Millisecond)
+	_, exitCh := spawn("exit 7")
+	select {
+	case info := <-exitCh:
+		if info.ExitCode != 7 {
+			t.Errorf("exit = %+v", info)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a plain exit waited for the OOM lookup of another child")
+	}
+	select {
+	case <-killedCh:
+		t.Fatal("SIGKILL death delivered before its OOM lookup finished")
+	default:
+	}
+	close(oom.block)
+	select {
+	case info := <-killedCh:
+		if !info.OOMKilled {
+			t.Errorf("OOMKilled = false after the lookup said true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SIGKILL death never delivered")
 	}
 }

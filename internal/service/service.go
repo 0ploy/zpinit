@@ -17,7 +17,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -42,7 +41,7 @@ func Spawn(cfg config.Service, baseEnv []string, r *reaper.Reaper, log *slog.Log
 		return nil, errors.New("empty command")
 	}
 
-	cred, err := resolveCredentials(cfg.User, cfg.Group)
+	cred, err := serviceCredential(cfg.User, cfg.Group)
 	if err != nil {
 		return nil, fmt.Errorf("credentials: %w", err)
 	}
@@ -146,40 +145,27 @@ func SpawnOneShot(name string, command, env []string, r *reaper.Reaper, log *slo
 	return proc.Pid, exitCh, nil
 }
 
-func resolveCredentials(userStr, groupStr string) (*syscall.Credential, error) {
+// serviceCredential resolves a service's `user` / `group` the way every
+// other child of zpinit is resolved (ResolveIdentity: the wrap CMD, exec
+// sessions): the user's supplementary groups from /etc/group, and a
+// numeric uid with no passwd entry runs with gid 0. Neither set means
+// nil: the service inherits zpinit's identity.
+func serviceCredential(userStr, groupStr string) (*syscall.Credential, error) {
 	if userStr == "" && groupStr == "" {
 		return nil, nil
 	}
-
-	var uid, gid uint32
-
-	if userStr != "" {
-		u, err := lookupUser(userStr)
-		if err != nil {
-			return nil, fmt.Errorf("user %q: %w", userStr, err)
-		}
-		uid64, err := strconv.ParseUint(u.Uid, 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("user %q: parse uid %q: %w", userStr, u.Uid, err)
-		}
-		uid = uint32(uid64)
-		gid64, _ := strconv.ParseUint(u.Gid, 10, 32)
-		gid = uint32(gid64)
+	if strings.Contains(userStr, ":") {
+		return nil, fmt.Errorf("user %q: contains ':'; set the group with `group`", userStr)
 	}
-
+	spec := userStr
 	if groupStr != "" {
-		g, err := lookupGroup(groupStr)
-		if err != nil {
-			return nil, fmt.Errorf("group %q: %w", groupStr, err)
-		}
-		gid64, err := strconv.ParseUint(g.Gid, 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("group %q: parse gid %q: %w", groupStr, g.Gid, err)
-		}
-		gid = uint32(gid64)
+		spec += ":" + groupStr
 	}
-
-	return &syscall.Credential{Uid: uid, Gid: gid}, nil
+	id, err := ResolveIdentity(spec)
+	if err != nil {
+		return nil, err
+	}
+	return id.Cred, nil
 }
 
 func lookupUser(s string) (*user.User, error) {

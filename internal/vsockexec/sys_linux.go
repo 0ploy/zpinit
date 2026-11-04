@@ -3,10 +3,12 @@
 package vsockexec
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -158,3 +160,97 @@ func isEIO(err error) bool {
 
 // eofChar is what stdin_eof writes to a tty: the default VEOF (^D).
 const eofChar = 0x04
+
+// pollHangup polls fd once, without blocking, for the peer closing or
+// resetting the connection. Only hangup events are asked for, so unread
+// data does not count. AF_VSOCK and AF_UNIX both raise POLLRDHUP when
+// the peer shuts down or resets.
+func pollHangup(fd int) bool {
+	const (
+		pollErr   = 0x8
+		pollHup   = 0x10
+		pollRDHup = 0x2000
+	)
+	pfd := struct {
+		fd             int32
+		events, revent int16
+	}{fd: int32(fd), events: pollRDHup}
+	var ts syscall.Timespec // zero: return at once
+	for {
+		n, _, e := syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&pfd)), 1, uintptr(unsafe.Pointer(&ts)), 0, 0, 0)
+		if e == syscall.EINTR {
+			continue
+		}
+		if e != 0 {
+			return true
+		}
+		return n > 0 && pfd.revent&(pollErr|pollHup|pollRDHup) != 0
+	}
+}
+
+// killSession SIGKILLs every process in session sid: the exec's leader
+// and everything it started, including jobs a shell moved into process
+// groups of their own. A process that left the session with its own
+// setsid is out of reach. The scan repeats because a member can fork
+// between the /proc read and the kill; zombies are dead already and do
+// not count. The sid stays reserved by the kernel while any member is
+// alive, so it cannot name an unrelated session mid-scan.
+func killSession(sid int) {
+	_ = syscall.Kill(-sid, syscall.SIGKILL)
+	for range 8 {
+		live := 0
+		for _, pid := range sessionMembers(sid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			live++
+		}
+		if live == 0 {
+			return
+		}
+	}
+}
+
+// sessionMembers lists the live (non-zombie) processes whose session is
+// sid, from /proc/<pid>/stat.
+func sessionMembers(sid int) []int {
+	d, err := os.Open("/proc")
+	if err != nil {
+		return nil
+	}
+	names, _ := d.Readdirnames(-1)
+	d.Close()
+	var out []int
+	for _, name := range names {
+		pid, err := strconv.Atoi(name)
+		if err != nil || pid <= 1 {
+			continue
+		}
+		b, err := os.ReadFile("/proc/" + name + "/stat")
+		if err != nil {
+			continue
+		}
+		state, s, ok := statSession(b)
+		if ok && s == sid && state != 'Z' && state != 'X' {
+			out = append(out, pid)
+		}
+	}
+	return out
+}
+
+// statSession parses state and session out of a /proc/<pid>/stat line.
+// comm may hold spaces and parentheses, so fields count from the last
+// ')': state ppid pgrp session ...
+func statSession(b []byte) (state byte, sid int, ok bool) {
+	i := bytes.LastIndexByte(b, ')')
+	if i < 0 {
+		return 0, 0, false
+	}
+	f := strings.Fields(string(b[i+1:]))
+	if len(f) < 4 || len(f[0]) != 1 {
+		return 0, 0, false
+	}
+	sid, err := strconv.Atoi(f[3])
+	if err != nil {
+		return 0, 0, false
+	}
+	return f[0][0], sid, true
+}

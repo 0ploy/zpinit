@@ -23,6 +23,7 @@ import (
 
 	"github.com/0ploy/zpinit/execproto"
 	"github.com/0ploy/zpinit/internal/config"
+	"github.com/0ploy/zpinit/internal/execpath"
 	"github.com/0ploy/zpinit/internal/reaper"
 	"github.com/0ploy/zpinit/internal/service"
 )
@@ -66,26 +67,59 @@ const requestTimeout = 10 * time.Second
 // pipe open would otherwise hold the session forever.
 const drainGrace = 2 * time.Second
 
+// acceptor is the part of *Listener Serve uses; tests fake it.
+type acceptor interface {
+	Accept() (*os.File, uint32, error)
+	Close() error
+}
+
+// Accept backoff when the guest is out of fds or memory, as net/http
+// does: the condition is transient, and giving up would close the only
+// way into the machine until it reboots.
+const (
+	acceptBackoffMin = 5 * time.Millisecond
+	acceptBackoffMax = time.Second
+)
+
 // Serve accepts connections until ctx is done or the listener fails.
 // Only the host CID is served: vsock has no SO_PEERCRED, so the CID
 // check is the whole authentication, and without it a local process
 // could reach a root exec over vsock loopback.
 func (s *Server) Serve(ctx context.Context, l *Listener) error {
+	return s.serve(ctx, l)
+}
+
+func (s *Server) serve(ctx context.Context, l acceptor) error {
 	go func() {
 		<-ctx.Done()
 		_ = l.Close()
 	}()
+	var backoff time.Duration
 	for {
 		conn, cid, err := l.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			if errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.ECONNABORTED) {
+			switch {
+			case errors.Is(err, syscall.EINTR), errors.Is(err, syscall.ECONNABORTED),
+				errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPROTO):
+				// The pending connection went away; take the next.
 				continue
+			case errors.Is(err, syscall.EMFILE), errors.Is(err, syscall.ENFILE),
+				errors.Is(err, syscall.ENOBUFS), errors.Is(err, syscall.ENOMEM):
+				backoff = min(max(2*backoff, acceptBackoffMin), acceptBackoffMax)
+				s.log.Warn("exec: accept failed; retrying", "err", err, "in", backoff)
+				select {
+				case <-time.After(backoff):
+					continue
+				case <-ctx.Done():
+					return nil
+				}
 			}
 			return err
 		}
+		backoff = 0
 		if !s.accept(cid) {
 			s.log.Warn("exec: refused connection from non-host CID", "cid", cid)
 			_ = conn.Close()
@@ -169,14 +203,16 @@ func (s *Server) start(req *execproto.Request) (*session, error) {
 	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = env
-	// Resolve argv[0] against the exec's PATH, not PID 1's.
+	// Resolve argv[0] against the exec's PATH, not PID 1's. A name
+	// with a slash is left to the exec, relative to its working dir.
 	if !strings.Contains(req.Argv[0], "/") {
-		if p, ok := lookPath(req.Argv[0], env); ok {
-			cmd.Path = p
-			cmd.Err = nil
-		} else {
-			return nil, fmt.Errorf("%s: executable file not found in $PATH", req.Argv[0])
+		path, _ := execpath.FromEnv(env)
+		p, err := execpath.Find(req.Argv[0], path)
+		if err != nil {
+			return nil, err
 		}
+		cmd.Path = p
+		cmd.Err = nil
 	}
 	// Setsid makes the exec its own session and process group, so the
 	// connection-drop SIGKILL and forwarded signals reach exactly it.
@@ -297,26 +333,6 @@ func composeEnv(base []string, req *execproto.Request, otherUser bool, home stri
 	return out
 }
 
-// lookPath resolves name against env's PATH.
-func lookPath(name string, env []string) (string, bool) {
-	path := ""
-	for _, kv := range env {
-		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
-			path = v
-		}
-	}
-	for _, dir := range strings.Split(path, ":") {
-		if dir == "" {
-			dir = "."
-		}
-		p := dir + "/" + name
-		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
-			return p, true
-		}
-	}
-	return "", false
-}
-
 // run pumps the session until the exec exits or the connection drops.
 func (sess *session) run(conn io.ReadWriteCloser) {
 	var wmu sync.Mutex
@@ -325,7 +341,10 @@ func (sess *session) run(conn io.ReadWriteCloser) {
 		defer wmu.Unlock()
 		return execproto.WriteFrame(conn, t, p)
 	}
-	killGroup := func() { _ = syscall.Kill(-sess.pid, syscall.SIGKILL) }
+	// Everything the exec started dies with it: its whole session, not
+	// only its process group, because a tty shell's job control puts
+	// each job in a group of its own.
+	killGroup := func() { killSession(sess.pid) }
 
 	if b, err := json.Marshal(execproto.Started{PID: sess.pid}); err == nil {
 		if err := send(execproto.FrameStarted, b); err != nil {
@@ -385,36 +404,72 @@ func (sess *session) run(conn io.ReadWriteCloser) {
 	}()
 
 	// Frame reader. Any read error before the exit is a dropped
-	// connection: SIGKILL the group.
+	// connection: SIGKILL the session.
 	exited := make(chan struct{})
 	readerDone := make(chan struct{})
+	dropped := func() {
+		select {
+		case <-exited:
+		default:
+			sess.log.Info("exec: connection dropped; killing the exec's session", "pid", sess.pid)
+			killGroup()
+		}
+	}
+	// queueStdin hands p to the stdin writer, keeping backpressure: a
+	// child that reads stdin slowly slows the host down rather than
+	// growing a buffer in PID 1. While the queue is full the reader
+	// cannot see EOF on conn, so it polls for a hangup instead; without
+	// that an exec that never reads stdin would outlive a dropped
+	// connection. false ends the reader.
+	queueStdin := func(p []byte) bool {
+		select {
+		case stdinCh <- p:
+			return true
+		default:
+		}
+		tk := time.NewTicker(hangupPoll)
+		defer tk.Stop()
+		for {
+			select {
+			case stdinCh <- p:
+				return true
+			case <-exited:
+				return false
+			case <-tk.C:
+				if peerHungUp(conn) {
+					dropped()
+					return false
+				}
+			}
+		}
+	}
 	go func() {
 		defer close(readerDone)
 		defer close(stdinCh)
 		for {
 			t, p, err := execproto.ReadFrame(conn)
 			if err != nil {
-				select {
-				case <-exited:
-				default:
-					sess.log.Info("exec: connection dropped; killing the exec's process group", "pid", sess.pid)
-					killGroup()
-				}
+				dropped()
 				return
 			}
 			switch t {
 			case execproto.FrameStdin:
-				if len(p) > 0 {
-					stdinCh <- p
+				if len(p) > 0 && !queueStdin(p) {
+					return
 				}
 			case execproto.FrameStdinEOF:
-				stdinCh <- nil
+				if !queueStdin(nil) {
+					return
+				}
 			case execproto.FrameResize:
 				var rz execproto.Resize
 				if sess.master != nil && json.Unmarshal(p, &rz) == nil && rz.Rows > 0 && rz.Cols > 0 {
 					_ = setWinsize(sess.master, rz.Rows, rz.Cols)
 				}
 			case execproto.FrameSignal:
+				// To the exec's process group, as the protocol says:
+				// a signal is the host forwarding its own, not job
+				// control. Only the cleanup kill takes the session.
 				if sig, ok := config.ParseSignal(string(p)); ok {
 					_ = syscall.Kill(-sess.pid, sig)
 				} else if n, ok := rtSignal(string(p)); ok {
@@ -428,7 +483,7 @@ func (sess *session) run(conn io.ReadWriteCloser) {
 
 	info := <-sess.exit
 	close(exited)
-	// Whatever is left of the exec's process group dies with it; output
+	// Whatever is left of the exec's session dies with it; output
 	// already in the pipes stays readable.
 	killGroup()
 	select {
@@ -455,9 +510,33 @@ func (sess *session) run(conn io.ReadWriteCloser) {
 	<-readerDone
 	if !sess.tty {
 		// The stdin writer closes its end on EOF; make sure it is
-		// closed when the host never sent one.
+		// closed when the host never sent one. This also unblocks a
+		// writer parked on a pipe that an escaped process holds open.
 		_ = sess.stdin.Close()
 	}
+}
+
+// hangupPoll is how often a reader stalled on a full stdin queue checks
+// whether the host hung up.
+const hangupPoll = 250 * time.Millisecond
+
+// peerHungUp reports whether conn's peer has closed or reset it,
+// without reading (the unread bytes are stdin the child has not taken
+// yet). A conn that exposes no fd never reports a hangup.
+func peerHungUp(conn io.ReadWriteCloser) bool {
+	sc, ok := conn.(syscall.Conn)
+	if !ok {
+		return false
+	}
+	rc, err := sc.SyscallConn()
+	if err != nil {
+		return true
+	}
+	hup := false
+	if err := rc.Control(func(fd uintptr) { hup = pollHangup(int(fd)) }); err != nil {
+		return true
+	}
+	return hup
 }
 
 // rtSignal accepts "SIG<n>" for the signals with no name (SignalName's

@@ -8,4 +8,4 @@ func wrapSysProcAttr(bool) *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setpgid: true}
 }
 
-func isTerminal(int) bool { return false }
+func controlsTerminal(int) bool { return false }

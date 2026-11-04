@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strconv"
 	"time"
+
+	"github.com/0ploy/zpinit/internal/reaper"
 )
 
 // OOM detection, machine mode only. When a tracked child dies of
@@ -45,24 +47,60 @@ func parseKmsgRecord(rec []byte) (ts time.Duration, msg []byte, ok bool) {
 	return time.Duration(usec) * time.Microsecond, msg, true
 }
 
-// isOOMKill reports whether a kernel log message records the OOM
-// killer killing pid.
-func isOOMKill(msg []byte, pid int) bool {
-	needle := []byte("Killed process " + strconv.Itoa(pid) + " (")
-	return bytes.Contains(msg, needle)
+// oomVictim returns the pid a kernel log message records the OOM
+// killer killing ("... Killed process <pid> (<comm>) ...").
+func oomVictim(msg []byte) (int, bool) {
+	_, rest, found := bytes.Cut(msg, []byte("Killed process "))
+	if !found {
+		return 0, false
+	}
+	digits, _, found := bytes.Cut(rest, []byte(" ("))
+	if !found {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(string(digits))
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
 }
 
-// oomKilledIn scans records (one per element) for an OOM kill of pid
-// logged at or after since (minus oomSlack).
-func oomKilledIn(records [][]byte, pid int, since time.Duration) bool {
+// oomVictims indexes records (one per element) by OOM-killed pid, each
+// with the time of its latest kill record.
+func oomVictims(records [][]byte) map[int]time.Duration {
+	out := map[int]time.Duration{}
 	for _, rec := range records {
 		ts, msg, ok := parseKmsgRecord(rec)
-		if !ok || ts+oomSlack < since {
+		if !ok {
 			continue
 		}
-		if isOOMKill(msg, pid) {
-			return true
+		if pid, ok := oomVictim(msg); ok && ts >= out[pid] {
+			out[pid] = ts
 		}
 	}
-	return false
+	return out
+}
+
+// attributeOOM marks in out each candidate the index records as killed
+// at or after its Since (minus oomSlack). It reports whether every
+// candidate is now marked.
+func attributeOOM(victims map[int]time.Duration, cands []reaper.OOMCandidate, out []bool) bool {
+	all := true
+	for i, c := range cands {
+		if !out[i] {
+			if ts, ok := victims[c.PID]; ok && ts+oomSlack >= c.Since {
+				out[i] = true
+			}
+		}
+		all = all && out[i]
+	}
+	return all
+}
+
+// oomKilledIn reports whether records hold an OOM kill of pid logged
+// at or after since (minus oomSlack).
+func oomKilledIn(records [][]byte, pid int, since time.Duration) bool {
+	out := []bool{false}
+	attributeOOM(oomVictims(records), []reaper.OOMCandidate{{PID: pid, Since: since}}, out)
+	return out[0]
 }

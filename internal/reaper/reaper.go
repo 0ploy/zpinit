@@ -34,12 +34,20 @@ type ExitInfo struct {
 	OOMKilled bool
 }
 
-// OOMDetector attributes a SIGKILL death to the kernel's OOM killer.
+// OOMDetector attributes SIGKILL deaths to the kernel's OOM killer.
 // Now is the detector's clock, sampled before each spawn; Killed
-// reports whether pid was OOM-killed at or after since.
+// reports, per candidate, whether it was OOM-killed at or after its
+// Since. It takes a batch so one look at the kernel log covers every
+// SIGKILL a Reap drained (a stop deadline SIGKILLs many at once).
 type OOMDetector interface {
 	Now() time.Duration
-	Killed(pid int, since time.Duration) bool
+	Killed(cands []OOMCandidate) []bool
+}
+
+// OOMCandidate is a tracked child that died of SIGKILL.
+type OOMCandidate struct {
+	PID   int
+	Since time.Duration
 }
 
 type tracking struct {
@@ -114,6 +122,12 @@ func (r *Reaper) Untrack(pid int) {
 // SpawnTracked; untracked ones (true orphans, or PIDs explicitly
 // Untracked) are logged.
 func (r *Reaper) Reap() {
+	var pending []pendingOOM
+	defer func() {
+		if len(pending) > 0 {
+			go r.attributeOOM(pending)
+		}
+	}()
 	for {
 		var ws syscall.WaitStatus
 		pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
@@ -149,7 +163,10 @@ func (r *Reaper) Reap() {
 
 		if tracked {
 			if r.oom != nil && info.Signaled && info.Signal == syscall.SIGKILL {
-				info.OOMKilled = r.oom.Killed(pid, t.start)
+				// Attributed off this loop: reading the kernel log
+				// (and its retry) must not hold up reaping the rest.
+				pending = append(pending, pendingOOM{t, info})
+				continue
 			}
 			t.ch <- info
 			close(t.ch)
@@ -160,5 +177,26 @@ func (r *Reaper) Reap() {
 		} else {
 			r.log.Info("reaped orphan", "pid", pid, "code", info.ExitCode)
 		}
+	}
+}
+
+type pendingOOM struct {
+	t    tracking
+	info ExitInfo
+}
+
+// attributeOOM asks the detector about one Reap's SIGKILL deaths and
+// delivers their ExitInfo. Each channel has a one-slot buffer, so the
+// sends never block, also after the reap loop stopped.
+func (r *Reaper) attributeOOM(pending []pendingOOM) {
+	cands := make([]OOMCandidate, len(pending))
+	for i, p := range pending {
+		cands[i] = OOMCandidate{PID: p.info.PID, Since: p.t.start}
+	}
+	killed := r.oom.Killed(cands)
+	for i, p := range pending {
+		p.info.OOMKilled = i < len(killed) && killed[i]
+		p.t.ch <- p.info
+		close(p.t.ch)
 	}
 }

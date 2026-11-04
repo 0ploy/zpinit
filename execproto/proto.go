@@ -18,9 +18,9 @@
 //     payload length, payload. The session ends with FrameExit (or
 //     FrameError) and zpinit closes the connection.
 //
-// A connection that drops before the exit SIGKILLs the exec's process
-// group: an exec that outlives its connection is a process nobody
-// accounts for. The full contract is docs/machine-mode.md.
+// A connection that drops before the exit SIGKILLs the exec's session
+// (every process group the exec started): an exec that outlives its
+// connection is a process nobody accounts for. The full contract is docs/machine-mode.md.
 package execproto
 
 import (

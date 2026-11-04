@@ -3,6 +3,8 @@ package machine
 import (
 	"testing"
 	"time"
+
+	"github.com/0ploy/zpinit/internal/reaper"
 )
 
 func TestOOMKilledIn(t *testing.T) {
@@ -46,5 +48,22 @@ func TestParseKmsgRecord(t *testing.T) {
 		if _, _, ok := parseKmsgRecord([]byte(bad)); ok {
 			t.Errorf("parsed %q", bad)
 		}
+	}
+}
+
+// One read of the log attributes a whole batch: a stop deadline
+// SIGKILLs many children at once.
+func TestAttributeOOMBatch(t *testing.T) {
+	recs := [][]byte{
+		[]byte("3,101,9000000,-;Out of memory: Killed process 4321 (php-fpm) total-vm:1024kB\n"),
+		[]byte("3,102,9500000,-;Memory cgroup out of memory: Killed process 77 (node) total-vm:1kB\n"),
+	}
+	cands := []reaper.OOMCandidate{{PID: 4321, Since: time.Second}, {PID: 55, Since: 0}, {PID: 77, Since: 30 * time.Second}}
+	out := make([]bool, len(cands))
+	if attributeOOM(oomVictims(recs), cands, out) {
+		t.Error("all attributed; pid 55 was never OOM-killed")
+	}
+	if want := []bool{true, false, false}; out[0] != want[0] || out[1] != want[1] || out[2] != want[2] {
+		t.Errorf("out = %v, want %v", out, want)
 	}
 }

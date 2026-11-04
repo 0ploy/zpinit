@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/0ploy/zpinit/internal/config"
 	"github.com/0ploy/zpinit/internal/entrypoint"
+	"github.com/0ploy/zpinit/internal/execpath"
 	"github.com/0ploy/zpinit/internal/machine"
 	"github.com/0ploy/zpinit/internal/reaper"
 	"github.com/0ploy/zpinit/internal/service"
@@ -56,6 +58,32 @@ func startReapLoop(log *slog.Logger, r *reaper.Reaper) (stop func()) {
 	}
 }
 
+// runInitWrap is wrap mode with --init, and every wrap in machine mode:
+// it settles how the child is stopped and who it runs as, then hands
+// over to runResidentWrap.
+func runInitWrap(log *slog.Logger, cfg *config.Config, cmdline []string, env map[string]string, r *reaper.Reaper, opts runOpts) machine.Outcome {
+	stop := wrapStop{timeout: cfg.Globals.DefaultStopTimeout.Std()}
+	var cred *syscall.Credential
+	var onStarted func()
+	if ms := opts.machine; ms != nil {
+		// The machine's graceful-stop contract replaces the container
+		// one: the image's STOPSIGNAL, within the machine's budget.
+		stop = wrapStop{signal: ms.StopSignal(), timeout: ms.Stop.Timeout.Std()}
+		// zpinit stays root (as PID 1 it must be able to reboot); the
+		// CMD runs as the image USER.
+		id, err := service.ResolveIdentity(ms.User)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "zpinit: user:", err)
+			return machine.Outcome{Code: 126}
+		}
+		cred = id.Cred
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		onStarted = func() { startExecServer(ctx, log, ms, r) }
+	}
+	return runResidentWrap(log, cmdline, env, cred, stop, opts.latch, opts.sink, r, onStarted)
+}
+
 // wrapStop is how the --init wrap stops its child.
 type wrapStop struct {
 	// signal overrides the forwarded stop signal (machine mode's
@@ -64,8 +92,8 @@ type wrapStop struct {
 	timeout time.Duration
 }
 
-// runInitWrap is wrap mode with --init (forced in machine mode): fork
-// the CMD instead of exec'ing it and stay resident above it, the way
+// runResidentWrap is the resident wrap (--init, forced in machine
+// mode): fork the CMD instead of exec'ing it and stay resident above it, the way
 // tini does. zpinit keeps reaping (orphans included), forwards signals
 // to the child's process group, turns a stop signal into a graceful
 // stop bounded by the stop timeout, and ends with the child's status
@@ -73,13 +101,11 @@ type wrapStop struct {
 //
 // cred is the child's identity (machine mode's `user`); nil inherits
 // zpinit's.
-func runInitWrap(log *slog.Logger, cmdline []string, env map[string]string, cred *syscall.Credential,
+func runResidentWrap(log *slog.Logger, cmdline []string, env map[string]string, cred *syscall.Credential,
 	stop wrapStop, latch *stopLatch, sink *signalSink, r *reaper.Reaper, onStarted func()) machine.Outcome {
-	// Resolve against the merged env's PATH, as execCmd does.
-	if p, ok := env["PATH"]; ok {
-		_ = os.Setenv("PATH", p)
-	}
-	argv0, err := exec.LookPath(cmdline[0])
+	// Resolve against the merged env's PATH, as execCmd does, without
+	// touching PID 1's own: zpinit stays resident here.
+	argv0, err := execpath.Find(cmdline[0], childPath(env))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "zpinit:", err)
 		return machine.Outcome{Code: 127}
@@ -96,10 +122,12 @@ func runInitWrap(log *slog.Logger, cmdline []string, env map[string]string, cred
 	cmd.Env = entrypoint.SliceFromEnviron(env)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	// Its own process group, so forwarded signals and the final SIGKILL
-	// reach forks of the CMD too. With a terminal on stdin the group is
-	// put in the foreground, so Ctrl+C and job control behave as if the
-	// CMD were run directly.
-	cmd.SysProcAttr = wrapSysProcAttr(isTerminal(0))
+	// reach forks of the CMD too. When stdin is zpinit's controlling
+	// terminal the group is put in the foreground, so Ctrl+C and job
+	// control behave as if the CMD were run directly. A tty that is not
+	// the controlling terminal (/dev/console under init=zpinit) is left
+	// alone: asking for the foreground there fails the fork.
+	cmd.SysProcAttr = wrapSysProcAttr(controlsTerminal(0))
 	if cred != nil {
 		cmd.SysProcAttr.Credential = cred
 	}
@@ -167,13 +195,4 @@ func outcomeOf(info reaper.ExitInfo) machine.Outcome {
 		return machine.Outcome{Code: 128 + int(info.Signal), Signal: info.Signal, OOM: info.OOMKilled}
 	}
 	return machine.Outcome{Code: info.ExitCode}
-}
-
-// identityFor resolves machine mode's `user` for the wrap child.
-func identityFor(spec string) (*syscall.Credential, error) {
-	id, err := service.ResolveIdentity(spec)
-	if err != nil {
-		return nil, err
-	}
-	return id.Cred, nil
 }

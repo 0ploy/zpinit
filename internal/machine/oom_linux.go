@@ -8,6 +8,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/0ploy/zpinit/internal/reaper"
 )
 
 // KernelOOM is the reaper's OOM detector in machine mode; see oom.go.
@@ -27,25 +29,29 @@ func (KernelOOM) Now() time.Duration {
 // oomRetry: the OOM killer logs its victim right after sending
 // SIGKILL, so the record is normally there before the reap. One short
 // retry covers the case where the victim is reaped first on another
-// CPU. Only SIGKILL deaths pay it.
+// CPU. Only a batch with an unmatched SIGKILL death pays it, and the
+// reaper runs this off its reap loop.
 const oomRetry = 20 * time.Millisecond
 
-// Killed reports whether the kernel log records an OOM kill of pid
-// since the given time (from Now, taken before the spawn).
-func (k KernelOOM) Killed(pid int, since time.Duration) bool {
+// Killed reports, per candidate, whether the kernel log records an OOM
+// kill of its pid since its Since (from Now, taken before the spawn).
+// The log is read once for the whole batch, and once more only if a
+// candidate is still unmatched.
+func (k KernelOOM) Killed(cands []reaper.OOMCandidate) []bool {
+	out := make([]bool, len(cands))
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
 			time.Sleep(oomRetry)
 		}
 		recs, err := readKmsg()
 		if err != nil {
-			return false
+			return out
 		}
-		if oomKilledIn(recs, pid, since) {
-			return true
+		if attributeOOM(oomVictims(recs), cands, out) {
+			return out
 		}
 	}
-	return false
+	return out
 }
 
 // readKmsg reads every record currently in the kernel log buffer.
