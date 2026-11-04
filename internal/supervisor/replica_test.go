@@ -4,6 +4,9 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/0ploy/zpinit/internal/config"
@@ -185,6 +188,43 @@ func TestExpandServiceToRunners_PlaceholderHonored(t *testing.T) {
 	for i, r := range rs {
 		if r.Cfg().Log.Stderr != "inherit" {
 			t.Errorf("rs[%d] stderr = %q, want inherit", i, r.Cfg().Log.Stderr)
+		}
+	}
+}
+
+// A resource change pushes one flat env to every runner. Each replica
+// must keep its own ZPINIT_REPLICA_INDEX, or the next respawn (the
+// reload_on_change fanout, or a crash restart) runs without it.
+func TestSetResourceEnvKeepsReplicaIndex(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	static := config.Service{Name: "consumer", Filename: "30_consumer.toml", Replicas: config.Replicas{N: 3}}
+	auto := config.Service{Name: "worker", Filename: "40_worker.toml", Replicas: config.Replicas{N: 1, Auto: true}}
+	single := config.Service{Name: "web", Filename: "10_web.toml", Replicas: config.Replicas{N: 1}}
+
+	o := NewOrchestrator(&config.Config{}, []string{"FOO=bar"}, nil, log)
+	o.SetBaseEnvBuilder(func(_, rsrc map[string]string) []string {
+		return []string{"FOO=bar", "ZPINIT_CPU_COUNT=" + rsrc["ZPINIT_CPU_COUNT"]}
+	})
+	var all []*Runner
+	for _, svc := range []config.Service{single, static, auto} {
+		all = append(all, expandServiceToRunners(svc, []string{"FOO=bar"}, nil, nil, log)...)
+	}
+	o.runners = all
+
+	o.SetResourceEnv(map[string]string{"ZPINIT_CPU_COUNT": "2"})
+
+	for _, r := range all {
+		env := r.BaseEnv()
+		if !slices.Contains(env, "ZPINIT_CPU_COUNT=2") {
+			t.Errorf("%s: resource env not applied: %v", r.DisplayName(), env)
+		}
+		idx := "ZPINIT_REPLICA_INDEX=" + strconv.Itoa(r.ReplicaIndex())
+		hasIdx := slices.ContainsFunc(env, func(e string) bool { return strings.HasPrefix(e, "ZPINIT_REPLICA_INDEX=") })
+		switch {
+		case r.Spec().Replicas.IsReplicated() && !slices.Contains(env, idx):
+			t.Errorf("%s: lost %s: %v", r.DisplayName(), idx, env)
+		case !r.Spec().Replicas.IsReplicated() && hasIdx:
+			t.Errorf("%s: single-replica service gained an index: %v", r.DisplayName(), env)
 		}
 	}
 }

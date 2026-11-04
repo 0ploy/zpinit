@@ -39,6 +39,12 @@
 
 ### Fixed
 
+- **Replicas lost `ZPINIT_REPLICA_INDEX` after a resource change.** A
+  CPU or memory limit change (`docker update --cpus`, a Kubernetes
+  in-place resize) stripped the index from every replica's env, so the
+  next restart of a replicated or `replicas = "auto"` service ran
+  without it. Apps that shard work or label logs by index now keep it.
+
 - **A stray signal could kill zpinit.** `kill -SEGV 1`, `-TRAP`, `-ABRT`,
   `-ILL`, `-BUS`, `-FPE`, `-SYS` or `-STKFLT` from inside the container
   ended PID 1 (and so the container) with a Go crash dump. Every

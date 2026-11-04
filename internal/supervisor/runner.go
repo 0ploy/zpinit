@@ -665,13 +665,17 @@ func (r *Runner) MarkReady() {
 	r.mu.Unlock()
 }
 
-// SetBaseEnv replaces the runner's captured baseEnv. Subsequent
-// spawns (after a Stop or a crash-driven restart) will see the new
-// slice. The currently-running child keeps its boot-time env: env
-// is set at exec, not retroactively. Safe to call from outside
-// goroutines — the field is mutated under r.mu so spawnNext's
-// read pairs cleanly.
+// SetBaseEnv replaces the runner's captured baseEnv with the
+// orchestrator-wide env, re-adding this runner's ZPINIT_REPLICA_INDEX
+// for a replicated service (the caller passes one flat slice for every
+// runner; without the recompose a resource change would strip the
+// index from every replica). Subsequent spawns (after a Stop or a
+// crash-driven restart) see the new slice. The currently-running child
+// keeps its boot-time env: env is set at exec, not retroactively. Safe
+// to call from outside goroutines: the field is mutated under r.mu so
+// spawnNext's read pairs cleanly.
 func (r *Runner) SetBaseEnv(env []string) {
+	env = composeReplicaEnv(env, r.replicaIndex, r.spec.Replicas.IsReplicated())
 	r.mu.Lock()
 	r.baseEnv = env
 	r.mu.Unlock()
