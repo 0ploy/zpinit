@@ -1,4 +1,4 @@
-# Dependabot: version updates for the three places this repo pins things.
+# Dependabot: version updates for the places this repo pins things.
 #
 # cooldown holds every new release back for 7 days before Dependabot
 # proposes it, so a release that gets yanked or hotfixed within a week
@@ -56,3 +56,16 @@ updates:
       default-days: 7
     commit-message:
       prefix: "devcontainer"
+
+  # Release image base (digest-pinned alpine in /Dockerfile).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Berlin
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "docker"

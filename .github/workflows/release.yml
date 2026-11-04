@@ -22,6 +22,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          # Newest 1.26.x patch, not whatever the runner has cached:
+          # release binaries embed the standard library and its fixes.
+          check-latest: true
 
       - name: Run tests
         run: go test -race -count=1 ./...

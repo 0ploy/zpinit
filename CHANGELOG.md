@@ -65,6 +65,10 @@
 
 ### Changed
 
+- **The published image is based on Alpine 3.24** (was 3.20, which is
+  past end of life). Only matters if you run `ghcr.io/0ploy/zpinit`
+  itself; `COPY --from` of the binaries is unaffected.
+
 - **The "not running as PID 1" warning is gone.** It fired under tini or
   systemd, where reaping is fine, and stayed silent in the case that is
   actually broken. zpinit now logs a factual `zpinit starting` line

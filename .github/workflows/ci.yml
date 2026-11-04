@@ -40,6 +40,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          # Newest 1.26.x patch, not whatever the runner has cached:
+          # release binaries embed the standard library and its fixes.
+          check-latest: true
       - run: go mod verify
       - run: make lint
       - run: make vuln
@@ -58,6 +61,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          check-latest: true
       - run: go build ./...
       # -race catches the data-race class the v0.3.1 review surfaced and
       # the cgroup/reload/watcher fan-out keeps inviting; -shuffle
@@ -89,6 +93,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          check-latest: true
       # Includes the docker-gated real-PID-1 test (test/integration/
       # pid1_test.go); the ubuntu runner has a docker daemon, so it runs
       # here rather than skipping as it does on a docker-less dev box.
@@ -106,6 +111,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          check-latest: true
       - run: make coverage
       - name: coverage summary
         run: |
