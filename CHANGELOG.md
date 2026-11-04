@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Machine mode: zpinit can be PID 1 of a microVM.** When zpinit is the
+  kernel's own init (PID 1 in the initial PID namespace) it detects it
+  and changes how it starts and ends: Ctrl+Alt+Del becomes a graceful
+  stop, the machine ends with sync, a read-only root and `reboot`
+  instead of an exit that would panic the kernel, a
+  `zpinit: reset ...` line on the console tells the host why, a failed
+  bringup parks the machine in a rescue mode, and an optional host-only
+  exec listener on vsock replaces `docker exec`. Inside the machine,
+  busybox `reboot`, `halt` and `poweroff` are graceful stops, like
+  `zpctl shutdown`. There is no flag; none of it can switch on in a
+  container. See `docs/machine-mode.md`.
+  The exec wire protocol is a public Go package,
+  `github.com/0ploy/zpinit/execproto`, for host-side clients.
+
+- **`--init` keeps zpinit resident above the CMD**, the way tini does
+  (also `ZPINIT_INIT=1`). Wrap mode then forks the CMD instead of
+  exec'ing it, reaps every orphan, forwards signals to the CMD's process
+  group, turns SIGTERM/SIGINT/SIGQUIT into a graceful stop that
+  SIGKILLs after `default_stop_timeout`, and exits with the CMD's status
+  (128+N for a signal). The default stays exec.
+
+- **`max_consecutive_crashes` per service.** Overrides the retry budget
+  of 5 before a crash-looping service goes FATAL; `0` means never give
+  up, like Docker's `--restart always`.
+
+- **`pdeathsig = false` per service** lets a service survive a zpinit
+  restart (by default the kernel kills supervised processes when zpinit
+  dies). Meant for a host-side zpinit whose services must outlive an
+  in-place upgrade; see `docs/security.md` for what it gives up.
+
+- `stop_signal` and `reload_signal` accept every standard signal name
+  (`PWR`, `SEGV`, `XCPU`, ...), not just the common ones.
+
+### Fixed
+
+- **A stray signal could kill zpinit.** `kill -SEGV 1`, `-TRAP`, `-ABRT`,
+  `-ILL`, `-BUS`, `-FPE`, `-SYS` or `-STKFLT` from inside the container
+  ended PID 1 (and so the container) with a Go crash dump. Every
+  catchable signal is now caught for the life of the process.
+
+- **A SIGTERM between entrypoint.d and the start of supervision was
+  fatal.** In that window it killed zpinit outright instead of stopping
+  it gracefully. Stop signals are now caught from startup and honoured
+  in whichever phase they land.
+
+### Changed
+
+- **The "not running as PID 1" warning is gone.** It fired under tini or
+  systemd, where reaping is fine, and stayed silent in the case that is
+  actually broken. zpinit now logs a factual `zpinit starting` line
+  with `pid=N context=container|machine`; the guidance moved to
+  `docs/troubleshooting.md`.
+
+- The boot banner gains `context=container` (or `machine`) and, for
+  `--init`, `init=fork`:
+  `[zpinit 0.8.0] context=container mode=supervise services=4 cpu=8 memory=8GiB`.
+
 ## v0.7.1
 
 ### Added

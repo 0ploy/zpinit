@@ -301,11 +301,16 @@ group = "redis"
 restart = "always"
 
 # Crash backoff. Doubles from initial to max; resets after the service
-# stays up for backoff_reset_after; gives up after 5 consecutive crashes
-# (FATAL state).
+# stays up for backoff_reset_after; gives up after
+# max_consecutive_crashes consecutive crashes (FATAL state).
 backoff_initial     = "1s"
 backoff_max         = "30s"
 backoff_reset_after = "60s"
+
+# Retry budget before FATAL. Default 5. 0 means never give up, the
+# equivalent of Docker's `--restart always`: the service backs off at
+# backoff_max forever instead of going FATAL.
+max_consecutive_crashes = 5
 
 # What this service failing its INITIAL boot does to the container.
 # "fail" (default) aborts PID 1 with exit 1, so an orchestrator sees a
@@ -322,9 +327,17 @@ backoff_reset_after = "60s"
 # container.
 on_boot_failure = "fail"
 
-# Graceful stop. Falls back to globals if unset.
-stop_signal  = "TERM"   # or "INT", "QUIT", "USR1", "HUP", ...
+# Graceful stop. Falls back to globals if unset. Any standard signal
+# name, with or without the SIG prefix.
+stop_signal  = "TERM"   # or "INT", "QUIT", "USR1", "HUP", "PWR", ...
 stop_timeout = "10s"
+
+# Default true: the service gets SIGKILL from the kernel if zpinit
+# itself dies, so nothing outlives its supervisor. Set false only for a
+# process that must survive a zpinit restart (a host-side zpinit
+# supervising long-lived shims that are re-adopted after an in-place
+# upgrade). See docs/security.md.
+pdeathsig = true
 
 # Default true. Set false if the service should be left alone across
 # config reloads (a long-running batch job, for example).

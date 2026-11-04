@@ -36,7 +36,8 @@ commit when the topic changes.
 ## Load-Bearing Design Rules
 
 **CMD wins over services.** A non-empty CMD (after `flag.Args()`) makes
-zpinit `syscall.Exec` it and ignore `services/`. No CMD means supervise
+zpinit `syscall.Exec` it (fork and stay resident with `--init`, always
+in machine mode) and ignore `services/`. No CMD means supervise
 mode, even with an empty `services/`: the control socket comes up and an
 operator can add services via `zpctl reread` or SIGHUP. Same image yields
 three modes from this rule: production (no CMD, supervise), debug
@@ -61,6 +62,30 @@ accepted connection is gated by `SO_PEERCRED` (`authorizePeer` in
 effective UID. Linux only; the macOS dev stub returns nil. If you loosen
 socket perms to allow non-root operators, lift the peer-cred check rather
 than widen the chmod.
+
+**Machine mode is detected, never configured.** PID 1 in the kernel's
+initial PID namespace (`machine.Detect`) is the only switch for
+`reboot(2)`, the vsock exec listener and reading `machine.json`. Never
+add a flag or env var for it: that is what keeps a container from ever
+rebooting or opening a root exec listener reachable by a hypervisor.
+In `main`, every way out goes through the `exit` closure (which calls
+`machine.End`, never returning); a bare `os.Exit` or `return` on a
+machine-reachable path panics the guest kernel.
+
+**Stop signals come from the stop latch** (`cmd/zpinit/signals.go`),
+installed at startup and shared by every phase; the sink catches the
+rest. Don't add per-phase `signal.Notify` for TERM/INT/QUIT or a
+`signal.Ignore` anywhere (SIG_IGN survives the wrap exec). USR1/USR2
+are stop signals in machine mode only (busybox `halt`/`poweroff`); in a
+container they must stay forwardable to an `--init` CMD.
+
+**`execproto` and the reset line are published contracts.** Host-side
+clients import `execproto` (the only package outside `internal/`) and
+match `zpinit: reset ` on the serial port. Change either only
+additively; an incompatible exec change bumps `execproto.Version`, an
+incompatible reset line needs a new prefix. zpinit names no particular
+host or bringup init: they depend on zpinit, never the reverse. `TestWireValuesPinned` and
+`TestResetLineFitsHostBuffer` guard them: fix the code, not the test.
 
 ## Non-Goals (push back, don't code)
 No log rotation (use logrotate or stdout-to-host-logging), no log capture
@@ -145,6 +170,12 @@ change observable behavior, it was never quiet; give it an entry.
    the public release; never do this without an explicit go-ahead.
 
 ## Gotchas
+
+- entrypoint.d waits on its scripts with `cmd.Wait`, so the SIGCHLD
+  reaper loop (`startReapLoop`), and everything that spawns through
+  the reaper (services, the `--init` CMD, vsock exec sessions), must
+  start after entrypoint.d returns. A concurrent `wait4(-1)` steals
+  the scripts' exit codes.
 
 - `ZPINIT_ENV_FILE` is an internal/test override for the env-file path.
   Production always reads `/run/zpinit/env`. Don't expose it in

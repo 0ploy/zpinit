@@ -68,13 +68,18 @@ Once your service set is right, bake the TOML into your own image.
 ## The three modes
 
 zpinit detects the mode from your CMD at startup. Same binary, three
-behaviors, no flags.
+behaviors, no mode flag.
 
 | Mode                                            | When zpinit picks it          | Replaces                |
 | ----------------------------------------------- | ----------------------------- | ----------------------- |
 | [1. Single Process](#1-single-process-mode)     | CMD provided, no setup needed | tini                    |
 | [2. Setup, then Run](#2-setup-then-run-mode)    | CMD provided, `entrypoint.d/` populated | `docker-entrypoint.sh` |
 | [3. Manage Services](#3-manage-services-mode)   | No CMD, `services/` populated | supervisord, PM2        |
+
+Two things sit across the modes rather than adding to them. `--init`
+makes modes 1 and 2 fork the CMD and stay resident above it instead of
+exec'ing it. And when zpinit is the kernel's own init (a microVM), it
+runs the same three modes in [machine mode](#as-the-kernels-init-microvms).
 
 ### 1. Single Process Mode
 
@@ -103,16 +108,27 @@ API_KEY   = "xxxxxxxxxxxxx"
 LOG_LEVEL = "info"
 ```
 
-If your workload doesn't reap its own children, use
-[Manage Services Mode](#3-manage-services-mode) with one entry instead:
-zpinit stays as PID 1 and reaps for you.
+If your workload doesn't reap its own children, add `--init` (or set
+`ZPINIT_INIT=1`): zpinit then forks the CMD instead of exec'ing it and
+stays resident above it, the way tini does. It reaps every orphan,
+forwards signals to the CMD's process group, turns SIGTERM/SIGINT/
+SIGQUIT into a graceful stop that SIGKILLs after
+`default_stop_timeout`, and exits with the CMD's status (128+N if a
+signal killed it). The default stays exec, because forking changes the
+workload's PID.
+
+```dockerfile
+ENTRYPOINT ["zpinit", "--init"]
+CMD ["my-app", "--port", "8080"]
+```
 
 ### 2. Setup, then Run Mode
 
 zpinit runs every executable in `/etc/zpinit/entrypoint.d/` in
 lexicographic order (each with `entrypoint_script_timeout` applied),
-drains zombies between steps, then `syscall.Exec`s your CMD. A
-non-zero exit aborts boot unless `entrypoint_on_failure = "continue"`.
+drains zombies between steps, then `syscall.Exec`s your CMD (or forks
+it, with `--init`). A non-zero exit aborts boot unless
+`entrypoint_on_failure = "continue"`.
 
 *Example Dockerfile:*
 ```dockerfile
@@ -302,16 +318,35 @@ See [docs/clustering.md § Auto-scaled replicas](docs/clustering.md)
 and the `[resources]` block in
 [docs/configuration.md](docs/configuration.md).
 
+## As the kernel's init (microVMs)
+
+zpinit can also be PID 1 of a whole machine: a Firecracker microVM
+whose guest init hands over to it, or anything booted with
+`init=zpinit`. It detects this on its own (PID 1 in the kernel's
+initial PID namespace) and switches to **machine mode**: Ctrl+Alt+Del
+becomes a graceful stop, the machine ends with sync and reboot instead
+of an exit (which would panic the kernel), the wrap-mode CMD always
+runs as a child, and an optional host-only exec listener on vsock
+replaces `docker exec`. The mode still comes from the CMD: supervise
+mode runs the image's own services, wrap mode its CMD. There is no
+flag; in a container none of it can switch on. Inside the machine,
+busybox `reboot`/`halt`/`poweroff` and `zpctl shutdown` stop it
+gracefully, and the host's restart policy decides whether it comes
+back; systemd's `reboot` cannot reach zpinit. See
+[docs/machine-mode.md](docs/machine-mode.md).
+
 ## Boot banner
 
 Every zpinit start emits one line to stderr (visible in `docker logs`)
 before dispatch:
 
 ```
-[zpinit 0.4.0] mode=supervise services=4 cpu=8 memory=8GiB
+[zpinit 0.8.0] context=container mode=supervise services=4 cpu=8 memory=8GiB
 ```
 
-Mode 1 (wrap) shows `argv=` instead of `services=`. Set
+`context=` is `container`, or `machine` when zpinit is the kernel's
+init. Mode 1 (wrap) shows `argv=` instead of `services=`, preceded by
+`init=fork` with `--init`. Set
 `ZPINIT_NO_BANNER=1` if a noise-sensitive workload needs a clean
 stderr stream.
 
@@ -441,6 +476,7 @@ appears in the boot banner.
 - [docs/architecture.md](docs/architecture.md): packages, state machine, reload internals.
 - [docs/security.md](docs/security.md): threat model, control socket, env injection.
 - [docs/troubleshooting.md](docs/troubleshooting.md): symptom-indexed runbook for live containers.
+- [docs/machine-mode.md](docs/machine-mode.md): zpinit as the kernel's init in a microVM: detection, `machine.json`, teardown, reset line, rescue, vsock exec.
 - [docs/development.md](docs/development.md): build, test, contribute.
 
 ## License

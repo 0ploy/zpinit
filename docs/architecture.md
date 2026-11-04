@@ -27,9 +27,9 @@ pending → starting → running → stopping → stopped
 ```
 
 Backoff doubles from `backoff_initial` to `backoff_max`, resets after
-the service stays up for `backoff_reset_after`, and gives up after 5
-consecutive crashes (FATAL). The retry budget is hardcoded
-(`MaxConsecutiveCrashes = 5`).
+the service stays up for `backoff_reset_after`, and gives up after
+`max_consecutive_crashes` consecutive crashes (default 5; `0` never
+gives up) with FATAL.
 
 ## Boot sequence
 
@@ -39,7 +39,9 @@ consecutive crashes (FATAL). The retry budget is hardcoded
    `key=value` to `/run/zpinit/env` to propagate env to services.
 2. **Mode detection.** If `flag.Args()` is non-empty after zpinit
    parses its own flags, a CMD was provided: zpinit `syscall.Exec`s
-   it as PID 1 and ignores `services/`.
+   it as PID 1 and ignores `services/`. With `--init` (or
+   `ZPINIT_INIT=1`, and always in machine mode) it forks the CMD
+   instead and stays resident above it; see "Resident wrap" below.
 3. **Resource detection.** `internal/resources` resolves this
    process's own cgroup directory from `/proc/self/cgroup` +
    `/proc/self/mountinfo` (the cgroupfs mount root is only the
@@ -235,10 +237,8 @@ was signaled).
 
 `SIGTERM`, `SIGINT`, or `SIGQUIT` to PID 1 triggers `stopAll`
 (`SIGQUIT` for supervisord parity: operators use `kill -QUIT` there
-for graceful shutdown). `SIGUSR1`/`SIGUSR2` are discarded rather than
-left at the Go default of killing the process; `SIGHUP` during the
-entrypoint phase is discarded too (reload only makes sense once
-services are supervised). Once shutdown begins, mutating control
+for graceful shutdown). See "Signals" below for how every other
+signal is kept from killing PID 1. Once shutdown begins, mutating control
 verbs (`start`, `restart`, `update`, reloads, autoscale commits) are
 refused and the control socket stops accepting connections, so no
 service can be spawned into a teardown that would never stop it
@@ -277,6 +277,65 @@ already proceeding at full speed and per-runner `SIGKILL` escalation
 is the accelerator. For an immediate hard kill, use the runtime's
 (`docker stop -t 0`); Pdeathsig takes the children down with PID 1.
 
+## Signals
+
+Two catchers are installed at startup and live for the whole process
+(`cmd/zpinit/signals.go`):
+
+- **The stop latch** catches `SIGTERM`, `SIGINT` and `SIGQUIT` and
+  latches the first one. Every phase watches the same latch: the
+  entrypoint.d context, the resident wrap, the supervise loop and
+  rescue. A stop landing between two phases is therefore neither lost
+  nor fatal. (Before the latch, a `SIGTERM` between entrypoint.d and
+  the supervise loop's `Notify` killed the process outright.) Later
+  stop signals are swallowed: the graceful stop is already running.
+  In machine mode it also catches `SIGUSR1` and `SIGUSR2`, busybox's
+  `halt` and `poweroff` requests to PID 1, which leave the sink there
+  ([machine-mode.md](machine-mode.md#reboot-halt-and-poweroff-inside-the-machine)).
+- **The sink** catches every other catchable signal except the ones
+  whose default is to be ignored or to stop the process (`CHLD`,
+  `URG`, `CONT`, `TSTP`, `TTIN`, `TTOU`, `WINCH`) and 32 to 34. Without
+  a `Notify`, the Go runtime ends the process on `HUP`, and on `QUIT`,
+  `ILL`, `TRAP`, `ABRT`, `BUS`, `FPE`, `SEGV`, `STKFLT` and `SYS` when
+  they are sent by `kill` (a real fault still panics). For a
+  container's init that is an abrupt death; for the kernel's init it is
+  a kernel panic. The sink discards, or in the resident wrap forwards
+  to the CMD's process group (all but `SIGPIPE`).
+
+Both use `Notify`, never `signal.Ignore`: `SIG_IGN` survives `execve`
+and would hand the wrap-mode CMD a polluted disposition table, while a
+caught signal resets to its default across the exec. Container mode
+installs them after the one-shot commands (`--version`, `--doctor`,
+`--plan`, `--check-config`), which stay interruptible.
+
+## Resident wrap (`--init`)
+
+Wrap mode normally `syscall.Exec`s the CMD. With `--init` (or
+`ZPINIT_INIT=1`) it forks it instead, the way tini does: the CMD runs
+in its own process group (put in the terminal's foreground when stdin
+is a tty, so job control and Ctrl+C behave as if it ran directly) with
+`Pdeathsig: SIGKILL`, and zpinit stays as PID 1 running the reaper
+loop. A stop signal is forwarded to the group (as received in a
+container; machine mode sends the image's stop signal instead), then
+`SIGKILL` after `default_stop_timeout` (machine mode: the machine's
+stop timeout). zpinit exits with the CMD's status, `128 + N` for a
+signal. It is a flag rather than a fourth mode because exec-vs-fork is
+orthogonal to whether entrypoint.d ran. Default stays exec, since
+forking changes the workload's PID and signal semantics.
+
+## Machine mode
+
+When zpinit is the kernel's own init it runs in machine mode; see
+[machine-mode.md](machine-mode.md) for the contract (detection,
+`machine.json`, Ctrl+Alt+Del, teardown, the reset line, rescue, vsock
+exec). In the code it is a thin layer: `internal/machine` (detection,
+settings, `End`), `internal/vsockexec` (the exec listener; its wire codec is the
+public `execproto` package, the one package outside `internal/`,
+because host-side clients and test harnesses import it), and
+`cmd/zpinit/machinemode.go`. `main` routes every way out through one
+`exit` closure, which in machine mode calls `machine.End` instead of
+`os.Exit`, so no path returns from PID 1.
+
 ## Reaping
 
 One `wait4(-1, WNOHANG)` site, in `internal/reaper.Reap`, dispatched
@@ -288,6 +347,14 @@ same way.
 `SpawnTracked` holds its mutex across `cmd.Start()` so the new PID is
 registered atomically, closing the spawn-then-track race for
 fast-dying children.
+
+The SIGCHLD loop (`startReapLoop`) runs in supervise mode, the
+resident wrap and rescue. It starts only after entrypoint.d finishes,
+because entrypoint.d still waits on its scripts with `cmd.Wait` (no
+reaper exists that early); a concurrent `wait4(-1)` would steal their
+exit codes. Anything that spawns through the reaper (services, the
+resident wrap's CMD, vsock exec sessions) therefore starts after
+entrypoint.d too.
 
 ## Control protocol
 

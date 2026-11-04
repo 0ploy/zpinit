@@ -105,6 +105,53 @@ zpinit does not try to scrub `/proc/<pid>/environ`; doing so is not
 possible from userspace once the process has started. The mitigation
 is operator hygiene, not runtime enforcement.
 
+## Parent-death signal and `pdeathsig = false`
+
+Every supervised child gets `Pdeathsig: SIGKILL`: if zpinit dies, the
+kernel kills its children, so nothing keeps running without a
+supervisor. A service can opt out with `pdeathsig = false`. Such a
+service **outlives its supervisor**: after a zpinit crash or restart
+it keeps running with no zpinit tracking it, and a restarted zpinit
+starts a second copy unless the service itself guards against that
+(a pidfile, a lock, re-adoption). The opt-out exists for a host-side
+zpinit supervising long-lived per-VM shims, where an in-place zpinit
+upgrade must not take every VM down; it has no use inside an ordinary
+container.
+
+## Machine mode
+
+As the kernel's init (see [machine-mode.md](machine-mode.md)) zpinit
+gains three powers a container must never have: `reboot(2)`, a vsock
+listener that runs commands as root, and acting on
+`/run/zpinit/machine.json`. All three are gated on detection alone
+(PID 1 in the kernel's initial PID namespace), never on a flag or an
+environment variable, so a container cannot switch them on by mistake.
+A container cannot change its PID namespace link; faking it by
+mounting over its own `/proc` only fools that container's own zpinit,
+which still is not the kernel's init and gets `EPERM`/`EINVAL` from
+`reboot`. A fooled zpinit would also open the vsock exec listener if a
+planted `machine.json` has an `exec` block, which is why the fake needs
+control of the container's own `/proc` and PID 1 to begin with: it buys
+nothing that container did not already have, except reachability from
+a hypervisor when the host is itself a VM.
+
+- **`machine.json` in a container** is reported with a warning and
+  never read. In machine mode it is decoded strictly; a file that fails
+  validation parks the machine and opens no exec listener.
+- **vsock exec** accepts only peer CID 2 (the host). vsock has no peer
+  credentials, so this is the whole authentication; a local process
+  connecting over vsock loopback (CID 1) is refused. It is opened only
+  with an `exec` block in `machine.json`, a double gate because vsock is
+  not network-namespaced: in a container on a host that is itself a VM,
+  a listener would be reachable from that VM's hypervisor.
+- **The reset line is forgeable** by anything that can write the
+  console. That is acceptable only because it carries nothing the host
+  acts on more strongly than "the guest wants to end", which the guest
+  can always achieve by exiting.
+- An exec session's process group is killed when its connection drops.
+  A process that leaves the group with its own `setsid` survives until
+  the machine ends, as a daemonised process would under `docker exec`.
+
 ## Non-goals
 
 zpinit does not provide:

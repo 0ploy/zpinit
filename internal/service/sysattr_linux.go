@@ -15,9 +15,13 @@ import "syscall"
 // in zpinit calls runtime.LockOSThread (a locked goroutine's exit kills
 // its thread, which would SIGKILL every child spawned from it). If a
 // future change needs LockOSThread, spawning must move off that thread.
-func baseSysProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{
-		Setpgid:   true,
-		Pdeathsig: syscall.SIGKILL,
+//
+// pdeathsig false (a service's `pdeathsig = false`) leaves the child
+// without it, so it outlives a zpinit restart.
+func baseSysProcAttr(pdeathsig bool) *syscall.SysProcAttr {
+	a := &syscall.SysProcAttr{Setpgid: true}
+	if pdeathsig {
+		a.Pdeathsig = syscall.SIGKILL
 	}
+	return a
 }

@@ -11,11 +11,13 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 	"time"
 
 	"github.com/0ploy/zpinit/internal/config"
 	"github.com/0ploy/zpinit/internal/entrypoint"
+	"github.com/0ploy/zpinit/internal/machine"
 	"github.com/0ploy/zpinit/internal/reaper"
 	"github.com/0ploy/zpinit/internal/resources"
 	"github.com/0ploy/zpinit/internal/supervisor"
@@ -29,11 +31,35 @@ const (
 )
 
 func main() {
+	// Machine mode is detected, never configured: zpinit is the kernel's
+	// own init. Its first acts, before flag parsing or anything that can
+	// fail: catch the stop signals (Ctrl+Alt+Del is about to arrive as
+	// SIGINT, and an uncaught SIGINT would end PID 1, i.e. panic the
+	// kernel), then switch Ctrl+Alt+Del from "reset now" to that SIGINT.
+	isMachine := machine.Detect()
+	var (
+		latch  *stopLatch
+		sink   *signalSink
+		cadErr error
+	)
+	if isMachine {
+		latch = installStopLatch(true)
+		sink = installSignalSink(true)
+		cadErr = machine.DisableCAD()
+	}
+
+	// The default ExitOnError would os.Exit(2) on a bad flag, which for
+	// the kernel's init is a kernel panic. In machine mode a flag error
+	// goes through the same ending as everything else (below).
+	if isMachine {
+		flag.CommandLine.Init(os.Args[0], flag.ContinueOnError)
+	}
 	var (
 		showVersion    bool
 		checkConfig    string
 		configDir      string
 		skipEntrypoint bool
+		initFlag       bool
 		doctorFlag     bool
 		doctorQuiet    bool
 		planFlag       bool
@@ -42,26 +68,70 @@ func main() {
 	flag.StringVar(&checkConfig, "check-config", "", "validate configuration in `dir` and exit")
 	flag.StringVar(&configDir, "config", defaultConfigDir, "configuration `dir`")
 	flag.BoolVar(&skipEntrypoint, "skip-entrypoint", false, "skip entrypoint.d scripts (useful for `docker run image bash` debug shells)")
+	flag.BoolVar(&initFlag, "init", false, "wrap mode: stay resident above the CMD (fork it, reap, forward signals, exit with its status) instead of exec'ing it; also ZPINIT_INIT=1")
 	flag.BoolVar(&doctorFlag, "doctor", false, "run the pre-flight environment audit and exit (filesystem, config, runtimes, state)")
 	flag.BoolVar(&doctorQuiet, "doctor-quiet", false, "with --doctor: suppress OK rows in the output")
 	flag.BoolVar(&planFlag, "plan", false, "print the resolved boot plan and exit (dry-run; no exec, no spawn, no entrypoint.d)")
-	flag.Parse()
+	flagErr := flag.CommandLine.Parse(os.Args[1:])
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	// In machine mode nothing may simply exit: PID 1 returning panics
+	// the kernel and loses unsynced writes. Every way out goes through
+	// machine.End, which tears down, syncs, writes the reset line and
+	// reboots. ms is replaced by the real settings once they are read.
+	ms := machine.Defaults()
+	exit := func(o machine.Outcome) {
+		if isMachine {
+			machine.End(log, ms, o)
+		}
+		os.Exit(o.Code)
+	}
+	if isMachine {
+		// A panic on the main goroutine still ends the machine cleanly.
+		// (One on another goroutine cannot be recovered; the kernel
+		// then panics, and with panic=1 the VM still ends.)
+		defer func() {
+			if p := recover(); p != nil {
+				log.Error("zpinit panic", "panic", p, "stack", string(debug.Stack()))
+				machine.End(log, ms, machine.Outcome{Cause: machine.CauseExit, Code: 2})
+			}
+		}()
+	}
+
+	if flagErr != nil {
+		// Only reachable in machine mode; the usage text is already out.
+		log.Error("invalid command line", "err", flagErr)
+		exit(machine.Outcome{Cause: machine.CauseExit, Code: 2})
+		return
+	}
 
 	if showVersion {
 		fmt.Println(version)
+		exit(machine.Outcome{Cause: machine.CauseExit})
 		return
 	}
 
 	if checkConfig != "" {
-		os.Exit(runCheckConfig(checkConfig))
+		exit(machine.Outcome{Cause: machine.CauseExit, Code: runCheckConfig(checkConfig)})
+		return
 	}
 
 	if doctorFlag {
-		os.Exit(runDoctor(configDir, doctorQuiet))
+		exit(machine.Outcome{Cause: machine.CauseExit, Code: runDoctor(configDir, doctorQuiet)})
+		return
 	}
 
 	if planFlag {
-		os.Exit(runPlan(configDir, flag.Args()))
+		exit(machine.Outcome{Cause: machine.CauseExit, Code: runPlan(configDir, flag.Args())})
+		return
+	}
+
+	// Container mode installs its catchers here, after the one-shot
+	// commands above, which stay interruptible with Ctrl+C.
+	if !isMachine {
+		latch = installStopLatch(false)
+		sink = installSignalSink(false)
 	}
 
 	// Track whether --config was passed explicitly so missing-dir
@@ -74,13 +144,66 @@ func main() {
 		}
 	})
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	ctxName := "container"
+	if isMachine {
+		ctxName = "machine"
+	}
+	// Being PID 1 only adds orphan reaping; zpinit always reaps its own
+	// children. So this is a fact for the log, not a warning.
+	log.Info("zpinit starting", "version", version, "pid", os.Getpid(), "context", ctxName)
 
-	if pid := os.Getpid(); pid != 1 {
-		log.Warn("zpinit is not running as PID 1; orphan reaping is unreliable outside containers", "pid", pid)
+	opts := runOpts{
+		configDir:      configDir,
+		configExplicit: configExplicit,
+		cmdline:        flag.Args(),
+		skipEntrypoint: skipEntrypoint,
+		init:           initFlag || os.Getenv("ZPINIT_INIT") == "1",
+		latch:          latch,
+		sink:           sink,
 	}
 
-	os.Exit(run(log, configDir, configExplicit, flag.Args(), skipEntrypoint))
+	if isMachine {
+		if cadErr != nil {
+			log.Error("could not route Ctrl+Alt+Del to zpinit; a host graceful stop will reset the machine at once", "err", cadErr)
+		}
+		settings, err := machine.Load(machine.SettingsPath)
+		if err != nil {
+			log.Error("machine settings unusable; parking the machine", "err", err)
+		}
+		ms = settings
+		opts.machine = ms
+		// Machine mode forces the resident wrap: PID 1 must never be
+		// replaced by a workload whose exit would panic the kernel.
+		opts.init = true
+		if ms.Rescue != nil {
+			exit(runPark(log, ms, latch))
+			return
+		}
+	} else if machine.WarnIfPresent(machine.SettingsPath) {
+		log.Warn("machine settings file present but zpinit is not the kernel's init; ignoring it", "path", machine.SettingsPath)
+	}
+
+	o := run(log, opts)
+	o.Cause = machine.CauseExit
+	if latch.requested.Load() {
+		o.Cause = machine.CauseStop
+	}
+	exit(o)
+}
+
+// runOpts is everything run needs from main.
+type runOpts struct {
+	configDir      string
+	configExplicit bool
+	cmdline        []string
+	skipEntrypoint bool
+	// init selects the resident (fork) wrap over exec. Forced in
+	// machine mode.
+	init  bool
+	latch *stopLatch
+	sink  *signalSink
+	// machine is the machine settings; nil in container mode.
+	machine *machine.Settings
 }
 
 func runCheckConfig(dir string) int {
@@ -104,7 +227,9 @@ func runCheckConfig(dir string) int {
 	return 0
 }
 
-func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []string, skipEntrypoint bool) int {
+func run(log *slog.Logger, opts runOpts) machine.Outcome {
+	configDir, configExplicit, cmdline := opts.configDir, opts.configExplicit, opts.cmdline
+	fail := func(code int) machine.Outcome { return machine.Outcome{Code: code} }
 	// Self-bootstrap the default config dir so a freshly-pulled image
 	// (or fresh install) just works: an operator can drop service files
 	// into /etc/zpinit/services/ and zpctl-reread them in without first
@@ -132,7 +257,7 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 			cfg = config.NewEmpty(configDir)
 		} else {
 			fmt.Fprintln(os.Stderr, err)
-			return 1
+			return fail(1)
 		}
 	}
 	for _, w := range cfg.Warnings {
@@ -147,18 +272,6 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 
 	r := reaper.New(log)
 
-	// SIGHUP/SIGUSR1/SIGUSR2 must never kill PID 1: the Go default for
-	// un-notified signals is process death, so a "reload" habit sent
-	// during the entrypoint phase (or a stray USR1) would take the
-	// container down mid-provisioning. Route them to a channel nobody
-	// reads (buffered; overflow is silently dropped) instead of
-	// signal.Ignore: Ignore installs SIG_IGN, which survives the wrap-
-	// mode exec and would hand the CMD a polluted disposition table.
-	// runSupervise later Notifies SIGHUP onto its own channel for
-	// reload handling; duplicate delivery here is harmless.
-	sigDiscard := make(chan os.Signal, 4)
-	signal.Notify(sigDiscard, syscall.SIGHUP, syscall.SIGUSR1, syscall.SIGUSR2)
-
 	// Layered env composition: globals.Env (lowest) under container env.
 	// entrypoint.d scripts can write further overrides to /run/zpinit/env,
 	// which run on top. Container env beats globals.Env so an operator
@@ -166,10 +279,10 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 	containerEnv := entrypoint.MapFromEnviron(os.Environ())
 	initialEnv := layeredMerge(cfg.Globals.Env, containerEnv)
 
-	finalEnv, err := runEntrypoint(log, configDir, cfg, skipEntrypoint, initialEnv)
+	finalEnv, err := runEntrypoint(log, configDir, cfg, opts.skipEntrypoint, initialEnv, opts.latch)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return 1
+		return fail(1)
 	}
 
 	// Drain any zombies produced by entrypoint.d (double-forked daemons,
@@ -195,9 +308,12 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 		"cpu_quota", resourceEnv[resources.EnvCPUQuota],
 		"memory_bytes", snap.MemoryBytes,
 	)
-	if !snap.CgroupResolved {
+	if !snap.CgroupResolved && opts.machine == nil {
 		// We could not tie this process to its own cgroup, so the
 		// numbers above may be the HOST's rather than the container's.
+		// (Not in machine mode: there is no host view to confuse with
+		// ours, the machine's own vCPUs and RAM are the budget.)
+		//
 		// Loud because the failure is silent otherwise and skews
 		// everything downstream: replicas = "auto" over-scales, and
 		// apps sizing heaps or worker pools from ZPINIT_MEMORY_BYTES /
@@ -215,12 +331,22 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 	// Operators can opt out with ZPINIT_NO_BANNER=1 for noise-sensitive
 	// workloads.
 	if os.Getenv("ZPINIT_NO_BANNER") != "1" {
-		printBootBanner(cmdline, cfg, snap)
+		printBootBanner(cmdline, cfg, snap, opts)
 	}
 
 	switch detectMode(cmdline) {
 	case modeWrap:
-		return execCmd(log, cmdline, bootEnv)
+		if opts.init {
+			return runWrapInit(log, cfg, cmdline, bootEnv, r, opts)
+		}
+		// A stop that arrived after entrypoint.d but before the exec
+		// would otherwise be lost (the latch caught it, and the exec'd
+		// CMD resets the handler). Report it the way dying of it would
+		// have.
+		if sig, ok := opts.latch.Signal().(syscall.Signal); ok {
+			return machine.Outcome{Code: 128 + int(sig), Signal: sig}
+		}
+		return fail(execCmd(log, cmdline, bootEnv))
 	case modeSupervise:
 		// scriptEnv is the delta entrypoint.d wrote to /run/zpinit/env
 		// (or set on its own children that bubbled up via the env
@@ -229,9 +355,9 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 		// scripts: newBaseEnv = newGlobals.Env + containerEnv +
 		// scriptEnv + resourceEnv.
 		scriptEnv := envDelta(initialEnv, finalEnv)
-		return runSupervise(log, configDir, cfg, bootEnv, containerEnv, scriptEnv, resourceEnv, snap, r)
+		return fail(runSupervise(log, configDir, cfg, bootEnv, containerEnv, scriptEnv, resourceEnv, snap, r, opts))
 	}
-	return 1 // unreachable
+	return fail(1) // unreachable
 }
 
 // printBootBanner emits the one-line "what zpinit is about to do"
@@ -244,19 +370,26 @@ func run(log *slog.Logger, configDir string, configExplicit bool, cmdline []stri
 // memory come from the already-reserved snapshot so they reflect
 // what services will actually see (matches ZPINIT_CPU_COUNT /
 // ZPINIT_MEMORY_BYTES).
-func printBootBanner(cmdline []string, cfg *config.Config, snap resources.Snapshot) {
+func printBootBanner(cmdline []string, cfg *config.Config, snap resources.Snapshot, opts runOpts) {
 	mode := "supervise"
 	tail := fmt.Sprintf("services=%d", len(cfg.Services))
 	if len(cmdline) > 0 {
 		mode = "wrap"
 		tail = fmt.Sprintf("argv=%q", cmdline)
+		if opts.init {
+			tail = "init=fork " + tail
+		}
+	}
+	ctxName := "container"
+	if opts.machine != nil {
+		ctxName = "machine"
 	}
 	mem := "unlimited"
 	if snap.MemoryBytes > 0 {
 		mem = formatMemoryBanner(snap.MemoryBytes)
 	}
-	fmt.Fprintf(os.Stderr, "[zpinit %s] mode=%s %s cpu=%d memory=%s\n",
-		version, mode, tail, snap.CPUCount, mem)
+	fmt.Fprintf(os.Stderr, "[zpinit %s] context=%s mode=%s %s cpu=%d memory=%s\n",
+		version, ctxName, mode, tail, snap.CPUCount, mem)
 }
 
 // formatMemoryBanner renders a byte count for the boot banner.
@@ -324,7 +457,7 @@ func detectMode(cmdline []string) mode {
 	return modeSupervise
 }
 
-func runEntrypoint(log *slog.Logger, configDir string, cfg *config.Config, skipFlag bool, initialEnv map[string]string) (map[string]string, error) {
+func runEntrypoint(log *slog.Logger, configDir string, cfg *config.Config, skipFlag bool, initialEnv map[string]string, latch *stopLatch) (map[string]string, error) {
 	if skipFlag {
 		log.Info("--skip-entrypoint set; skipping entrypoint.d")
 		// Return the layered initial env so globals.Env still reaches
@@ -345,12 +478,9 @@ func runEntrypoint(log *slog.Logger, configDir string, cfg *config.Config, skipF
 		envFile = v
 	}
 
-	// SIGQUIT is included for supervisord parity: `docker kill -s QUIT`
-	// means "graceful shutdown" to operators coming from there, and the
-	// Go default (goroutine dump + exit 2) would be the hardest possible
-	// kill instead.
-	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
-	defer stopSignals()
+	// A stop signal (see stopSignals) aborts the running script.
+	ctx, cancel := latch.Context()
+	defer cancel()
 
 	return entrypoint.Run(ctx, entrypoint.Config{
 		Dir:           filepath.Join(configDir, "entrypoint.d"),
@@ -386,8 +516,9 @@ func execCmd(log *slog.Logger, cmdline []string, env map[string]string) int {
 }
 
 // runSupervise is the supervise-mode entry point. It splits signals
-// onto two channels: SIGCHLD goes to a dedicated reaper goroutine that
-// runs throughout shutdown, and SIGTERM/INT/HUP/QUIT go to the
+// onto separate channels: SIGCHLD goes to a dedicated reaper goroutine
+// (startReapLoop) that runs throughout shutdown, the stop signals
+// (TERM/INT/QUIT) arrive through the stop latch, and SIGHUP goes to the
 // user-signal loop here. The split is load-bearing: if reaping shared a channel
 // with shutdown, the SIGTERM handler's wait for orchestrator exit would
 // block reading SIGCHLDs, the reaper would stop, and child Exit
@@ -395,44 +526,16 @@ func execCmd(log *slog.Logger, cmdline []string, env map[string]string) int {
 //
 // SIGHUP triggers a reload via orchestrator.Reload (Phase 7): re-load
 // config from disk, diff against the running set, apply add/remove/restart.
-func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env map[string]string, containerEnv, scriptEnv, resourceEnv map[string]string, snap resources.Snapshot, r *reaper.Reaper) int {
-	chldCh := make(chan os.Signal, 16)
-	signal.Notify(chldCh, syscall.SIGCHLD)
+func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env map[string]string, containerEnv, scriptEnv, resourceEnv map[string]string, snap resources.Snapshot, r *reaper.Reaper, opts runOpts) int {
+	// Stop signals arrive through opts.latch, installed at startup so
+	// none is lost between phases; only SIGHUP (reload) is ours here.
 	userCh := make(chan os.Signal, 8)
-	signal.Notify(userCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
+	signal.Notify(userCh, syscall.SIGHUP)
 
-	reaperStop := make(chan struct{})
-	reaperDone := make(chan struct{})
-	// Reap is wrapped with recover() so an unforeseen panic doesn't
-	// take the entire SIGCHLD handler offline (which would silently
-	// wedge every Runner waiting on its child's Exit channel). The
-	// recover survives, the loop continues, and the next SIGCHLD
-	// retries.
-	safeReap := func() {
-		defer func() {
-			if p := recover(); p != nil {
-				log.Error("reaper panic; continuing", "panic", p)
-			}
-		}()
-		r.Reap()
-	}
-	go func() {
-		defer close(reaperDone)
-		for {
-			select {
-			case <-chldCh:
-				safeReap()
-			case <-reaperStop:
-				safeReap() // final drain
-				return
-			}
-		}
-	}()
+	stopReap := startReapLoop(log, r)
 	cleanup := func() {
-		close(reaperStop)
-		<-reaperDone
+		stopReap()
 		signal.Stop(userCh)
-		signal.Stop(chldCh)
 	}
 
 	envSlice := entrypoint.SliceFromEnviron(env)
@@ -557,6 +660,14 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 	exitCh := make(chan int, 1)
 	go func() { exitCh <- orch.Run(ctx) }()
 
+	if opts.machine != nil {
+		startExecServer(ctx, log, opts.machine, r)
+		if budget, limit := supervisor.ServicesStopBudget(cfg.Services), opts.machine.Stop.Timeout.Std(); budget > limit {
+			log.Warn("the services' worst-case stop exceeds the machine's stop timeout; a graceful stop is cut off at the timeout",
+				"services_budget", budget, "stop_timeout", limit)
+		}
+	}
+
 	log.Info("zpinit started", "version", version, "pid", os.Getpid(), "services", len(cfg.Services))
 	if len(cfg.Services) == 0 {
 		log.Info("no services configured; control socket up, waiting for reload (zpctl reread / SIGHUP)")
@@ -571,6 +682,13 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 		// supervisor's outer wait must cover stopAll's serial inner
 		// wait.
 		budget := orch.ShutdownBudget()
+		// In machine mode the whole stop has to fit the machine's stop
+		// timeout: the host kills the VMM after its own, longer one,
+		// and whatever is still running then is SIGKILLed by
+		// machine.End anyway.
+		if opts.machine != nil && budget > opts.machine.Stop.Timeout.Std() {
+			budget = opts.machine.Stop.Timeout.Std()
+		}
 		log.Info("shutting down", "reason", reason, "budget", budget)
 		// Close the control socket before teardown begins so no new
 		// zpctl request lands mid-stopAll. The orchestrator's stopping
@@ -602,13 +720,10 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 
 	for {
 		select {
+		case <-opts.latch.Done():
+			return beginShutdown("signal " + opts.latch.Signal().String())
 		case sig := <-userCh:
 			switch sig {
-			// SIGQUIT joins TERM/INT for supervisord parity: operators
-			// coming from there use `kill -QUIT` for graceful shutdown,
-			// and the Go default would be a goroutine dump + hard exit.
-			case syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT:
-				return beginShutdown("signal " + sig.String())
 			case syscall.SIGHUP:
 				log.Info("SIGHUP: reloading config", "dir", configDir)
 				newCfg, err := config.Load(configDir)
@@ -636,6 +751,7 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 				}
 			}
 		case <-shutdownReq:
+			opts.latch.requested.Store(true)
 			return beginShutdown("zpctl shutdown")
 		case code := <-exitCh:
 			// The orchestrator ended on its own: the exit_code_from

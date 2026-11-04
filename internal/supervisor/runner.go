@@ -35,11 +35,13 @@ const (
 	StateFatal    State = "fatal"
 )
 
-// MaxConsecutiveCrashes is the retry budget after which a service goes
-// fatal. Crashes past this value with no successful run interval (i.e.
-// the service never reaches the BackoffResetAfter window) lead to fatal.
-// Hardcoded for now; can be promoted to config if needed.
-const MaxConsecutiveCrashes = 5
+// MaxConsecutiveCrashes is the default retry budget after which a
+// service goes fatal. Crashes past this value with no successful run
+// interval (i.e. the service never reaches the BackoffResetAfter
+// window) lead to fatal. A service overrides it with
+// max_consecutive_crashes (config.Service.CrashBudget); 0 there means
+// never.
+const MaxConsecutiveCrashes = config.DefaultMaxConsecutiveCrashes
 
 type cmdKind int
 
@@ -870,7 +872,7 @@ func (r *Runner) recordFailure(timers *runnerTimers) {
 	r.crashes++
 	crashes := r.crashes
 	r.mu.Unlock()
-	if crashes >= MaxConsecutiveCrashes {
+	if budget := r.cfg.CrashBudget(); budget > 0 && crashes >= budget {
 		r.log.Warn("retry budget exceeded; fatal", "service", r.DisplayName(), "crashes", crashes)
 		r.setTerminal(StateFatal, false)
 		return

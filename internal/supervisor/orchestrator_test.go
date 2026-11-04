@@ -1319,3 +1319,20 @@ func TestOrchestrator_ExitCodeFromWorker(t *testing.T) {
 		t.Errorf("exit code = %d, want 7 (worker's)", code)
 	}
 }
+
+func TestServicesStopBudget(t *testing.T) {
+	if got := ServicesStopBudget(nil); got != 0 {
+		t.Errorf("no services: got %v, want 0", got)
+	}
+	svcs := []config.Service{
+		mustService("a", "10_a.toml", func(s *config.Service) { s.StopTimeout = config.Duration(2 * time.Second) }),
+		mustService("b", "20_b.toml", func(s *config.Service) {
+			s.StopTimeout = config.Duration(10 * time.Second)
+			s.Replicas = config.Replicas{N: 8}
+		}),
+	}
+	want := (2*time.Second + reapGrace) + (10*time.Second + reapGrace)
+	if got := ServicesStopBudget(svcs); got != want {
+		t.Errorf("got %v, want %v (one unit per file, no headroom)", got, want)
+	}
+}

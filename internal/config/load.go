@@ -557,6 +557,9 @@ func validateService(s *Service) []string {
 			errs = append(errs, "replicas_min / replicas_max only apply when replicas = \"auto\"")
 		}
 	}
+	if s.MaxConsecutiveCrashes != nil && *s.MaxConsecutiveCrashes < 0 {
+		errs = append(errs, fmt.Sprintf("max_consecutive_crashes must be >= 0 (0 = never give up), got %d", *s.MaxConsecutiveCrashes))
+	}
 	if s.ReloadSignal != "" && len(s.ReloadCommand) > 0 {
 		errs = append(errs, "reload_signal and reload_command are mutually exclusive")
 	}

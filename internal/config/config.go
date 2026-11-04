@@ -169,6 +169,38 @@ type Service struct {
 	// ReloadSignal/ReloadCommand declares, falling back to full
 	// restart if neither is set. Empty or nil disables the trigger.
 	ReloadOnChange []string `toml:"reload_on_change"`
+
+	// Pdeathsig, when explicitly false, drops the parent-death SIGKILL
+	// zpinit sets on the service's process. Default (nil) is true:
+	// the service dies with its supervisor. Opting out lets a service
+	// outlive a zpinit restart, which a host-side zpinit supervising
+	// long-lived shims wants for in-place upgrades. Pointer so "unset"
+	// and "explicitly true" both mean the default.
+	Pdeathsig *bool `toml:"pdeathsig"`
+
+	// MaxConsecutiveCrashes overrides the retry budget after which the
+	// service goes FATAL. nil means DefaultMaxConsecutiveCrashes; 0
+	// means never give up (Docker's `--restart always`).
+	MaxConsecutiveCrashes *int `toml:"max_consecutive_crashes"`
+}
+
+// DefaultMaxConsecutiveCrashes is the retry budget a service gets when
+// it does not set max_consecutive_crashes.
+const DefaultMaxConsecutiveCrashes = 5
+
+// CrashBudget returns the number of consecutive crashes after which
+// the service goes FATAL, or 0 for "never".
+func (s Service) CrashBudget() int {
+	if s.MaxConsecutiveCrashes == nil {
+		return DefaultMaxConsecutiveCrashes
+	}
+	return *s.MaxConsecutiveCrashes
+}
+
+// WantsPdeathsig reports whether the service's process gets the
+// parent-death SIGKILL (the default).
+func (s Service) WantsPdeathsig() bool {
+	return s.Pdeathsig == nil || *s.Pdeathsig
 }
 
 // IsReloadable returns true unless the service explicitly set

@@ -277,3 +277,32 @@ func itoa(n int) string {
 	}
 	return string(out)
 }
+
+// TestDetect_MachineNoLimits is the microVM shape: zpinit is the
+// kernel's init, sits in the root cgroup (which has no cpu.max or
+// memory.max at all), and the vCPUs and RAM ARE the budget. Detection
+// must fall through to /proc and report the machine's real size,
+// never zero and never an error, so ZPINIT_CPU_COUNT /
+// ZPINIT_MEMORY_BYTES and replicas = "auto" are right in a VM.
+func TestDetect_MachineNoLimits(t *testing.T) {
+	cg := t.TempDir()
+	proc := t.TempDir()
+	// The root cgroup of a guest: controllers listed, no limit files.
+	writeFile(t, filepath.Join(cg, "cgroup.controllers"), "cpuset cpu io memory pids\n")
+	writeFile(t, filepath.Join(cg, "cpu.stat"), "usage_usec 0\n")
+	writeFile(t, filepath.Join(proc, "cpuinfo"), procCPUInfo(2))
+	writeFile(t, filepath.Join(proc, "meminfo"), "MemTotal:        1003520 kB\n")
+	withRoots(t, cg, proc)
+
+	s := Detect()
+	if s.CPUCount != 2 || s.CPUQuota != 2.0 {
+		t.Errorf("CPU = %d (quota %v), want the machine's 2 vCPUs", s.CPUCount, s.CPUQuota)
+	}
+	if s.MemoryBytes != 1003520*1024 {
+		t.Errorf("MemoryBytes = %d, want MemTotal %d", s.MemoryBytes, 1003520*1024)
+	}
+	env := s.EnvVars()
+	if env[EnvCPUCount] != "2" || env[EnvMemoryBytes] == "" || env[EnvMemoryBytes] == "0" {
+		t.Errorf("env = %v", env)
+	}
+}

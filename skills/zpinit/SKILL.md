@@ -37,7 +37,7 @@ tag instead of `latest` for reproducible builds.
 
 ## Mode selection: one rule
 
-zpinit picks its mode from the CMD at startup. No flags.
+zpinit picks its mode from the CMD at startup. No mode flag.
 
 **A non-empty CMD means zpinit execs it. No CMD means supervise mode.**
 
@@ -83,8 +83,10 @@ CMD ["my-app", "--port", "8080"]
 ```
 
 Note: after the exec, zpinit is gone and nothing reaps children. If the
-workload spawns children it doesn't reap, use mode 3 with a single
-service entry instead; zpinit then stays as PID 1 and reaps.
+workload spawns children it doesn't reap, use `ENTRYPOINT ["zpinit",
+"--init"]` (or `ENV ZPINIT_INIT=1`): zpinit then forks the CMD and
+stays as PID 1 above it like tini, reaping orphans, forwarding signals
+and exiting with the CMD's status (128+N for a signal).
 
 ## Mode 2: setup, then run
 
@@ -160,6 +162,7 @@ restart = "always"                          # or "on-failure" | "never"
 
 stop_signal  = "TERM"                       # default; "TERM" and "SIGTERM" both work
 stop_timeout = "10s"                        # default; then SIGKILL escalation
+max_consecutive_crashes = 5                 # default; FATAL after this many; 0 = never
 
 on_boot_failure = "fail"                    # default: failing initial boot exits the
                                             # container. "continue" keeps PID 1 alive
@@ -257,6 +260,21 @@ zpinit --plan         /etc/zpinit/   # resolved boot plan dry-run (replicas expa
 zpinit --doctor       /etc/zpinit/   # superset: binaries on PATH, runtime versions, live state
 ```
 
+## Running the image as a microVM
+
+The same image can run as a microVM whose PID 1 is zpinit (the kernel's
+init, "machine mode", detected automatically). Nothing in the image
+changes: the mode still comes from the CMD, so a services image runs
+its `/etc/zpinit` and a plain image runs its CMD. Service files stop one
+after another, each taking up to its `stop_timeout` plus 5 s, and the
+sum must fit the machine's stop budget (zpinit warns at boot when it
+does not); `default_stop_timeout = "5s"` in `zpinit.toml` is the usual
+fix for services that stop fast. Things a VM needs that
+a container gets from the runtime, like SSH host keys, belong in an
+`entrypoint.d` script. Inside the VM, systemd's `reboot`/`poweroff`
+do not work; use `zpctl shutdown` or busybox `reboot`. Details:
+`docs/machine-mode.md`.
+
 ## Quick experiment without building an image
 
 ```sh
@@ -284,3 +302,4 @@ the task goes beyond this skill:
   injection.
 - `docs/why.md`: design decisions and non-goals (no log rotation, no
   dependency graphs, no env interpolation).
+- `docs/machine-mode.md`: zpinit as a microVM's PID 1.

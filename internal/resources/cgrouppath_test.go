@@ -198,3 +198,19 @@ func TestResolveCgroupLayout_OverrideKeepsLegacyShape(t *testing.T) {
 		t.Error("an explicit override is authoritative and must count as resolved")
 	}
 }
+
+// A microVM guest as a bringup init leaves it: cgroup2 mounted at
+// /sys/fs/cgroup, PID 1 in the root cgroup. The layout resolves (it
+// is verifiably ours), to the mount root.
+func TestResolveFromProc_MicroVMRoot(t *testing.T) {
+	dir := t.TempDir()
+	cg := dir + "/cgroup"
+	mi := dir + "/mountinfo"
+	writeFile(t, cg, "0::/\n")
+	writeFile(t, mi, "22 1 254:16 / / rw,relatime - ext4 /dev/vdb rw\n"+
+		"30 22 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n")
+	l, ok := resolveFromProc(cg, mi)
+	if !ok || !l.resolved || l.v2 != "/sys/fs/cgroup" {
+		t.Errorf("layout = %+v ok=%v", l, ok)
+	}
+}

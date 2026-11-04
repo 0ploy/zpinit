@@ -62,7 +62,7 @@ func Spawn(cfg config.Service, baseEnv []string, r *reaper.Reaper, log *slog.Log
 	cmd.Env = MergeEnv(baseEnv, cfg.Env)
 	cmd.Stdout = stdoutTarget
 	cmd.Stderr = stderrTarget
-	cmd.SysProcAttr = baseSysProcAttr()
+	cmd.SysProcAttr = baseSysProcAttr(cfg.WantsPdeathsig())
 	if cred != nil {
 		cmd.SysProcAttr.Credential = cred
 	}
@@ -131,7 +131,7 @@ func SpawnOneShot(name string, command, env []string, r *reaper.Reaper, log *slo
 	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = baseSysProcAttr()
+	cmd.SysProcAttr = baseSysProcAttr(true)
 
 	proc, exitCh, err := r.SpawnTracked(func() (*os.Process, error) {
 		if err := cmd.Start(); err != nil {

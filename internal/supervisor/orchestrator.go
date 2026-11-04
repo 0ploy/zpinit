@@ -654,6 +654,20 @@ func (o *Orchestrator) stopRunnerGroup(ctx context.Context, group []*Runner) {
 	wg.Wait()
 }
 
+// ServicesStopBudget is the services' share of ShutdownBudget for a
+// config, computed from the config rather than the live runner set so it
+// is right before Run has registered anything: one (stop_timeout +
+// reapGrace) per service file, without shutdownHeadroom. Machine mode
+// compares this against the machine's stop timeout; the headroom covers
+// only the exit path and would otherwise flag every timeout under 30s.
+func ServicesStopBudget(services []config.Service) time.Duration {
+	var total time.Duration
+	for _, s := range services {
+		total += s.StopTimeout.Std() + reapGrace
+	}
+	return total
+}
+
 // ShutdownBudget reports the conservative wall-clock budget that
 // stopAll needs against the *current* runner set. runSupervise calls
 // this at signal time so reload-induced changes (added services,

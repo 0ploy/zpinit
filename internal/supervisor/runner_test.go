@@ -328,6 +328,54 @@ func TestRunner_FatalAfterRetryBudget(t *testing.T) {
 	f.waitState(StateFatal, time.Second)
 }
 
+func TestRunner_CrashBudgetOverride(t *testing.T) {
+	two := 2
+	f := newFixture(t, config.Service{
+		Command:               []string{"x"},
+		Restart:               config.RestartAlways,
+		BackoffInitial:        config.Duration(1 * time.Second),
+		BackoffMax:            config.Duration(2 * time.Second),
+		BackoffResetAfter:     config.Duration(120 * time.Second),
+		MaxConsecutiveCrashes: &two,
+	})
+	f.runner.Start()
+
+	p := f.nextProcess(time.Second)
+	f.waitState(StateRunning, time.Second)
+	p.pushExit(reaper.ExitInfo{ExitCode: 1})
+	f.waitState(StateBackoff, time.Second)
+	f.clock.Advance(10 * time.Second)
+
+	p = f.nextProcess(time.Second)
+	f.waitState(StateRunning, time.Second)
+	p.pushExit(reaper.ExitInfo{ExitCode: 1})
+	f.waitState(StateFatal, time.Second)
+}
+
+func TestRunner_CrashBudgetZeroNeverFatal(t *testing.T) {
+	zero := 0
+	f := newFixture(t, config.Service{
+		Command:               []string{"x"},
+		Restart:               config.RestartAlways,
+		BackoffInitial:        config.Duration(1 * time.Second),
+		BackoffMax:            config.Duration(2 * time.Second),
+		BackoffResetAfter:     config.Duration(120 * time.Second),
+		MaxConsecutiveCrashes: &zero,
+	})
+	f.runner.Start()
+
+	// Well past the default budget, it keeps backing off and restarting.
+	for i := 0; i < 3*MaxConsecutiveCrashes; i++ {
+		p := f.nextProcess(time.Second)
+		f.waitState(StateRunning, time.Second)
+		p.pushExit(reaper.ExitInfo{ExitCode: 1})
+		f.waitState(StateBackoff, time.Second)
+		f.clock.Advance(10 * time.Second)
+	}
+	f.nextProcess(time.Second)
+	f.waitState(StateRunning, time.Second)
+}
+
 func TestRunner_StopDuringRunning(t *testing.T) {
 	f := newFixture(t, config.Service{
 		Command:    []string{"x"},

@@ -217,6 +217,80 @@ stdout = "/var/log/worker-{index}.log"
 
 `zpinit --doctor` prints the expansion so you can confirm before boot.
 
+## zpinit is not PID 1
+
+The first log line is `msg="zpinit starting" version=... pid=N
+context=container`.
+zpinit always reaps its own children; being PID 1 only adds reaping of
+orphans (processes whose parent died, reparented to PID 1). So:
+
+- **Under another init that reaps** (tini, `docker run --init`,
+  systemd, a VM init): fine, that init reaps the orphans.
+- **Under a PID 1 that does not reap** (a shell script, an app as
+  ENTRYPOINT running zpinit as a child): orphans pile up as zombies.
+  Make zpinit the ENTRYPOINT instead.
+- **Wrap mode without `--init`:** zpinit execs the CMD, so the CMD is
+  PID 1 and zpinit is gone. If the CMD does not reap, add `--init` (or
+  `ZPINIT_INIT=1`) to keep zpinit resident above it.
+
+## A warning about `machine.json` in a container
+
+**Symptom.** `machine settings file present but zpinit is not the
+kernel's init; ignoring it`.
+
+**Why.** `/run/zpinit/machine.json` is how a microVM's guest init hands
+settings to zpinit. It is read only when zpinit is the kernel's init
+(machine mode); in a container it is never read. Usually an image built
+from a VM root filesystem, or a bind mount that brought it along.
+
+**Fix.** Nothing is wrong; remove the file to silence the warning.
+
+## A microVM resets immediately on stop, or never stops
+
+The host's graceful stop is Ctrl+Alt+Del, which zpinit turns into
+SIGINT by calling `reboot(CAD_OFF)` as its first act. Check the serial
+log:
+
+- `could not route Ctrl+Alt+Del to zpinit`: the call failed, so the
+  kernel resets the machine on the spot.
+- `context=container` on a machine you expected to be in machine mode:
+  zpinit is not PID 1 of the kernel's PID namespace (something else is
+  init, or it runs in a namespace).
+- No `zpinit: reset` line after the stop: the guest did not end through
+  zpinit (a kernel panic, or something called `reboot(2)` itself).
+- A stop that takes exactly `stop.timeout`: a service or the CMD
+  ignored its stop signal and was killed at the deadline. In supervise
+  mode zpinit warns at boot when the services' worst-case stop exceeds
+  the machine's stop timeout: one `stop_timeout` plus 5 s per service
+  file, because files stop one after another. A supervise stop cut off
+  there ends with `cause=stop status=1`.
+
+## `reboot` or `poweroff` inside a microVM does nothing
+
+**Symptom.** `System has not been booted with systemd as init system
+(PID 1). Can't operate.`, and the machine stays up.
+
+**Why.** On systemd-based images (Ubuntu, Debian) `reboot`, `poweroff`
+and `halt` are `systemctl`, which only talks to systemd. zpinit is PID
+1, so nothing answers.
+
+**Fix.** Use `zpctl shutdown` (supervise mode), `kill 1`, or busybox
+`reboot`/`halt`/`poweroff`: each is a graceful stop, and the host's
+restart policy decides whether the machine comes back. `reboot -f`
+resets the machine at once, without the teardown or the reset line. See
+[machine-mode.md](machine-mode.md#reboot-halt-and-poweroff-inside-the-machine).
+
+## A parked microVM
+
+**Symptom.** zpinit logs `machine parked; rescue mode`, usually after
+the bringup init's own failure report on the console.
+
+**Why.** Bringup failed (`machine.json`'s `rescue.step` says where), or zpinit could not use
+`machine.json` (`step=zpinit`, with the decode error). The machine
+stays up with no workload so it can be inspected over exec, then
+stopped; the stop ends with `zpinit: reset intent=shutdown
+cause=parked`. See [machine-mode.md](machine-mode.md#rescue).
+
 ## Logs are missing entirely
 
 `log.stdout` / `log.stderr` default to `inherit`, meaning the service

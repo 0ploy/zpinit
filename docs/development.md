@@ -117,7 +117,10 @@ The resource watcher's inotify trigger (`internal/resources/
 notify_linux.go`) is one of these: off Linux `newCgroupNotify` returns
 nil and the watcher falls back to its backstop poll, so
 `notify_linux_test.go` is `//go:build linux` and never runs on a macOS
-`make test`. To exercise it without a Linux box:
+`make test`. The same holds for machine mode's teardown
+(`internal/machine/end_linux_test.go`) and the whole vsock exec server
+(`internal/vsockexec/server_linux_test.go`; off Linux the server is a
+stub). To exercise one without a Linux box:
 
 ```sh
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o /tmp/res.test ./internal/resources
@@ -137,9 +140,10 @@ docker run --rm -v "$PWD":/src -w /src golang:1.26 go test -race ./...
 `gh`, Claude Code). Its main value is that it IS Linux: `make integration`
 and the `//go:build linux` tests run there directly, with `-race`, the
 same way CI runs them. It has no docker daemon, so
-`TestPID1InContainer` (the only test that runs zpinit as a real PID 1,
-covering orphan reaping and the container exit code) skips there and
-runs on the ubuntu CI runner. Setup (GitHub token, git identity, caches, what
+the tests that run zpinit as a real PID 1 in a container
+(`TestPID1InContainer`, and `TestContainerModeAsPID1` /
+`TestContainerModeSupervisePID1SurvivesSignals` in `init_test.go`)
+skip there and run on the ubuntu CI runner. Setup (GitHub token, git identity, caches, what
 needs a rebuild) is in `.devcontainer/README.md`.
 
 ## Project notes for agents
