@@ -293,6 +293,9 @@ func (o *Orchestrator) Run(ctx context.Context) int {
 	o.shutdownOnce = sync.Once{}
 	o.stopping = false
 	runnersSnap := append([]*Runner(nil), o.runners...)
+	for _, r := range runnersSnap {
+		r.setShuttingDown(false)
+	}
 	// Add inside the publishing critical section, matching the rule
 	// every other registration path follows. Trivially safe here (the
 	// deferred Wait cannot have started yet), but keeping the shape
@@ -601,6 +604,14 @@ func (o *Orchestrator) stopAll() {
 	o.mu.Lock()
 	o.stopping = true
 	snap := append([]*Runner(nil), o.runners...)
+	// Latch every runner too, in the same critical section: the
+	// stopping flag is checked only at entry points, so a restart or
+	// start already past its entry check (a `zpctl restart` in its stop
+	// half, a reload_on_change fanout) would otherwise respawn the
+	// child after this teardown stopped it.
+	for _, r := range snap {
+		r.setShuttingDown(true)
+	}
 	o.mu.Unlock()
 
 	// snap is sorted by (filename, replicaIndex). Tear groups down in

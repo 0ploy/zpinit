@@ -128,6 +128,15 @@ type Runner struct {
 	// and must remain operable for the retry).
 	removing bool
 
+	// shuttingDown is stopAll's latch on every runner it tears down:
+	// starts are refused with errShuttingDown until the next Run clears
+	// it. The orchestrator's own stopping flag only guards entry
+	// points, so without this a `zpctl restart` whose stop half was
+	// already running when stopAll began would see Stopped and spawn a
+	// fresh child that nothing stops gracefully (it dies by Pdeathsig
+	// when PID 1 exits).
+	shuttingDown bool
+
 	// observers, if any, receive every state transition. Buffered; sends
 	// are non-blocking — observers that fall behind miss events.
 	observersMu sync.Mutex
@@ -190,6 +199,13 @@ func (r *Runner) markRemoving() {
 func (r *Runner) clearRemoving() {
 	r.mu.Lock()
 	r.removing = false
+	r.mu.Unlock()
+}
+
+// setShuttingDown sets or clears the shutdown latch (see shuttingDown).
+func (r *Runner) setShuttingDown(on bool) {
+	r.mu.Lock()
+	r.shuttingDown = on
 	r.mu.Unlock()
 }
 
@@ -770,6 +786,10 @@ func (r *Runner) handleStart(timers *runnerTimers) error {
 	if r.removing {
 		r.mu.Unlock()
 		return errBeingRemoved
+	}
+	if r.shuttingDown {
+		r.mu.Unlock()
+		return errShuttingDown
 	}
 	r.stoppedManually = false
 	r.mu.Unlock()

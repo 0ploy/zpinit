@@ -277,6 +277,11 @@ change observable behavior, it was never quiet; give it an entry.
   answer. `OnResourceChange` must do its `wg.Add` inside the same
   `o.mu` section as the stopping check: an unlocked Add can race
   Run's deferred `wg.Wait` at zero counter, which panics.
+  Entry checks alone are not enough: a `zpctl restart` (or reload
+  fanout) already in its stop half when stopAll begins wakes on the
+  same Stopped edge and calls Start. So stopAll also latches every
+  snapshotted runner (`setShuttingDown`, same critical section) and
+  `handleStart` refuses with `errShuttingDown`; `Run` clears it.
   `stopRunnerGroup` deliberately does NOT skip Pending runners: a
   queued `cmdStart` (cmds is buffered) can still spawn one, and the
   FIFO queued stop is what tears that child down again.

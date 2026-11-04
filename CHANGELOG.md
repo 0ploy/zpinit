@@ -45,6 +45,13 @@
   next restart of a replicated or `replicas = "auto"` service ran
   without it. Apps that shard work or label logs by index now keep it.
 
+- **A restart racing a shutdown could leave a service running
+  unmanaged.** A `zpctl restart` or `zpctl reload` still stopping its
+  service when the container got SIGTERM started the service again once
+  the stop finished. The new process ran while its dependencies were
+  being stopped and was killed with SIGKILL when zpinit exited. The
+  restart is now refused once shutdown has begun.
+
 - **A stray signal could kill zpinit.** `kill -SEGV 1`, `-TRAP`, `-ABRT`,
   `-ILL`, `-BUS`, `-FPE`, `-SYS` or `-STKFLT` from inside the container
   ended PID 1 (and so the container) with a Go crash dump. Every

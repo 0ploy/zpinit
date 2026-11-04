@@ -3,10 +3,12 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/0ploy/zpinit/internal/config"
+	"github.com/0ploy/zpinit/internal/reaper"
 	"github.com/0ploy/zpinit/internal/resources"
 )
 
@@ -81,5 +83,58 @@ func TestStopAll_StopsPendingRunner(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("runner goroutine did not exit")
+	}
+}
+
+// A restart whose stop half is in flight when stopAll begins must not
+// respawn the child: stopAll finds the runner already Stopping, waits
+// for the same Stopped edge the restart waits for, and moves on. The
+// restart's start half then has to be refused.
+func TestStopAll_RefusesRestartInFlight(t *testing.T) {
+	f := newFixture(t, config.Service{Name: "app", Filename: "10_app.toml",
+		StopTimeout: config.Duration(10 * time.Second)})
+	f.runner.Start()
+	p := f.nextProcess(time.Second)
+	f.waitState(StateRunning, time.Second)
+
+	o := &Orchestrator{log: testLog(), cfg: minimalCfg()}
+	o.runners = []*Runner{f.runner}
+
+	restartErr := make(chan error, 1)
+	go func() { restartErr <- f.runner.RestartCtx(context.Background()) }()
+	waitSignals(t, p, 1, time.Second) // the restart's stop half is running
+
+	stopped := make(chan struct{})
+	go func() { o.stopAll(); close(stopped) }()
+	deadline := time.Now().Add(time.Second)
+	// stopAll latches o.stopping and the runners in one critical
+	// section, so once this flips the runner is latched too.
+	for !o.isStopping() {
+		if time.Now().After(deadline) {
+			t.Fatal("stopAll did not latch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	p.pushExit(reaper.ExitInfo{Signaled: true, Signal: syscall.SIGTERM})
+
+	select {
+	case err := <-restartErr:
+		if !errors.Is(err, errShuttingDown) {
+			t.Errorf("restart during shutdown: err = %v, want errShuttingDown", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("restart did not return")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stopAll did not return")
+	}
+	if n := f.spawnCount(); n != 1 {
+		t.Errorf("spawns = %d, want 1 (no respawn during shutdown)", n)
+	}
+	if got := f.runner.State(); got != StateStopped {
+		t.Errorf("state = %s, want %s", got, StateStopped)
 	}
 }
