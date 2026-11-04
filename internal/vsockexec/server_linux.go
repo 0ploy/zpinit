@@ -157,11 +157,14 @@ func (s *Server) Handle(conn io.ReadWriteCloser) {
 	}
 	sess, err := s.start(req)
 	if err != nil {
-		s.log.Warn("exec: start failed", "argv", req.Argv, "err", err)
+		s.log.Warn("exec: start failed", "cmd", req.Argv[0], "args", len(req.Argv)-1, "err", err)
 		_ = execproto.WriteFrame(conn, execproto.FrameError, []byte(err.Error()))
 		return
 	}
-	s.log.Info("exec: started", "pid", sess.pid, "argv", req.Argv, "tty", req.TTY)
+	// The command only, never its arguments: they are the operator's
+	// (`sh -c 'mysql -p…'`), and the log is the machine's console, which
+	// the host keeps on disk.
+	s.log.Info("exec: started", "pid", sess.pid, "cmd", req.Argv[0], "args", len(req.Argv)-1, "tty", req.TTY)
 	sess.run(conn)
 }
 

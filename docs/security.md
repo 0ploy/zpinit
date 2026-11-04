@@ -153,6 +153,10 @@ a hypervisor when the host is itself a VM.
   stdin. A process that leaves the session with its own `setsid`
   survives until the machine ends, as a daemonised process would under
   `docker exec`.
+- An exec is logged with its command (`argv[0]`) and the number of
+  arguments, never the arguments themselves: they are the operator's
+  (`sh -c 'mysql -p…'`), and the log goes to the console, which the
+  host keeps on disk.
 - The reset line is written only to a character device, so a
   `console` that names a disk cannot overwrite it.
 

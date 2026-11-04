@@ -378,6 +378,9 @@ Semantics:
   `argv[0]` is resolved against that `PATH`.
 - **Working directory:** the request's, else `exec.working_dir`, else
   `/`.
+- **Logging:** each exec's start and end are logged with its pid,
+  command (`argv[0]`) and argument count, never the arguments, which
+  may hold secrets (`docs/security.md`).
 - Each exec is `setsid`'d, so it is its own session and process group.
   With a tty it gets a fresh pty from `/dev/ptmx` as its controlling
   terminal.
