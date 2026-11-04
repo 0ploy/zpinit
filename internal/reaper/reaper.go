@@ -18,6 +18,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // ExitInfo describes how a tracked child terminated. Either Signaled
@@ -28,13 +29,30 @@ type ExitInfo struct {
 	ExitCode int
 	Signal   syscall.Signal
 	Signaled bool
+	// OOMKilled: the kernel's OOM killer sent the SIGKILL. Only ever
+	// set with an OOM detector installed (machine mode).
+	OOMKilled bool
+}
+
+// OOMDetector attributes a SIGKILL death to the kernel's OOM killer.
+// Now is the detector's clock, sampled before each spawn; Killed
+// reports whether pid was OOM-killed at or after since.
+type OOMDetector interface {
+	Now() time.Duration
+	Killed(pid int, since time.Duration) bool
+}
+
+type tracking struct {
+	ch    chan<- ExitInfo
+	start time.Duration // detector clock at spawn; zero without one
 }
 
 type Reaper struct {
 	log *slog.Logger
+	oom OOMDetector // nil: no OOM attribution
 
 	mu      sync.Mutex
-	tracked map[int]chan<- ExitInfo
+	tracked map[int]tracking
 }
 
 func New(log *slog.Logger) *Reaper {
@@ -43,9 +61,13 @@ func New(log *slog.Logger) *Reaper {
 	}
 	return &Reaper{
 		log:     log,
-		tracked: make(map[int]chan<- ExitInfo),
+		tracked: make(map[int]tracking),
 	}
 }
+
+// SetOOMDetector enables OOM attribution for tracked children. Call it
+// before the first spawn; it is not synchronised with Reap.
+func (r *Reaper) SetOOMDetector(d OOMDetector) { r.oom = d }
 
 // SpawnTracked invokes spawn while holding the reaper's lock, then
 // registers the resulting PID for exit notification. Holding the lock
@@ -61,12 +83,16 @@ func (r *Reaper) SpawnTracked(spawn func() (*os.Process, error)) (*os.Process, <
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	var start time.Duration
+	if r.oom != nil {
+		start = r.oom.Now()
+	}
 	proc, err := spawn()
 	if err != nil {
 		return nil, nil, err
 	}
 	ch := make(chan ExitInfo, 1)
-	r.tracked[proc.Pid] = ch
+	r.tracked[proc.Pid] = tracking{ch: ch, start: start}
 	return proc, ch, nil
 }
 
@@ -115,15 +141,18 @@ func (r *Reaper) Reap() {
 		}
 
 		r.mu.Lock()
-		ch, tracked := r.tracked[pid]
+		t, tracked := r.tracked[pid]
 		if tracked {
 			delete(r.tracked, pid)
 		}
 		r.mu.Unlock()
 
 		if tracked {
-			ch <- info
-			close(ch)
+			if r.oom != nil && info.Signaled && info.Signal == syscall.SIGKILL {
+				info.OOMKilled = r.oom.Killed(pid, t.start)
+			}
+			t.ch <- info
+			close(t.ch)
 			continue
 		}
 		if info.Signaled {

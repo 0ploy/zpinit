@@ -265,6 +265,20 @@ log:
   file, because files stop one after another. A supervise stop cut off
   there ends with `cause=stop status=1`.
 
+## A microVM's workload dies of SIGKILL
+
+**Symptom.** The reset line reads `signal=SIGKILL`, or a service's
+`last_exit` is `signal:killed`.
+
+**Check.** `oom=1` on the reset line, `oom_killed` in `zpctl status`,
+or a `killed by the kernel's OOM killer` warning means the machine ran
+out of memory: give it more, or lower the workload's heap or worker
+count. Without the marker the kill came from somewhere else, most often
+the stop deadline (`stop timeout elapsed; SIGKILL` /
+`stop_timeout exceeded; escalating to SIGKILL` in the log). A worker
+process forked by a service is not covered: look for `Killed process`
+in `dmesg` inside the machine.
+
 ## `reboot` or `poweroff` inside a microVM does nothing
 
 **Symptom.** `System has not been booted with systemd as init system

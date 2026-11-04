@@ -29,8 +29,9 @@ type statusJSON struct {
 // lastExitJSON carries exactly one of code/signal (whichever the last
 // reaped exit produced); the unused field is omitted.
 type lastExitJSON struct {
-	Code   *int    `json:"code,omitempty"`
-	Signal *string `json:"signal,omitempty"`
+	Code      *int    `json:"code,omitempty"`
+	Signal    *string `json:"signal,omitempty"`
+	OOMKilled bool    `json:"oom_killed,omitempty"` // machine mode only
 }
 
 // formatStatusJSON renders one runner as a compact single-line JSON
@@ -65,6 +66,7 @@ func formatStatusJSON(r *Runner, verbose bool) string {
 		if le.Signaled {
 			sig := le.Signal.String()
 			out.LastExit.Signal = &sig
+			out.LastExit.OOMKilled = le.OOMKilled
 		} else {
 			code := le.ExitCode
 			out.LastExit.Code = &code
@@ -125,6 +127,9 @@ func formatStatusLineVerbose(r *Runner) string {
 	if le := snap.LastExit; le.PID != 0 {
 		if le.Signaled {
 			extras = append(extras, fmt.Sprintf("last_exit=signal:%s", le.Signal.String()))
+			if le.OOMKilled {
+				extras = append(extras, "oom_killed")
+			}
 		} else {
 			extras = append(extras, fmt.Sprintf("last_exit=code:%d", le.ExitCode))
 		}

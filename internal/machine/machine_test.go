@@ -157,6 +157,9 @@ func TestResetLine(t *testing.T) {
 		{Outcome{Cause: CauseStop, Code: 143, Signal: syscall.SIGTERM}, "\nzpinit: reset intent=shutdown cause=stop signal=SIGTERM\n"},
 		{Outcome{Cause: CauseParked}, "\nzpinit: reset intent=shutdown cause=parked\n"},
 		{Outcome{Cause: CauseExit, Code: 162, Signal: syscall.Signal(34)}, "\nzpinit: reset intent=shutdown cause=exit signal=SIG34\n"},
+		{Outcome{Cause: CauseExit, Code: 137, Signal: syscall.SIGKILL, OOM: true}, "\nzpinit: reset intent=shutdown cause=exit signal=SIGKILL oom=1\n"},
+		{Outcome{Cause: CauseExit, Code: 137, OOM: true}, "\nzpinit: reset intent=shutdown cause=exit status=137 oom=1\n"},
+		{Outcome{Cause: CauseParked, OOM: true}, "\nzpinit: reset intent=shutdown cause=parked\n"},
 	}
 	for _, c := range cases {
 		if got := ResetLine(c.o); got != c.want {
@@ -176,7 +179,8 @@ func TestResetLineFitsHostBuffer(t *testing.T) {
 		{Cause: CauseStop, Code: -2147483648},
 		{Cause: CauseExit, Code: 2147483647},
 		{Cause: CauseExit, Code: 192, Signal: syscall.Signal(64)},
-		{Cause: CauseExit, Code: 154, Signal: syscall.SIGVTALRM},
+		{Cause: CauseExit, Code: 154, Signal: syscall.SIGVTALRM, OOM: true},
+		{Cause: CauseStop, Code: -2147483648, OOM: true},
 		{Cause: CauseParked},
 	}
 	for _, o := range worst {

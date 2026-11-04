@@ -24,10 +24,13 @@ const (
 // Outcome is how zpinit ends: the exit status it would report in a
 // container, and why. Signal is non-zero when the wrap child was killed
 // by a signal; Code then still carries the 128+N a container would see.
+// OOM: the process whose status this is (the wrap CMD, or supervise
+// mode's exit_code_from target) was killed by the kernel's OOM killer.
 type Outcome struct {
 	Cause  Cause
 	Code   int
 	Signal syscall.Signal
+	OOM    bool
 }
 
 // ResetLinePrefix is what the host matches. A published, host-facing
@@ -42,14 +45,19 @@ const ResetLinePrefix = "zpinit: reset "
 //	zpinit: reset intent=shutdown cause=exit signal=SIGSEGV
 //	zpinit: reset intent=shutdown cause=stop status=143
 //	zpinit: reset intent=shutdown cause=parked
+//	zpinit: reset intent=shutdown cause=exit signal=SIGKILL oom=1
 func ResetLine(o Outcome) string {
 	line := "\n" + ResetLinePrefix + "intent=shutdown cause=" + string(o.Cause)
 	switch {
 	case o.Cause == CauseParked:
+		return line + "\n"
 	case o.Signal != 0:
 		line += " signal=" + config.SignalName(o.Signal)
 	default:
 		line += fmt.Sprintf(" status=%d", o.Code)
+	}
+	if o.OOM {
+		line += " oom=1"
 	}
 	return line + "\n"
 }

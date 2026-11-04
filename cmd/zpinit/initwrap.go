@@ -136,6 +136,9 @@ func runInitWrap(log *slog.Logger, cmdline []string, env map[string]string, cred
 	for {
 		select {
 		case info := <-exitCh:
+			if info.OOMKilled {
+				log.Warn("the CMD was killed by the kernel's OOM killer", "pid", pid)
+			}
 			return outcomeOf(info)
 		case <-latched:
 			latched = nil
@@ -161,7 +164,7 @@ func runInitWrap(log *slog.Logger, cmdline []string, env map[string]string, cred
 
 func outcomeOf(info reaper.ExitInfo) machine.Outcome {
 	if info.Signaled {
-		return machine.Outcome{Code: 128 + int(info.Signal), Signal: info.Signal}
+		return machine.Outcome{Code: 128 + int(info.Signal), Signal: info.Signal, OOM: info.OOMKilled}
 	}
 	return machine.Outcome{Code: info.ExitCode}
 }

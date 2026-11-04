@@ -846,6 +846,9 @@ func (r *Runner) handleExit(info reaper.ExitInfo, timers *runnerTimers) {
 	r.lastExit = info
 	r.mu.Unlock()
 	r.setProcess(nil)
+	if info.OOMKilled {
+		r.log.Warn("killed by the kernel's OOM killer", "service", r.DisplayName(), "pid", info.PID)
+	}
 
 	if r.State() == StateStopping {
 		// Stopping is only ever entered from handleStop, so this edge

@@ -82,6 +82,7 @@ status=1`.
 | Supervise-mode stop | budget from the services' stop timeouts | the same, cut off at `stop.timeout` |
 | Ending | `exit(code)` | teardown, sync, reset line, `reboot` |
 | `machine.json` | warned about, never read | read |
+| A tracked process OOM-killed | not distinguished from any `SIGKILL` | reported ([below](#out-of-memory-kills)) |
 | vsock exec | never | when `machine.json` has `exec` |
 | No cgroup limits | warning: figures may be the host's | expected: vCPUs and RAM are the budget |
 
@@ -209,6 +210,7 @@ zpinit: reset intent=shutdown cause=exit status=0
 zpinit: reset intent=shutdown cause=exit signal=SIGSEGV
 zpinit: reset intent=shutdown cause=stop status=0
 zpinit: reset intent=shutdown cause=parked
+zpinit: reset intent=shutdown cause=exit signal=SIGKILL oom=1
 ```
 
 - `cause=exit`: the workload ended on its own (or zpinit failed before
@@ -230,6 +232,11 @@ zpinit: reset intent=shutdown cause=parked
   `signal=SIGTERM` (or whichever `stop.signal` is), one killed at the
   deadline `signal=SIGKILL`, and a supervise stop cut off at the
   deadline `status=1`.
+- `oom=1` is appended when the process the status belongs to (the
+  wrap-mode CMD, or supervise mode's `exit_code_from` target) was
+  killed by the kernel's OOM killer: the machine needs more memory, as
+  opposed to a `SIGKILL` at the stop deadline. Absent otherwise. See
+  [Out-of-memory kills](#out-of-memory-kills).
 - `intent=reboot` is reserved; nothing produces it, so host matchers
   should accept it from the start.
 - Always its own line: preceded by `\n` so a partial line from the
@@ -242,7 +249,8 @@ zpinit: reset intent=shutdown cause=parked
 - **A stable contract.** The prefix `zpinit: reset `, `intent` from
   the set `shutdown` and `reboot` (a host should treat any other value,
   or no line, as an unexplained reset), and no version marker: an
-  incompatible change gets a new prefix instead. The line stays far
+  incompatible change gets a new prefix instead. Fields are only ever
+  added (as `oom` was), so a host ignores keys it does not know. The line stays far
   below 1024 bytes, so a host may drop longer lines on purpose; every
   field is bounded and a test enforces it. A host should exempt a
   `cause=parked` reset from any restart policy: the machine never
@@ -250,6 +258,30 @@ zpinit: reset intent=shutdown cause=parked
 - **Forgeable by design.** The guest owns its serial port. Forging
   `shutdown` buys nothing the guest could not get by exiting, so the
   host must never act on this line more strongly than that.
+
+## Out-of-memory kills
+
+Inside a machine the kernel's OOM killer is the only memory limit, and
+its victim dies of `SIGKILL`, which on its own looks the same as a kill
+at the stop deadline. So in machine mode, when a process zpinit spawned
+and tracks dies of `SIGKILL`, zpinit looks for the OOM killer's
+`Killed process <pid> (...)` record in the kernel log (`/dev/kmsg`),
+counting only records written after that process was spawned, so a
+recycled pid cannot match. A match is reported:
+
+- as `oom=1` on the reset line, when it was the wrap-mode CMD or the
+  `exit_code_from` target;
+- as a warning, `killed by the kernel's OOM killer`, for any service
+  (and for the CMD);
+- in `zpctl status`: `oom_killed` in `last_exit` with `--json`, and an
+  `oom_killed` marker on the `--verbose` line.
+
+Only processes zpinit itself spawned are covered: the CMD, each
+service's main process, and exec sessions. A worker forked by a
+service (a php-fpm or nginx worker) is its parent's child, so its OOM
+kill shows in the kernel log, not in zpinit's reports. In a container
+none of this runs: there `/dev/kmsg` is the host's log, with pids from
+another namespace.
 
 ## Rescue
 

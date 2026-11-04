@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -127,5 +129,48 @@ func TestErrRespFor_MapsUnknownService(t *testing.T) {
 	}
 	if got := errRespFor(errors.New("boom")); got.Code != ctlproto.CodeFailed {
 		t.Errorf("generic error -> code %d, want %d", got.Code, ctlproto.CodeFailed)
+	}
+}
+
+// An OOM kill (machine mode) shows in status: oom_killed in JSON, a
+// bare oom_killed marker in the verbose line. Absent otherwise.
+func TestStatusReportsOOMKill(t *testing.T) {
+	cfg := config.Service{Name: "app", Filename: "10_app.toml"}
+	r := NewRunner(cfg, nil, 0, nil, nil, testLog())
+	r.state = StateBackoff
+	r.lastExit = reaper.ExitInfo{PID: 9, Signaled: true, Signal: syscall.SIGKILL, OOMKilled: true}
+
+	le, ok := decodeStatus(t, formatStatusJSON(r, false))["last_exit"].(map[string]any)
+	if !ok || le["oom_killed"] != true || le["signal"] != "killed" {
+		t.Errorf("last_exit = %v, want signal killed with oom_killed", le)
+	}
+	if line := formatStatusLineVerbose(r); !strings.Contains(line, "last_exit=signal:killed oom_killed") {
+		t.Errorf("verbose line lacks the OOM marker: %q", line)
+	}
+
+	r.lastExit.OOMKilled = false
+	le, _ = decodeStatus(t, formatStatusJSON(r, false))["last_exit"].(map[string]any)
+	if _, has := le["oom_killed"]; has {
+		t.Errorf("oom_killed present for a plain SIGKILL: %v", le)
+	}
+	if strings.Contains(formatStatusLineVerbose(r), "oom_killed") {
+		t.Error("verbose line marks a plain SIGKILL as OOM")
+	}
+}
+
+// The reset line of a supervise-mode machine reports whether the
+// exit_code_from target was OOM-killed.
+func TestExitOOMKilled(t *testing.T) {
+	svc := config.Service{Name: "worker", Filename: "10_worker.toml"}
+	r := NewRunner(svc, nil, 0, nil, nil, testLog())
+	r.lastExit = reaper.ExitInfo{PID: 5, Signaled: true, Signal: syscall.SIGKILL, OOMKilled: true}
+	o := &Orchestrator{log: testLog(), cfg: &config.Config{Globals: config.Globals{ExitCodeFrom: "worker"}}}
+	o.runners = []*Runner{r}
+	if !o.ExitOOMKilled() {
+		t.Error("ExitOOMKilled = false for an OOM-killed exit_code_from target")
+	}
+	o.cfg.Globals.ExitCodeFrom = "default"
+	if o.ExitOOMKilled() {
+		t.Error("ExitOOMKilled = true with exit_code_from = default")
 	}
 }

@@ -393,7 +393,8 @@ can treat this as "stopped/absent" rather than a hard error).
 
 `zpctl status --json` emits one compact JSON object per line (NDJSON,
 one per replica): `name`, `service`, `replica_index`, `state`, `pid`,
-`uptime_seconds`, `total_spawns`, and `last_exit`. Add `--verbose` to
+`uptime_seconds`, `total_spawns`, and `last_exit` (with `oom_killed`
+when a microVM's OOM killer ended the process). Add `--verbose` to
 include the `/proc`-derived `rss_bytes`, `cpu_seconds`, and `fds` for
 live processes. Plain `--json` stays lock-only and cheap to poll.
 

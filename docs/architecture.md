@@ -348,6 +348,12 @@ same way.
 registered atomically, closing the spawn-then-track race for
 fast-dying children.
 
+In machine mode the reaper also attributes `SIGKILL` deaths of
+tracked children to the OOM killer (`SetOOMDetector`, backed by
+`machine.KernelOOM` reading `/dev/kmsg`) and sets
+`ExitInfo.OOMKilled`; see
+[machine-mode.md](machine-mode.md#out-of-memory-kills).
+
 The SIGCHLD loop (`startReapLoop`) runs in supervise mode, the
 resident wrap and rescue. It starts only after entrypoint.d finishes,
 because entrypoint.d still waits on its scripts with `cmd.Wait` (no

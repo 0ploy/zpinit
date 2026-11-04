@@ -271,6 +271,11 @@ func run(log *slog.Logger, opts runOpts) machine.Outcome {
 	}
 
 	r := reaper.New(log)
+	if opts.machine != nil {
+		// Attribute SIGKILL deaths to the OOM killer from the kernel
+		// log. Machine mode only: a container's /dev/kmsg is the host's.
+		r.SetOOMDetector(machine.KernelOOM{})
+	}
 
 	// Layered env composition: globals.Env (lowest) under container env.
 	// entrypoint.d scripts can write further overrides to /run/zpinit/env,
@@ -355,7 +360,7 @@ func run(log *slog.Logger, opts runOpts) machine.Outcome {
 		// scripts: newBaseEnv = newGlobals.Env + containerEnv +
 		// scriptEnv + resourceEnv.
 		scriptEnv := envDelta(initialEnv, finalEnv)
-		return fail(runSupervise(log, configDir, cfg, bootEnv, containerEnv, scriptEnv, resourceEnv, snap, r, opts))
+		return runSupervise(log, configDir, cfg, bootEnv, containerEnv, scriptEnv, resourceEnv, snap, r, opts)
 	}
 	return fail(1) // unreachable
 }
@@ -526,7 +531,7 @@ func execCmd(log *slog.Logger, cmdline []string, env map[string]string) int {
 //
 // SIGHUP triggers a reload via orchestrator.Reload (Phase 7): re-load
 // config from disk, diff against the running set, apply add/remove/restart.
-func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env map[string]string, containerEnv, scriptEnv, resourceEnv map[string]string, snap resources.Snapshot, r *reaper.Reaper, opts runOpts) int {
+func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env map[string]string, containerEnv, scriptEnv, resourceEnv map[string]string, snap resources.Snapshot, r *reaper.Reaper, opts runOpts) machine.Outcome {
 	// Stop signals arrive through opts.latch, installed at startup so
 	// none is lost between phases; only SIGHUP (reload) is ours here.
 	userCh := make(chan os.Signal, 8)
@@ -675,7 +680,13 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 
 	// beginShutdown is the single teardown path, shared by the signal
 	// handler and `zpctl shutdown` so the two cannot drift.
-	beginShutdown := func(reason string) int {
+	// ended is how Run's own exit code becomes the outcome: the
+	// exit_code_from target's status, plus whether the OOM killer ended
+	// it (machine mode's reset line reports both).
+	ended := func(code int) machine.Outcome {
+		return machine.Outcome{Code: code, OOM: orch.ExitOOMKilled()}
+	}
+	beginShutdown := func(reason string) machine.Outcome {
 		// Recompute the budget against the *current* runner set rather
 		// than reusing a boot-time snapshot — reload may have added
 		// services or bumped stop_timeout since startup, and the
@@ -709,12 +720,12 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 		select {
 		case code := <-exitCh:
 			cleanup()
-			return code
+			return ended(code)
 		case <-shutdownTimer.C:
 			log.Error("orchestrator did not return within budget; exiting anyway",
 				"budget", budget)
 			cleanup()
-			return 1
+			return machine.Outcome{Code: 1}
 		}
 	}
 
@@ -758,7 +769,7 @@ func runSupervise(log *slog.Logger, configDir string, cfg *config.Config, env ma
 			// target reached a terminal state, or boot failed. Run has
 			// already returned, so there is nothing left to bound.
 			cleanup()
-			return code
+			return ended(code)
 		}
 	}
 }

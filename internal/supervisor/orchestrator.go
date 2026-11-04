@@ -880,6 +880,19 @@ func (o *Orchestrator) configDir() string {
 	return o.cfg.Dir
 }
 
+// ExitOOMKilled reports whether the exit_code_from target's last exit,
+// the one exitCode reports, was an OOM kill.
+func (o *Orchestrator) ExitOOMKilled() bool {
+	o.mu.RLock()
+	name := o.cfg.Globals.ExitCodeFrom
+	r := o.findRunnerLocked(name)
+	o.mu.RUnlock()
+	if name == "default" || r == nil {
+		return false
+	}
+	return r.LastExit().OOMKilled
+}
+
 func (o *Orchestrator) exitCode() int {
 	o.mu.RLock()
 	name := o.cfg.Globals.ExitCodeFrom

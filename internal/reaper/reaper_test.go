@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -156,4 +157,102 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+type fakeOOM struct {
+	mu     sync.Mutex
+	now    time.Duration
+	asked  []int
+	since  []time.Duration
+	answer bool
+}
+
+func (f *fakeOOM) Now() time.Duration { return f.now }
+func (f *fakeOOM) Killed(pid int, since time.Duration) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asked = append(f.asked, pid)
+	f.since = append(f.since, since)
+	return f.answer
+}
+
+// Only a SIGKILL death is attributed, with the clock sampled at spawn.
+func TestOOMDetectorConsultedOnSIGKILLOnly(t *testing.T) {
+	oom := &fakeOOM{now: 42 * time.Second, answer: true}
+	r := New(discardLogger())
+	r.SetOOMDetector(oom)
+	defer drainReaper(t, r)()
+
+	spawn := func(script string) (*os.Process, <-chan ExitInfo) {
+		cmd := exec.Command("/bin/sh", "-c", script)
+		p, ch, err := r.SpawnTracked(func() (*os.Process, error) {
+			if err := cmd.Start(); err != nil {
+				return nil, err
+			}
+			return cmd.Process, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p, ch
+	}
+	wait := func(ch <-chan ExitInfo) ExitInfo {
+		select {
+		case info := <-ch:
+			return info
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout")
+		}
+		return ExitInfo{}
+	}
+
+	p, ch := spawn("exec sleep 30")
+	_ = p.Signal(syscall.SIGKILL)
+	if info := wait(ch); !info.OOMKilled {
+		t.Errorf("SIGKILL death: OOMKilled = false, want true (%+v)", info)
+	}
+
+	p, ch = spawn("exec sleep 30")
+	_ = p.Signal(syscall.SIGTERM)
+	if info := wait(ch); info.OOMKilled {
+		t.Errorf("SIGTERM death: OOMKilled = true")
+	}
+	_, ch = spawn("exit 3")
+	if info := wait(ch); info.OOMKilled {
+		t.Errorf("exit 3: OOMKilled = true")
+	}
+
+	oom.mu.Lock()
+	defer oom.mu.Unlock()
+	if len(oom.asked) != 1 {
+		t.Fatalf("detector asked %d times, want 1 (SIGKILL only): %v", len(oom.asked), oom.asked)
+	}
+	if oom.since[0] != 42*time.Second {
+		t.Errorf("since = %v, want the spawn-time clock 42s", oom.since[0])
+	}
+}
+
+// Without a detector nothing is attributed (container mode).
+func TestNoOOMDetector(t *testing.T) {
+	r := New(discardLogger())
+	defer drainReaper(t, r)()
+	cmd := exec.Command("/bin/sh", "-c", "exec sleep 30")
+	p, ch, err := r.SpawnTracked(func() (*os.Process, error) {
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		return cmd.Process, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = p.Signal(syscall.SIGKILL)
+	select {
+	case info := <-ch:
+		if info.OOMKilled {
+			t.Error("OOMKilled without a detector")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout")
+	}
 }

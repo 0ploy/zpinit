@@ -9,7 +9,8 @@
   and changes how it starts and ends: Ctrl+Alt+Del becomes a graceful
   stop, the machine ends with sync, a read-only root and `reboot`
   instead of an exit that would panic the kernel, a
-  `zpinit: reset ...` line on the console tells the host why, a failed
+  `zpinit: reset ...` line on the console tells the host why (with
+  `oom=1` when the kernel's OOM killer ended the workload), a failed
   bringup parks the machine in a rescue mode, and an optional host-only
   exec listener on vsock replaces `docker exec`. Inside the machine,
   busybox `reboot`, `halt` and `poweroff` are graceful stops, like
