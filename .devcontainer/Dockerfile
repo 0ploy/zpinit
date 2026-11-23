@@ -2,7 +2,7 @@
 # Go must satisfy the `go` directive in go.mod (1.26). The image already ships
 # gcc, which `go test -race` needs for cgo. Digest-pinned; bump via
 # `docker buildx imagetools inspect golang:1.26-bookworm`.
-FROM golang:1.26-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c
+FROM golang:1.27-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea
 
 # jq: bootstrap.sh merges the Claude settings file. Sudo is limited to the two
 # chown calls the bootstrap needs to take ownership of the named volumes.
